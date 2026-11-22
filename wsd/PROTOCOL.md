@@ -83,9 +83,36 @@ rules that the header cannot express.
 | 116 | EV_ZOOM | `wsd_window`: the zoom (green) button; the client maximizes or restores and sets the frame itself |
 | 117 | EV_DISPLAY | `wsd_hello_reply`: the screen with the menu bar changed size, scale or refresh rate, or a client set a display mode (not sent for its work area alone) |
 | 118 | EV_APP_DEACTIVATED | no payload: another app became the active one (Cmd-Tab, a click elsewhere, a link opened in the browser); the client puts the game in the background |
+| 1001 | EV_KEYMAP | `wsd_ev_keymap` + bytes of a `wsd_keymap` blob: what each key types in the keyboard layout selected on the Mac (see Keyboard layout). Sent after `EV_HELLO`, then whenever the input source or the keyboard's type changes. Orbiters fork: numbered away from the events above |
 
 All times are `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` nanoseconds, the same timebase as
 `mach_absolute_time` and `CACurrentMediaTime`.
+
+## Keyboard layout
+
+`EV_KEY` names a key by its place (`mac_keycode`); what the key types depends on the keyboard layout selected on the
+Mac. `EV_KEYMAP` tells the client that layout, so that a Windows program gets the virtual keys and the characters of
+the layout, as on a PC with the same one (an AZERTY Mac gives `VK_A` and "a" for the key right of Tab). Without it
+the client can only take every keyboard for a US one.
+
+The blob (`struct wsd_keymap`, then the tables its comment lists) holds facts read with `UCKeyTranslate`, for the
+128 keycodes and 10 levels: no modifier, Shift, Option and Caps Lock in every combination (levels 0 to 7, the bits of
+`WSD_KEYMAP_SHIFT`, `OPTION`, `CAPS`), then Command and Command+Shift, which only help to give keys their virtual
+keys (a Russian layout types Latin letters with Command). A dead key is flagged per level and its character is the
+accent alone; `compositions` lists what each accent composes with every character the layout types. A key that types
+more than one UTF-16 unit has 0.
+
+The blob is larger than a message: it comes as consecutive `EV_KEYMAP` messages, each with the blob's `serial`, the
+piece's `offset` and the blob's `total` size; the piece that ends at `total` completes it. wsd sends it after
+`EV_HELLO`, when the selected input source changes (`kTISNotifySelectedKeyboardInputSourceChanged`), and before a key
+that comes from a keyboard of another type than the layout was read for (an ISO MacBook with an ANSI external
+keyboard): a layout differs by keyboard type. An input method (Japanese, Chinese) gives the layout it types Latin
+letters with. A client from before `EV_KEYMAP` ignores it and keeps its US keyboard; a client that knows it and gets
+none (an older wsd) does the same.
+
+`WSD_KEYMAP_SOURCE` in wsd's environment names an installed layout to tell instead of the selected one
+(`com.apple.keylayout.German`): test only, so that a test changes nothing on the Mac. `tests/keyboard/run.sh` checks
+the blob and the Windows layout wineobelisk.drv makes of it against the Mac's installed layouts.
 
 ## Application
 

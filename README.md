@@ -1,3 +1,5 @@
+> **This is the `orbiters` branch of the Orbiters fork.** It adds the Mac's keyboard layout to wsd's protocol (`EV_KEYMAP`, see [wsd/PROTOCOL.md](wsd/PROTOCOL.md)), which the `orbiters` branch of [Orbiters-cc/voile-wine](https://github.com/Orbiters-cc/voile-wine) builds the Windows layout from. `main` mirrors [Zagrios/voile-lkd](https://github.com/Zagrios/voile-lkd). The changes are not voile-lkd's authors' work: do not report their problems to them.
+
 # voile-lkd
 
 **The Linux engine of [Voile](https://github.com/Zagrios/voile).** It runs unmodified x86-64 Linux programs in native macOS arm64 processes, with no virtual machine and no Hypervisor.framework.

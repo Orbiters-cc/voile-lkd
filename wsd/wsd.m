@@ -30,6 +30,7 @@
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <stdatomic.h>
 #include "wsd_protocol.h"
+#include "wsd_keymap.h"
 
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
@@ -547,7 +548,9 @@ static void audio_clock_leave(WsdAudio *a) {
 @property(strong) NSMutableDictionary<NSNumber *, NSCursor *> *cursors; /* CURSOR_DEFINE */
 @property IOPMAssertionID displayAssertion; /* SCREEN_SAVER 0 holds the display on, kIOPMNullAssertionID otherwise */
 @property BOOL dead;
+@property BOOL greeted; /* said HELLO: it is told the keyboard layout, and each change of it */
 - (void)send:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
+- (void)sendKeymap;
 - (void)close;
 @end
 static void set_display_mode(WsdClient *client, uint32_t width, uint32_t height);
@@ -650,6 +653,49 @@ static struct wsd_hello_reply display_info(void) {
 }
 static struct wsd_hello_reply g_display; /* the screen the clients were last told of */
 
+/* The Mac's keyboard layout as the clients were last told it (WSD_EV_KEYMAP): Wine builds the Windows layout from it,
+ * so that a key gives the game the virtual key and the characters of the layout selected on the Mac, as Wine's Mac
+ * driver does (macdrv_keyboard_changed). Without it the game saw a US keyboard whatever the Mac's layout (2026-11-22:
+ * VRChat on an AZERTY Mac took A for Q and typed "q"). */
+static NSData *g_keymap;
+static uint32_t g_keymap_serial;
+static UInt32 g_keymap_keyboard_type;
+
+/* Reads the selected layout for the keyboard type `keyboard_type` and tells the clients when it is not the one they
+ * have. An input method (Japanese, Chinese) gives the layout it types Latin letters with. */
+static void keymap_refresh(UInt32 keyboard_type) {
+  TISInputSourceRef source = NULL;
+  /* test only: WSD_KEYMAP_SOURCE names an installed layout to tell instead of the selected one, such as
+   * com.apple.keylayout.German, so that a test changes nothing on the Mac */
+  const char *forced = getenv("WSD_KEYMAP_SOURCE");
+  if (forced && *forced) {
+    NSArray *list = CFBridgingRelease(TISCreateInputSourceList(
+        (__bridge CFDictionaryRef) @{(__bridge NSString *)kTISPropertyInputSourceID : @(forced)}, true));
+    if (list.count) source = (TISInputSourceRef)CFRetain((__bridge CFTypeRef)list[0]);
+  }
+  if (!source) source = TISCopyCurrentKeyboardLayoutInputSource();
+  size_t size = 0;
+  void *blob = wsd_keymap_build(source, keyboard_type, &size);
+  if (!blob) {
+    LOG("keyboard layout: the input source has no Unicode layout, the clients keep %s",
+        g_keymap ? "the last one" : "their US keyboard");
+    if (source) CFRelease(source);
+    return;
+  }
+  NSData *keymap = [NSData dataWithBytesNoCopy:blob length:size freeWhenDone:YES];
+  g_keymap_keyboard_type = keyboard_type;
+  if (![keymap isEqualToData:g_keymap]) {
+    const struct wsd_keymap *k = keymap.bytes;
+    g_keymap = keymap;
+    g_keymap_serial++;
+    LOG("keyboard layout %u: %s, keyboard type %u%s, %u dead-key compositions", g_keymap_serial, k->source,
+        k->keyboard_type, (k->flags & WSD_KEYMAP_ISO) ? " (ISO)" : "", k->compositions);
+    for (WsdClient *c in g_clients)
+      if (c.greeted) [c sendKeymap];
+  }
+  if (source) CFRelease(source);
+}
+
 static NSCursor *system_cursor(uint32_t cursor) {
   switch (cursor) {
   case WSD_CURSOR_ARROW: return NSCursor.arrowCursor;
@@ -737,7 +783,16 @@ static CAMetalLayer *make_metal_layer(void) {
   int64_t type = cg ? CGEventGetIntegerValueField(cg, kCGKeyboardEventKeyboardType) : 0;
   return type && KBGetLayoutType((int16_t)type) == kKeyboardISO ? WSD_KEY_ISO : 0;
 }
+/* A key from a keyboard of another type than the layout was read for (an ISO MacBook and an ANSI external keyboard):
+ * the layout is read again for it before the key goes, since a layout differs by keyboard type. A synthetic key has
+ * no type. */
+- (void)noteKeyboardType:(NSEvent *)e {
+  CGEventRef cg = e.CGEvent;
+  int64_t type = cg ? CGEventGetIntegerValueField(cg, kCGKeyboardEventKeyboardType) : 0;
+  if (type > 0 && (UInt32)type != g_keymap_keyboard_type) keymap_refresh((UInt32)type);
+}
 - (void)key:(NSEvent *)e down:(BOOL)down {
+  if (down && !g_injecting) [self noteKeyboardType:e];
   struct wsd_ev_key k = {self.ww.windowId,
                          (down ? WSD_KEY_DOWN : 0) | (e.isARepeat ? WSD_KEY_REPEAT : 0) | [self iso:e] | [self synth],
                          e.keyCode, (uint32_t)(e.modifierFlags >> 16), [self evNs:e]};
@@ -1734,6 +1789,18 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   g_injecting = NO;
 }
 
+/* The keyboard layout, in pieces that fit a message. A client from before WSD_EV_KEYMAP ignores them. */
+- (void)sendKeymap {
+  if (!g_keymap) return;
+  const uint32_t piece = WSD_MAX_PAYLOAD - sizeof(struct wsd_ev_keymap);
+  uint32_t total = (uint32_t)g_keymap.length;
+  for (uint32_t offset = 0; offset < total; offset += piece) {
+    struct wsd_ev_keymap k = {g_keymap_serial, offset, total};
+    NSData *bytes = [g_keymap subdataWithRange:NSMakeRange(offset, MIN(piece, total - offset))];
+    [self send:WSD_EV_KEYMAP payload:&k len:sizeof(k) extra:bytes];
+  }
+}
+
 - (void)handle:(uint32_t)type data:(const uint8_t *)d len:(uint32_t)n {
 #define NEED(T) if (n < sizeof(struct T)) { [self error:type code:-EMSGSIZE]; return; } const struct T *m = (const void *)d
   switch (type) {
@@ -1743,6 +1810,8 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     g_display = r;
     LOG("client %d hello version %u", self.pid, m->version);
     [self send:WSD_EV_HELLO payload:&r len:sizeof(r) extra:nil];
+    self.greeted = YES;
+    [self sendKeymap];
     break;
   }
   case WSD_WINDOW_CREATE: {
@@ -2539,6 +2608,13 @@ int main(int argc, char **argv) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     make_menu();
     [NSApp finishLaunching];
+    /* the keyboard layout, now and each time the player picks another input source */
+    keymap_refresh(LMGetKbdType());
+    [NSDistributedNotificationCenter.defaultCenter
+        addObserverForName:(__bridge NSString *)kTISNotifySelectedKeyboardInputSourceChanged object:nil
+                     queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+      keymap_refresh(g_keymap_keyboard_type ?: LMGetKbdType());
+    }];
     /* App Nap would slow wsd down while its windows are covered and nothing plays, with the game waiting on it (its
      * frames, its input, a match being found meanwhile); Wine's Mac driver turns it off the same way
      * (-[WineApplicationController transformProcessToForeground:]). Idle system sleep stays allowed. */
