@@ -580,7 +580,17 @@ static void apply_app_icon(const char *why) {
   if (!pick)
     for (WsdClient *c in g_clients)
       if (!c.dead && c.icon && (!pick || c.iconSeq < pick.iconSeq)) pick = c;
-  if (!pick) return;
+  if (!pick) {
+    /* No live client has an icon (the one shown left, the rest sent none): the bundle's own icon again, never a
+     * departed client's picture. */
+    if (g_icon_shown || g_icon_image) {
+      NSApp.applicationIconImage = nil;
+      g_icon_image = nil;
+      g_icon_shown = nil;
+      LOG("application icon reset to the bundle's (%s: no client has one)", why);
+    }
+    return;
+  }
   if (pick == shown && g_icon_image == pick.icon) return;
   g_icon_image = pick.icon;
   NSApp.applicationIconImage = pick.icon;
