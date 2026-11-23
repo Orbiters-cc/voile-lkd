@@ -342,6 +342,54 @@ class Bounds(unittest.TestCase):
         self.assertIn("no end record", f.says())
 
 
+class Splits(unittest.TestCase):
+    """What committed a frame's command buffers and cut its main colour target."""
+
+    def recording(self):
+        r = Recording(passes=1)
+        r.export(MS, 0xAAA)
+        for i in range(3):
+            t = (100 + 20 * i) * MS
+            r.frame(t, chunks=3)
+            last = 100 + r.n * 3
+            for c, why, asked, opened in ((last - 2, 17, 0, 1), (last - 1, 6, 15, 0), (last, 19, 0, 0)):
+                r.put("dxmt", t - MS, "D_COMMIT", why | asked << 8 | opened << 16, 1, c, r.n, t - 2 * MS if asked else 0, 1000, 0)
+            # the main target (texture 7): two encoders in the first command buffer, one in each other; another one's between
+            def encoder(chunk, index, texture, ops, stop, width=1323):
+                key, at = 1 << 48 | chunk, t - MS + chunk * 1000 + index
+                r.put("dxmt", at, "D_PASS", index | 1 << 16, key, width << 32 | 860, otl_attachment(115, 2, width, 860))
+                r.put("dxmt", at + 1, "D_PASS_ID", index | 1 << 16, key, texture, 0, stop)
+                r.put("dxmt", at + 2, "D_OPS", index, key, ops, 0, ops * 10)
+            encoder(last - 2, 1, 7, 50, 3)       # a blit needs it
+            encoder(last - 2, 2, 9, 5, 0, 512)
+            encoder(last - 2, 3, 7, 40, 0)
+            encoder(last - 1, 1, 7, 30, 0)
+            encoder(last, 1, 7, 20, 0)
+        return r
+
+    def test_each_cut_is_told_by_what_made_it(self):
+        s = self.recording().finish()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            told = otl.splits(s, s.frames)
+        self.assertEqual((told["recorded_frames"], told["encoders"], told["cuts"]), (2, 4.0, 3.0), "the first frame's command buffers are not known")
+        self.assertEqual(told["cut_by"], {
+            "encoder: a blit that needs it": 1.0,
+            "command buffer: GetData(DONOTFLUSH) of an event query not there 64 times before": 1.0,
+            "command buffer: End of an occlusion query, committed at ClearUnorderedAccessView": 1.0})
+        self.assertEqual((told["command_buffers"], told["open_pass"]), (3.0, 1.0))
+        self.assertIn("RGBA16F 1323x860 2x", out.getvalue())
+
+    def test_a_recording_of_before_says_nothing(self):
+        s = steady().finish()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(otl.splits(s, s.frames)["frames_with_commits"], 0)
+        self.assertEqual(out.getvalue(), "")
+
+
+def otl_attachment(fmt, samples, w, h):
+    return fmt | samples << 16 | 1 << 24 | 1 << 28 | w << 34 | h << 49
+
+
 class Passes(unittest.TestCase):
     def recording(self, every=2):
         r = Recording(passes=every)

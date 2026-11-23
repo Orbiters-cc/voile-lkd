@@ -33,6 +33,7 @@
 #include "wsd_keymap.h"
 #define OTL_IMPLEMENTATION
 #include "otl.h"
+#include "wsd_upscale.h"
 
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
@@ -43,6 +44,12 @@ static id<MTLCommandQueue> g_queue;
 static id<MTLRenderPipelineState> g_pipe;
 static BOOL g_exit_on_disconnect;
 typedef struct { double x, y; } WsdScale; /* pixels per point on each axis, see scale_at() */
+/* Developers' switches, both off without their variable, which launch.sh gives to wsd alone (docs/wsd-switches.md):
+ * OBELISK_WSD_UPSCALE=metalfx scales a frame smaller than its window's pixels here (wsd_upscale.h);
+ * OBELISK_WSD_PRESENT, a list of: "arrival" (a frame is drawn as it arrives, while a drawable is sure to be free, instead of at
+ * the next display-link tick), "attime" (presented for the next refresh the link names), "nosync"
+ * (displaySyncEnabled off), "two" (two drawables instead of three). */
+static BOOL g_upscale, g_present_arrival, g_present_attime, g_present_nosync, g_present_two;
 static int g_render_percent = 100; /* --render-percent, 1 to 100 (PROTOCOL.md, "Render percent") */
 static uint32_t g_mode_width_px, g_mode_height_px; /* SET_DISPLAY_MODE: the size a game switched the display to, 0: that side is not lowered */
 static __weak id g_mode_owner;          /* the client that set it, which takes it back when it goes (a WsdClient) */
@@ -202,6 +209,13 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property(strong) WsdBuffer *lastBuffer;
 @property BOOL redisplay;
 @property int redisplayTries;
+/* OBELISK_WSD_UPSCALE: this plane's scaler, the one being made, and how many frames in a row have asked for that one */
+@property(strong) WsdScaler *scaler, *scalerAsked;
+@property int scalerAskedFrames;
+/* frames committed whose presentation (or its absence) was not told yet, and when the display's next refresh is */
+@property int onTheirWay;
+@property uint64_t drawnNs;
+@property CFTimeInterval nextRefresh, refreshPeriod;
 @property uint64_t pendingSerial, pendingClientNs, pendingReceivedNs;
 @property uint32_t replaced, nPresented, nZero;
 /* present interval statistics (logged every 120 shown frames per plane) */
@@ -807,8 +821,8 @@ static CAMetalLayer *make_metal_layer(void) {
   l.opaque = YES;
   l.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
   l.framebufferOnly = YES;
-  l.maximumDrawableCount = 3;
-  l.displaySyncEnabled = YES;
+  l.maximumDrawableCount = g_present_two ? 2 : 3;
+  l.displaySyncEnabled = !g_present_nosync;
   l.allowsNextDrawableTimeout = YES;
   l.contentsGravity = kCAGravityResize;
   return l;
@@ -1215,6 +1229,12 @@ static CAMetalLayer *make_metal_layer(void) {
 
 /* Display-link tick: encode the latest pending frame, if any. */
 - (void)tick:(CADisplayLink *)link {
+  if (g_present_attime) {
+    for (WsdWindow *p = self; p; p = p == self ? self.overlay : nil) {
+      p.nextRefresh = link.targetTimestamp;
+      p.refreshPeriod = link.duration;
+    }
+  }
   if (otl_active()) {
     WsdWindow *p = self.overlay ?: self;
     BOOL seen = self.window.visible && (self.window.occlusionState & NSWindowOcclusionStateVisible);
@@ -1228,7 +1248,71 @@ static CAMetalLayer *make_metal_layer(void) {
   if (self.overlay) [self.overlay tickPlane];
 }
 
+/* The pixels of this plane on its display: what a frame is scaled to. */
+- (CGSize)nativeSize {
+  double s = self.window.backingScaleFactor;
+  CGSize pt = self.isOverlay ? self.layer.bounds.size : self.view.bounds.size;
+  return CGSizeMake(round(pt.width * s), round(pt.height * s));
+}
+
+/* The scaler that shows `b` at this plane's pixels, when there is one ready: none for a frame that is not smaller than
+ * them, for a size that has not settled, for one MetalFX has none for, and while it is being made (off this queue). */
+- (WsdScaler *)scalerFor:(WsdBuffer *)b {
+  if (!g_upscale) return nil;
+  CGSize out = [self nativeSize];
+  NSUInteger w = (NSUInteger)out.width, h = (NSUInteger)out.height;
+  if (!upscale_wanted(b.width, b.height, w, h)) {
+    self.scaler = self.scalerAsked = nil; /* its textures go with it */
+    return nil;
+  }
+  if ([self.scaler isFor:b.texture width:w height:h]) return self.scaler.scaler ? self.scaler : nil;
+  if (![self.scalerAsked isFor:b.texture width:w height:h]) {
+    WsdScaler *ask = [WsdScaler new];
+    ask.inWidth = b.width; ask.inHeight = b.height; ask.format = b.texture.pixelFormat; ask.outWidth = w; ask.outHeight = h;
+    self.scalerAsked = ask;
+    self.scalerAskedFrames = 0;
+  }
+  if (++self.scalerAskedFrames == UPSCALE_SETTLED) {
+    WsdScaler *ask = self.scalerAsked;
+    uint32_t bw = b.width, bh = b.height, wid = self.windowId;
+    MTLPixelFormat format = b.texture.pixelFormat;
+    __weak WsdWindow *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      uint64_t t0 = now_ns();
+      WsdScaler *made = upscale_make(g_dev, bw, bh, format, w, h);
+      uint64_t took = now_ns() - t0;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        WsdWindow *sw = weakSelf;
+        if (!sw || sw.scalerAsked != ask) return; /* another size was asked for meanwhile */
+        sw.scaler = made;
+        sw.scalerAsked = nil;
+        LOG("window %u %s: frames of %ux%u are scaled to %lux%lu with MetalFX%s (made in %.0f ms)", wid,
+            sw.isOverlay ? "overlay" : "base", bw, bh, (unsigned long)w, (unsigned long)h,
+            made.scaler ? "" : ": not possible, macOS stretches them", took / 1e6);
+      });
+    });
+  }
+  return nil;
+}
+
+/* OBELISK_WSD_PRESENT=arrival: whether a drawable is sure to be free (one is on the screen, the others on their way to it). What
+ * is on its way and was not told of for 100 ms is not waited for any longer. */
+- (BOOL)drawableSure {
+  if (now_ns() - self.drawnNs > 100 * NSEC_PER_MSEC) self.onTheirWay = 0;
+  return self.onTheirWay < (g_present_two ? 1 : 2);
+}
+
+/* The frame that has just arrived is drawn now when it can be; else the next display-link tick takes it. */
+- (void)arrived {
+  if (g_present_arrival && [self drawableSure]) [self drawPlane:YES];
+}
+
 - (void)tickPlane {
+  if (g_present_arrival && ![self drawableSure]) return; /* (the main queue never waits for a drawable) */
+  [self drawPlane:NO];
+}
+
+- (void)drawPlane:(BOOL)onArrival {
   WsdBuffer *b = self.pendingBuffer;
   BOOL redisplay = NO;
   if (!b && self.redisplay && self.lastBuffer && !self.lastBuffer.detached) { b = self.lastBuffer; redisplay = YES; }
@@ -1249,19 +1333,25 @@ static CAMetalLayer *make_metal_layer(void) {
   }
   if (redisplay) self.redisplay = NO;
   else { self.pendingBuffer = nil; self.lastBuffer = b; self.redisplayTries = 0; self.overlayGone = NO; }
-  CGSize want = CGSizeMake(b.width, b.height);
+  WsdScaler *scaler = [self scalerFor:b];
+  CGSize want = scaler ? CGSizeMake(scaler.outWidth, scaler.outHeight) : CGSizeMake(b.width, b.height);
   if (!CGSizeEqualToSize(self.layer.drawableSize, want)) self.layer.drawableSize = want;
+  /* (the drawable in hand has the size of before: the triangle fills it whatever its size, as ever) */
+  BOOL scaled = scaler && d.texture.width == scaler.outWidth && d.texture.height == scaler.outHeight;
 
   MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
   rp.colorAttachments[0].texture = d.texture;
   rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
   rp.colorAttachments[0].storeAction = MTLStoreActionStore;
   id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-  id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-  [enc setRenderPipelineState:g_pipe];
-  [enc setFragmentTexture:b.texture atIndex:0];
-  [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-  [enc endEncoding];
+  if (scaled) upscale_encode(scaler, cb, g_pipe, b.texture, d.texture);
+  else {
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:g_pipe];
+    [enc setFragmentTexture:b.texture atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+  }
 
   struct wsd_ev_presented ev = {self.windowId, b.bufferId, self.pendingSerial, self.pendingClientNs,
                                 self.pendingReceivedNs, tick_ns, 0, self.replaced, 0};
@@ -1269,6 +1359,7 @@ static CAMetalLayer *make_metal_layer(void) {
   uint64_t serial = self.pendingSerial;
   __weak WsdWindow *weakSelf = self;
   uint32_t otl_window = self.windowId | (self.isOverlay ? 1u << 30 : 0) | (redisplay ? 1u << 31 : 0), otl_plane = self.otlId;
+  const uint32_t otl_path = (scaled ? 1u << 28 : 0) | (onArrival ? 1u << 29 : 0);
   if (otl_active()) {
     otl_hist(OTL_H_A, drawable_ns - tick_ns);
     if (!redisplay) otl_hist(OTL_H_B, tick_ns - self.pendingReceivedNs);
@@ -1282,6 +1373,7 @@ static CAMetalLayer *make_metal_layer(void) {
     }
     dispatch_async(dispatch_get_main_queue(), ^{
       WsdWindow *sw = weakSelf;
+      if (sw.onTheirWay > 0) sw.onTheirWay--;
       if (e2.presented_ns) sw.nPresented++; else sw.nZero++;
       if (e2.presented_ns && !redisplay) {
         [sw.isOverlay ? sw.base : sw frameShownAt:now_ns()];
@@ -1315,13 +1407,22 @@ static CAMetalLayer *make_metal_layer(void) {
       if (!redisplay) [weakSelf sendEvent:WSD_EV_PRESENTED payload:&e2 len:sizeof(e2) extra:nil];
     });
   }];
-  [cb presentDrawable:d];
+  self.onTheirWay++;
+  self.drawnNs = now_ns();
+  if (g_present_attime && self.nextRefresh) {
+    CFTimeInterval at = self.nextRefresh, now = now_ns() / 1e9;
+    while (at <= now && self.refreshPeriod > 0) at += self.refreshPeriod;
+    [cb presentDrawable:d atTime:at];
+  } else {
+    [cb presentDrawable:d];
+  }
   /* The drawable does not keep its layer, which Metal's queue reads when it presents (the Metal HUD of the
    * performance sharing does): a plane removed meanwhile, as when a game recreates its swapchain, would free it first
    * (2026-10-21: wsd crashed in libMTLHud on a nil layer). The command buffer keeps it until it completes. */
   CAMetalLayer *layer = self.layer;
   [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
     (void)layer;
+    (void)scaler; /* what it wrote goes to the screen with this buffer */
     if (otl_active())
       otl_put(otl_now(), OTL_W_GPU, otl_window, serial, (uint64_t)(c.GPUStartTime * 1e9), (uint64_t)(c.GPUEndTime * 1e9),
               (uint64_t)(c.kernelStartTime * 1e9), (uint64_t)(c.kernelEndTime * 1e9), otl_plane);
@@ -1329,7 +1430,7 @@ static CAMetalLayer *make_metal_layer(void) {
       dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf releaseBuffer:b serial:serial shown:YES]; });
   }];
   [cb commit];
-  if (otl_active()) otl_put(otl_now(), OTL_W_DRAW, otl_window, b.bufferId, serial, tick_ns, drawable_ns, d.drawableID, otl_plane);
+  if (otl_active()) otl_put(otl_now(), OTL_W_DRAW, otl_window | otl_path, b.bufferId, serial, tick_ns, drawable_ns, d.drawableID, otl_plane);
 }
 
 /* Moves and/or resizes the content area. Pixels are converted with the effective scale (backing_scale()); y counts
@@ -2070,6 +2171,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     w.pendingSerial = m->serial;
     w.pendingClientNs = m->client_time_ns;
     w.pendingReceivedNs = rx;
+    [w arrived];
     break;
   }
   case WSD_DEBUG_INPUT: {
@@ -2189,6 +2291,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     o.pendingSerial = m->present.serial;
     o.pendingClientNs = m->present.client_time_ns;
     o.pendingReceivedNs = rx;
+    [o arrived];
     break;
   }
   case WSD_SET_TITLE: {
@@ -2660,6 +2763,16 @@ int main(int argc, char **argv) {
     pd.fragmentFunction = [lib newFunctionWithName:@"fmain"];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     g_pipe = lib ? [g_dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+    const char *present = getenv("OBELISK_WSD_PRESENT"), *upscale = getenv("OBELISK_WSD_UPSCALE");
+    if (present) {
+      g_present_arrival = strstr(present, "arrival") != NULL;
+      g_present_attime = strstr(present, "attime") != NULL;
+      g_present_nosync = strstr(present, "nosync") != NULL;
+      g_present_two = strstr(present, "two") != NULL;
+    }
+    g_upscale = upscale_init(g_dev, upscale);
+    if (present || upscale)
+      LOG("switches: upscale %s (%s), present %s", upscale ?: "unset", g_upscale ? "MetalFX" : "as ever", present ?: "unset");
     if (!g_pipe) { LOG("Metal setup failed: %s", err.localizedDescription.UTF8String); return 1; }
 
     static char path[128];

@@ -4,7 +4,8 @@ bench (bench.py of Orbiters-N4N0) and the developer's obelisk-cli are the real o
 are temporary, and the owned Direct3D 11 client (tests/graphics/pass_costs.cpp) stands in VRChat's place (rehearse_cli.py).
 
 Usage: rehearse.py --cli <developer's obelisk-cli> --generation <folder> --release <Voile release folder, as Voile ships it>
-                   --bench <tools/mac-bench> --client <pass_costs.exe> --out <folder> [--mode heavy60] [--plan 58,100,45]
+                   --client <pass_costs.exe> --out <folder> [--bench <folder of bench.py>] [--mode heavy60] [--plan 58,100,45]
+                   [--switch NAME=VALUE ...]
 
 The client covers the screen for less than a minute per start. Refuses while the screen is locked."""
 import argparse, json, os, shutil, subprocess, sys
@@ -14,8 +15,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for name in ("--cli", "--generation", "--release", "--bench", "--client", "--out"):
+    for name in ("--cli", "--generation", "--release", "--client", "--out"):
         p.add_argument(name, required=True)
+    p.add_argument("--bench", default=HERE)
+    p.add_argument("--switch", action="append", default=[])
     p.add_argument("--mode", default="heavy60")
     p.add_argument("--plan", default="58,100,45")
     p.add_argument("--seconds", type=int, default=45)
@@ -49,6 +52,8 @@ def main():
     command = ["/usr/bin/python3", "-I", os.path.join(HERE, "real_session.py"), "vrchat://launch?ref=orbiters.cc&id=wrld_00000000-0000-0000-0000-000000000000:12345~private(usr_rehearsal)~region(eu)",
                "--rehearse", "--cli", stub, "--generation", os.path.abspath(a.generation), "--bench", os.path.abspath(a.bench), "--out", os.path.join(out, "evidence"),
                "--plan", a.plan, "--warm", "4", "--window", str(a.window), "--windows", str(a.windows), "--between", "5", "--passes", a.passes]
+    for switch in a.switch:
+        command += ["--switch", switch]
     runner = subprocess.Popen(command, env=env)
     while True:
         try:

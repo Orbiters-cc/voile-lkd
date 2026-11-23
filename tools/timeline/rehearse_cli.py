@@ -45,8 +45,6 @@ def play(words):
             with open(os.path.join(HOME, "running.json"), "w") as f:
                 json.dump(dict(session=session, pid=pid), f)
             tell(event="running", app_id=438100, pid=pid, session_id=session)
-            # (a program of no app of its own is not brought to the front by itself, as a game's is)
-            subprocess.Popen("sleep 4; /usr/bin/open \"${TMPDIR:-/tmp}/obelisk-apps/Rehearsal/Rehearsal.app\"", shell=True, stdout=subprocess.DEVNULL)
             now = f"{datetime.datetime.now():%Y.%m.%d %H:%M:%S} Debug      -  "
             place = link.split("id=")[1]
             with open(f"{vrchat}/output_log_{datetime.datetime.now():%Y-%m-%d_%H-%M-%S}.txt", "w") as f:

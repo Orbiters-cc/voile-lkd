@@ -23,7 +23,8 @@ import argparse, bisect, collections, csv, glob, json, os, re, struct, sys
 K = dict(THREAD=1, SUMMARY=2, HIST=3, LOST=4, END=5, N_EXPORT=16, N_SIGNAL=18, N_COUNTS=19, N_FENCE=20, N_PAIR=21, N_RETIRE=22,
          N_FLUSH=23, V_RETIRE=24, N_GONE=26, N_FRAME=27, N_EVENT=28, N_ARM=29, D_READY=32, D_ENCODE=33, D_DONE=34, D_SIGNAL=35,
          D_SEOC=36, D_NOTIFY=37, D_PIPELINE=38, D_INIT=39, D_INIT_DONE=40, D_PASS=41, D_PASS_DS=42, D_BLIT=43, D_COMPUTE=44,
-         D_OPS=45, D_PASS_TIME=46, D_QUEUE=47, D_PASS_SKIP=48, D_CLOCK=49, W_ATTACH=64, W_RX=65, W_TICK=66, W_DRAW=67, W_GPU=68,
+         D_OPS=45, D_PASS_TIME=46, D_QUEUE=47, D_PASS_SKIP=48, D_CLOCK=49, D_COMMIT=50,
+         D_PASS_ENDED=51, D_PASS_ID=52, W_ATTACH=64, W_RX=65, W_TICK=66, W_DRAW=67, W_GPU=68,
          W_SHOWN=69, W_RELEASE=70, W_DETACH=71)
 REC = struct.Struct("<QHHI6Q")
 Rec = collections.namedtuple("Rec", "t kind thr a v")
@@ -32,6 +33,16 @@ STORE = {0: "dontcare", 1: "store", 2: "resolve", 3: "store+resolve", 4: "unknow
 END = {0: "exit", 1: "budget", 2: "write", 3: "space"}
 SKIP = {1: "no sample buffer free", 2: "too many encoders", 3: "no GPU timestamps here", 4: "its command buffer failed",
         5: "not resolved"}
+WHY = {0: "another call", 1: "OMSetRenderTargets", 2: "a target also bound to be written elsewhere", 3: "ClearRenderTargetView",
+       4: "ClearDepthStencilView", 5: "ClearView", 6: "ClearUnorderedAccessView", 7: "the next Draw", 8: "Dispatch", 9: "a copy",
+       10: "an upload (UpdateSubresource, a dynamic texture's Unmap, a copy from staging)", 11: "a readback (a copy to staging)",
+       12: "ResolveSubresource", 13: "End of an event or disjoint query", 14: "End of a timestamp query", 15: "End of an occlusion query",
+       16: "GetData that may flush, its query not there", 17: "GetData(DONOTFLUSH) of an event query not there 64 times before",
+       18: "Flush", 19: "Signal", 20: "Wait", 21: "Map of a staging resource in use", 22: "a keyed mutex", 23: "ExecuteCommandList",
+       24: "WaitUntilGPUIdle", 25: "Present", 26: "a reset of the state", 27: "UpdateSubresource of a staging resource", 28: "an upscale"}
+FLUSHES = {16, 17, 18, 19, 20, 21, 22, 24}  # the call itself commits; else a commit asked for before it
+STOP = {0: "the command buffer's end", 1: "a render pass that needs it", 2: "a dispatch that needs it", 3: "a blit that needs it",
+        4: "a clear that needs it", 5: "a resolve that needs it", 6: "an event signalled or waited for", 7: "a timestamp", 8: "another encoder"}
 COMPLETED, NONE, SERIAL = 4, 2**64 - 1, (1 << 48) - 1  # MTLCommandBufferStatusCompleted
 # Kept whatever the time asked for: what names things that live longer than it.
 ALWAYS = {K[k] for k in ("THREAD", "SUMMARY", "HIST", "LOST", "END", "N_EXPORT", "N_GONE", "N_EVENT", "D_QUEUE", "D_CLOCK",
@@ -469,6 +480,10 @@ class Session:
         l = [r for r in d.get("D_CLOCK") if r.v[4] == queue]
         if len(l) < 2 or l[-1].v[1] <= l[0].v[1]:
             return None, "fewer than two clocks of both"
+        # A device whose GPU clock is its CPU clock, and that one uptime (each value inside its own moment): no map is needed, and
+        # a moment that took long (the thread had to wait) says nothing against it.
+        if all(r.v[0] == r.v[1] and r.v[2] <= r.v[1] <= r.v[3] for r in l):
+            return (1.0, 0, 0, 0), None
         mid = lambda r: (r.v[2] + r.v[3]) / 2
         rate = (mid(l[-1]) - mid(l[0])) / (l[-1].v[1] - l[0].v[1])
         worst = max(abs(mid(l[0]) + (r.v[1] - l[0].v[1]) * rate - mid(r)) for r in l)
@@ -483,7 +498,7 @@ class Session:
             self.passes_by = {}
         if d.pid not in self.passes_by:
             by = self.passes_by[d.pid] = collections.defaultdict(list)
-            for k in ("D_PASS", "D_PASS_DS", "D_BLIT", "D_COMPUTE", "D_OPS", "D_PASS_TIME", "D_PASS_SKIP"):
+            for k in ("D_PASS", "D_PASS_DS", "D_PASS_ID", "D_BLIT", "D_COMPUTE", "D_OPS", "D_PASS_TIME", "D_PASS_SKIP"):
                 for r in d.get(k):
                     by[r.v[0]].append(r)
             self.clocks = getattr(self, "clocks", {})
@@ -502,6 +517,8 @@ class Session:
                     e.update(type="render", colours=r.v[2:2 + min(n, 4)], more=max(0, n - 4))
                 elif r.kind == K["D_PASS_DS"]:
                     e.update(depth=r.v[1], stencil=r.v[2])
+                elif r.kind == K["D_PASS_ID"]:
+                    e.update(texture=r.v[1], depth_texture=r.v[2], stop=r.v[3])
                 elif r.kind == K["D_BLIT"]:
                     e["type"] = "blit"
                 elif r.kind == K["D_COMPUTE"]:
@@ -538,6 +555,92 @@ class Session:
                 return None, "outside its command buffer's GPU time"
             out.append((name, a, b))
         return (out, None) if out else (None, "nothing written")
+
+
+    def commits(self, pid):
+        """(queue, chunk) -> why its command buffer was committed (D_COMMIT)."""
+        if not hasattr(self, "commits_by"):
+            self.commits_by = {}
+        if pid not in self.commits_by:
+            self.commits_by[pid] = {(r.v[0], r.v[1]): r for r in self.dxmt[pid].get("D_COMMIT")}
+        return self.commits_by[pid]
+
+
+def commit_text(r):
+    if r is None:
+        return "not recorded"
+    why, asked = r.a & 0xff, r.a >> 8 & 0xff
+    if why in FLUSHES or not asked:
+        return WHY.get(why, str(why))
+    return f"{WHY.get(asked, asked)}, committed at {WHY.get(why, why)}"
+
+
+def splits(s, frames):
+    """Per frame: how often the main colour target's draws were cut into another encoder, and by what; and what committed its
+    command buffers. The main colour target: the texture (by identity) whose encoders hold most draws. A cut between two encoders
+    of it in different command buffers is the commit of the first one's; inside one command buffer, what the first could not be
+    put beyond."""
+    looked, pieces, draws, why, size = 0, [], [], collections.Counter(), collections.Counter()
+    commits, buffers, with_open, waited = collections.Counter(), 0, 0, 0
+    n_commits = 0
+    ended = collections.Counter()
+    for f in frames:
+        if "queue" not in f or "chunks" not in f:
+            continue
+        by = s.commits(f["npt"].pid)
+        rs = [by.get((f["queue"], c)) for c in f["chunks"]]
+        if any(rs):
+            n_commits += 1
+            buffers += len(rs)
+            for r in rs:
+                commits[commit_text(r)] += 1
+                with_open += bool(r and r.a >> 16 & 1)
+                waited += r.v[4] if r else 0
+        l = s.passes(f)
+        if not l or not any("stop" in e for e in l):
+            continue
+        looked += 1
+        targets = collections.defaultdict(list)
+        for e in l:
+            if e["type"] == "render" and e["colours"]:
+                targets[(e.get("texture"), e["colours"][0] & 0xffffff | (e["colours"][0] >> 34) << 34)].append(e)
+        key, mine = max(targets.items(), key=lambda t: sum(e["ops"] for e in t[1]), default=(None, []))
+        if not mine:
+            continue
+        size[attachment_text(mine[0]["colours"][0]).rsplit(" ", 1)[0]] += 1
+        pieces.append(len(mine))
+        draws.append(sum(e["ops"] for e in mine))
+        for a, b in zip(mine, mine[1:]):
+            if a["chunk"] != b["chunk"]:
+                why["command buffer: " + commit_text(by.get((f["queue"], a["chunk"])))] += 1
+            else:
+                stop = a.get("stop", 0)
+                why["encoder: " + (("the same targets, not joinable (" + STOP.get(stop & 15, "?") + ")") if stop & 16 else STOP.get(stop & 15, "?"))] += 1
+    for d in s.dxmt.values():
+        wanted = {(f["queue"], f["group"]) for f in frames if "queue" in f and f["npt"].pid == d.pid}
+        for r in d.get("D_PASS_ENDED"):
+            if (r.v[0], r.v[2]) in wanted:
+                ended[WHY.get(r.a, r.a)] += 1
+    if n_commits:
+        print(f"  command buffers: {buffers / n_commits:.1f} a frame, {with_open / n_commits:.1f} of them committed while a render pass was "
+              f"open; a commit waited {waited / max(1, buffers) / 1e6:.3f} ms for a free one. Committed by:")
+        for w, c in commits.most_common():
+            print(f"    {c / n_commits:7.2f}  {w}")
+    out = dict(frames_with_commits=n_commits, command_buffers=buffers / n_commits if n_commits else None, open_pass=with_open / n_commits if n_commits else None,
+               committed_by={w: c / n_commits for w, c in commits.items()})
+    if looked:
+        cuts = sum(why.values())
+        print(f"  the main colour target ({size.most_common(1)[0][0] if size else 'none'}, {mean(draws):.0f} draws): {mean(pieces):.2f} encoders a frame, "
+              f"{cuts / looked:.2f} cuts, over {looked} recorded frames ({sum(1 for p in pieces if p > 1)} of them cut). Cut by:")
+        for w, c in why.most_common():
+            print(f"    {c / looked:7.2f}  {w}")
+        if ended:
+            print("  render passes ended in the context, before any were put together, a frame:")
+            for w, c in ended.most_common():
+                print(f"    {c / looked:7.2f}  {w}")
+        out.update(recorded_frames=looked, target=size.most_common(1)[0][0] if size else None, encoders=mean(pieces), cuts=cuts / looked,
+                   cut_by={w: c / looked for w, c in why.items()}, passes_ended_by={w: c / looked for w, c in ended.items()})
+    return out
 
 
 def pass_text(e):
@@ -688,6 +791,8 @@ def cadence(s, lo, hi, plane=None):
             shown = {r.v[0]: r.v[1] for r in callbacks if r.v[1] and not r.a >> 31}
             wg = [r.v[2] - r.v[1] for r in w.get("W_GPU") if lo <= r.t <= hi and r.v[5] == p and r.v[2] > r.v[1]]
             waits = [r.v[3] - r.v[2] for r in new]
+            sent = {r.v[1]: r.v[2] for r in rx}
+            client = [t - sent[k] for k, t in shown.items() if k in sent and t > sent[k]]
             lat = [shown[r.v[1]] - r.v[2] for r in new if r.v[1] in shown]
             links = [r.v[2] for r in ticks if r.v[2]]
             refresh = pct(links, 50) if links else 1e9 / 60
@@ -704,6 +809,8 @@ def cadence(s, lo, hi, plane=None):
                      shown_interval_ms={f"p{q}": pct(gaps, q) / 1e6 for q in (50, 95, 99)},
                      shown_intervals_in_refreshes=dict(sorted(collections.Counter(round(g / refresh) for g in gaps).items())),
                      next_drawable_ms={f"p{q}": pct(waits, q) / 1e6 for q in (50, 90, 99)}, gpu_ms={f"p{q}": pct(wg, q) / 1e6 for q in (50, 99)},
+                     drawn_on_arrival=sum(1 for r in new if r.a >> 29 & 1), drawn_scaled=sum(1 for r in new if r.a >> 28 & 1),
+                     client_to_shown_ms={f"p{q}": pct(client, q) / 1e6 for q in (50, 95, 99)},
                      tick_to_shown_ms={f"p{q}": pct(lat, q) / 1e6 for q in (50, 90)})
             out.append(d)
             print(f"  plane {p} (window {window}{', overlay' if d['region'] else ''}): received {d['received']} ({d['received_per_s']:.2f}/s), "
@@ -716,7 +823,8 @@ def cadence(s, lo, hi, plane=None):
                   + ", ".join(f"{k}: {v}" for k, v in d["shown_intervals_in_refreshes"].items()))
             print(f"    nextDrawable p50 {d['next_drawable_ms']['p50']:.3f} p99 {d['next_drawable_ms']['p99']:.3f} ms; wsd GPU p50 "
                   f"{d['gpu_ms']['p50']:.3f} p99 {d['gpu_ms']['p99']:.3f} ms; tick to shown p50 {d['tick_to_shown_ms']['p50']:.3f} p90 "
-                  f"{d['tick_to_shown_ms']['p90']:.3f} ms")
+                  f"{d['tick_to_shown_ms']['p90']:.3f} ms; client to shown p50 {d['client_to_shown_ms']['p50']:.3f} p95 "
+                  f"{d['client_to_shown_ms']['p95']:.3f} ms; drawn on arrival {d['drawn_on_arrival']}, scaled {d['drawn_scaled']}")
     if not out:
         print("  no frames received" + (f" on plane {plane}" if plane is not None else ""))
     return out
@@ -746,6 +854,7 @@ def main():
     p.add_argument("--plane", type=int, help="only the frames of this plane of wsd's")
     p.add_argument("--frames", type=int, default=0, help="print that many frames one by one")
     p.add_argument("--passes", action="store_true", help="the encoder list of the commonest frame")
+    p.add_argument("--splits", action="store_true", help="what committed the command buffers and cut the main colour target's passes")
     p.add_argument("--cadence", action="store_true", help="wsd's ticks, drawables and shown frames, per plane")
     p.add_argument("--csv", help="the frames reported, one per line")
     p.add_argument("--json", help="the counts, per report")
@@ -783,6 +892,8 @@ def main():
             report(s, frames, title)
             if a.passes:
                 passes_report(s, frames)
+            if a.passes or a.splits:
+                told[-1]["splits"] = splits(s, frames)
             if a.frames:
                 print("  " + " ".join(f"{h[:9]:>9s}" for h in ["value", "wait"] + PARTS))
                 for f in [f for f in frames if "parts" in f][: a.frames]:

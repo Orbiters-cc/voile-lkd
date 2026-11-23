@@ -255,6 +255,135 @@ static void heavy(unsigned f) {
   use(back, nullptr, W, H); tri(vb_full, ps_tex, one.srv);
 }
 
+/* ---- what a game does in the middle of a scene, and whether the renderer pays for it with a split of the pass ----
+ * The scene of all of these is VRChat's shape: one full-size 2x colour and depth, 266 draws with a constant buffer each, half of
+ * them covering the picture (so that the GPU is the limiter and frames overlap), a 256 x 256 target drawn after every 40; then
+ * the resolve and the back buffer. `at` is called before draw number n. */
+static ID3D11Buffer *vb_dyn, *default_buf;
+static ID3D11Texture2D *staging_tex, *dyn_tex;
+static ID3D11Query *occ[4], *stamps[4], *disjoint[4], *events[4];
+static unsigned long long polls, polled_ready;
+
+static void constant(float a, float b, float c) {
+  D3D11_MAPPED_SUBRESOURCE m;
+  HR(ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m));
+  float v[4] = {a, b, c, 1};
+  memcpy(m.pData, v, sizeof(v));
+  ctx->Unmap(cb, 0);
+  ctx->PSSetConstantBuffers(0, 1, &cb);
+}
+static void scene_with(unsigned f, void (*at)(unsigned f, int n), bool between = true) {
+  use(ms.rtv, ms.dsv, W, H); clear(ms.rtv, ms.dsv, f);
+  ctx->OMSetBlendState(add, nullptr, ~0u);
+  for (int n = 0; n < 266; n++) {
+    if (at) at(f, n);
+    if (between && n % 40 == 39) {
+      Target &t = tiny[n / 40 % 8];
+      use(t.rtv, nullptr, 256, 256); clear(t.rtv, nullptr, f); tri(vb_small, ps_color, nullptr);
+      use(ms.rtv, ms.dsv, W, H);
+    }
+    constant(n / 266.0f, (f % 30) / 30.0f, .2f);
+    if (n % 2 == 0) tri(vb_full, ps_tex, copy[n >> 1 & 1].srv);
+    else tri(vb_small, ps_cbuf, nullptr);
+  }
+  ctx->OMSetBlendState(nullptr, nullptr, ~0u);
+  ctx->ResolveSubresource(one.tex, 0, ms.tex, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+  use(back, nullptr, W, H); tri(vb_full, ps_tex, one.srv);
+}
+static void poll(ID3D11Query *q, UINT flags) {
+  UINT64 out[4];
+  polls++;
+  if (ctx->GetData(q, out, q->GetDataSize(), flags) == S_OK) polled_ready++;
+}
+/* nothing of it */
+static void q_none(unsigned f) { scene_with(f, nullptr); }
+/* an event query ended once a frame, after the picture, and looked at (DONOTFLUSH) as the next frame begins: what an engine's
+ * frame pacing does. The host polls it every 100 us from then on. */
+static void q_event_frame(unsigned f) {
+  if (f > 3) poll(events[(f + 1) & 3], D3D11_ASYNC_GETDATA_DONOTFLUSH);
+  scene_with(f, nullptr);
+  ctx->End(events[f & 3]);
+}
+/* the same, the host told to look at nothing: the query is never ended (as q_none) but a timestamp disjoint pair is */
+static void q_disjoint_frame(unsigned f) {
+  if (f > 3) poll(disjoint[(f + 1) & 3], D3D11_ASYNC_GETDATA_DONOTFLUSH);
+  ctx->Begin(disjoint[f & 3]);
+  ctx->End(stamps[f & 3]);
+  scene_with(f, nullptr);
+  ctx->End(disjoint[f & 3]);
+}
+/* an event query ended in the middle of the scene (a fence an engine puts after its uploads) */
+static void at_event(unsigned f, int n) { if (n == 133) ctx->End(events[f & 3]); }
+static void q_event_mid(unsigned f) { scene_with(f, at_event); }
+/* four timestamps in the scene (a GPU profiler's) */
+static void at_stamp(unsigned f, int n) { if (n % 66 == 33) ctx->End(stamps[n / 66 & 3]); (void)f; }
+static void q_stamp_mid(unsigned f) { scene_with(f, at_stamp); }
+/* four occlusion queries in the scene (lens flares, visibility), the results of the frame before looked at first */
+static void at_occ(unsigned f, int n) {
+  if (n == 0 && f > 3) for (auto q : occ) poll(q, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+  if (n % 66 == 30) ctx->Begin(occ[n / 66 & 3]);
+  if (n % 66 == 34) ctx->End(occ[n / 66 & 3]);
+}
+static void q_occ_mid(unsigned f) { scene_with(f, at_occ); }
+/* the same queries around draws, and no target drawn between the parts of the scene */
+static void q_occ_alone(unsigned f) { scene_with(f, at_occ, false); }
+/* a query looked at without DONOTFLUSH while the scene is recorded */
+static void at_poll_flush(unsigned f, int n) { if (n % 66 == 33 && f > 3) poll(events[(f + 3) & 3], 0); }
+static void q_event_pollflush(unsigned f) { scene_with(f, at_poll_flush); ctx->End(events[f & 3]); }
+/* a dynamic vertex buffer written before each draw: discarded, or appended to */
+static void at_discard(unsigned, int n) {
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (n % 4) return;
+  HR(ctx->Map(vb_dyn, 0, D3D11_MAP_WRITE_DISCARD, 0, &m));
+  memcpy(m.pData, kSmall, sizeof(kSmall));
+  ctx->Unmap(vb_dyn, 0);
+  tri(vb_dyn, ps_color, nullptr);
+}
+static void m_discard(unsigned f) { scene_with(f, at_discard); }
+static void at_nooverwrite(unsigned, int n) {
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (n % 4) return;
+  HR(ctx->Map(vb_dyn, 0, n ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m));
+  memcpy((char *)m.pData + n / 4 * sizeof(kSmall), kSmall, sizeof(kSmall));
+  ctx->Unmap(vb_dyn, 0);
+  UINT stride = sizeof(Vertex), off = n / 4 * (UINT)sizeof(kSmall);
+  tri(vb_dyn, ps_color, nullptr);
+  ctx->IASetVertexBuffers(0, 1, &vb_dyn, &stride, &off);
+}
+static void m_nooverwrite(unsigned f) { scene_with(f, at_nooverwrite); }
+/* a dynamic texture written (a blit into it, which ends the pass) */
+static void at_dyntex(unsigned f, int n) {
+  if (n % 66 != 33) return;
+  D3D11_MAPPED_SUBRESOURCE m;
+  HR(ctx->Map(dyn_tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m));
+  for (int y = 0; y < 64; y++) memset((char *)m.pData + y * m.RowPitch, (int)(f + y), 256);
+  ctx->Unmap(dyn_tex, 0);
+}
+static void m_dyntex(unsigned f) { scene_with(f, at_dyntex); }
+/* UpdateSubresource of a default buffer nobody reads in this frame */
+static void at_update(unsigned f, int n) {
+  if (n % 66 == 33) { float v[4] = {(float)f, (float)n, 0, 1}; ctx->UpdateSubresource(default_buf, 0, nullptr, v, 0, 0); }
+}
+static void m_update(unsigned f) { scene_with(f, at_update); }
+/* a small readback: a copy to a staging texture in the middle of the scene, mapped (DO_NOT_WAIT) frames later */
+static void at_readback(unsigned f, int n) {
+  if (n == 133) ctx->CopySubresourceRegion(staging_tex, 0, 0, 0, 0, tiny[0].tex, 0, nullptr);
+  if (n == 0 && f > 3) {
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (ctx->Map(staging_tex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m) == S_OK) ctx->Unmap(staging_tex, 0);
+  }
+}
+static void m_readback(unsigned f) { scene_with(f, at_readback); }
+/* the same once a frame, after the picture: an engine's asynchronous readback */
+static void m_readback_end(unsigned f) {
+  scene_with(f, nullptr);
+  ctx->CopySubresourceRegion(staging_tex, 0, 0, 0, 0, tiny[0].tex, 0, nullptr);
+  ctx->End(events[f & 3]);
+}
+/* Flush in the middle */
+static void at_flush(unsigned, int n) { if (n == 133) ctx->Flush(); }
+static void m_flush(unsigned f) { scene_with(f, at_flush); }
+
 struct Mode { const char *name; void (*frame)(unsigned); };
 static const Mode kModes[] = {
     {"trivial", trivial}, {"copies4", copies}, {"offscreen", offscreen}, {"msaa-resolve", msaa_resolve},
@@ -263,6 +392,10 @@ static const Mode kModes[] = {
     {"switch8-read", switch_read}, {"switch8-bound", switch_bound}, {"full8-free", full_free}, {"full8-bound", full_bound},
     {"msaa-full8-free", msaa_full_free}, {"msaa-full8-bound", msaa_full_bound}, {"upload8", upload_mid}, {"draws2000", draws},
     {"heavy60", heavy},
+    {"q-none", q_none}, {"q-event-frame", q_event_frame}, {"q-disjoint-frame", q_disjoint_frame}, {"q-event-mid", q_event_mid},
+    {"q-stamp-mid", q_stamp_mid}, {"q-occ-mid", q_occ_mid}, {"q-occ-alone", q_occ_alone}, {"q-event-pollflush", q_event_pollflush},
+    {"m-discard", m_discard}, {"m-nooverwrite", m_nooverwrite}, {"m-dyntex", m_dyntex}, {"m-update", m_update},
+    {"m-readback", m_readback}, {"m-readback-end", m_readback_end}, {"m-flush", m_flush},
 };
 
 static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcA(h, m, w, l); }
@@ -342,6 +475,21 @@ int main(int argc, char **argv) {
   ms = target(W, H, 2, true);
   for (auto &t : copy) t = target(W, H, 1, false);
   for (auto &t : tiny) t = target(256, 256, 1, false);
+  bd = {(UINT)(sizeof(kSmall) * 67), D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+  HR(dev->CreateBuffer(&bd, nullptr, &vb_dyn));
+  bd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+  HR(dev->CreateBuffer(&bd, nullptr, &default_buf));
+  D3D11_TEXTURE2D_DESC sd2 = {256, 256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  HR(dev->CreateTexture2D(&sd2, nullptr, &staging_tex));
+  D3D11_TEXTURE2D_DESC td2 = {64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, 0};
+  HR(dev->CreateTexture2D(&td2, nullptr, &dyn_tex));
+  for (int i = 0; i < 4; i++) {
+    D3D11_QUERY_DESC q = {D3D11_QUERY_OCCLUSION, 0};
+    HR(dev->CreateQuery(&q, &occ[i]));
+    q.Query = D3D11_QUERY_TIMESTAMP; HR(dev->CreateQuery(&q, &stamps[i]));
+    q.Query = D3D11_QUERY_TIMESTAMP_DISJOINT; HR(dev->CreateQuery(&q, &disjoint[i]));
+    q.Query = D3D11_QUERY_EVENT; HR(dev->CreateQuery(&q, &events[i]));
+  }
   printf("PASSCOSTS size=%ux%u seconds=%.1f interval=%u\n", W, H, seconds, interval);
 
   for (const Mode &m : kModes) {
@@ -351,6 +499,7 @@ int main(int argc, char **argv) {
     for (unsigned f = 0; f < 10; f++) { m.frame(f); HR(swap->Present(interval, 0)); pump(); } /* pipelines, first use */
     Sleep(200);
     unsigned f = 0;
+    polls = polled_ready = 0;
     unsigned long long begin = ns(), record = 0, present = 0, now = begin;
     while (now - begin < (unsigned long long)(seconds * 1e9)) {
       unsigned long long a = ns();
@@ -362,8 +511,8 @@ int main(int argc, char **argv) {
       if (FAILED(hr)) { printf("FAILED Present 0x%08lx\n", (unsigned long)hr); return 1; }
       pump();
     }
-    printf("MODE %s frames=%u begin=%llu end=%llu fps=%.2f record_ms=%.3f present_ms=%.3f\n", m.name, f, begin, now,
-           f * 1e9 / (double)(now - begin), record / 1e6 / f, present / 1e6 / f);
+    printf("MODE %s frames=%u begin=%llu end=%llu fps=%.2f record_ms=%.3f present_ms=%.3f polls=%llu ready=%llu\n", m.name, f, begin, now,
+           f * 1e9 / (double)(now - begin), record / 1e6 / f, present / 1e6 / f, polls, polled_ready);
     Sleep(150);
   }
   printf("DONE\n");

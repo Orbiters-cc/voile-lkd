@@ -89,6 +89,13 @@ enum otl_kind {
   OTL_D_QUEUE = 47,       /* a: 1 made, 0 ended; v: queue id */
   OTL_D_PASS_SKIP = 48,   /* encoders without GPU times; a: enum otl_skip; v: key, how many */
   OTL_D_CLOCK = 49,       /* v: the device's CPU and GPU timestamps of one moment, uptime before and after it, queue id */
+  OTL_D_COMMIT = 50,      /* follows OTL_D_READY of its chunk; a: the call that committed it | what had asked for a commit before
+                             it << 8 (enum otl_why, 0: nothing had) | a render pass was open << 16; v: queue id, chunk, frame group,
+                             when it was asked for, what the commit waited for a free chunk in ns, the open pass's colour 0 */
+  OTL_D_PASS_ENDED = 51,  /* a render pass ended in the context, before the optimiser; a: enum otl_why; v: queue id, chunk, frame
+                             group, colour 0 as otl_attachment(), its texture, depth's texture (DXMT's pointers) */
+  OTL_D_PASS_ID = 52,     /* follows OTL_D_PASS; a: as it; v: key, colour 0's texture, depth's texture (Metal's, of a view the
+                             texture it is of), what kept it from joining a later encoder (enum otl_stop) */
 
   /* wsd (role wsd) */
   OTL_W_ATTACH = 64,      /* a buffer was attached; a: buffer; v: memory identity, width<<32|height, format, client id */
@@ -96,7 +103,7 @@ enum otl_kind {
                              client time, receive time, serial replaced, client id << 32 | plane id */
   OTL_W_TICK = 66,        /* a: window | state << 16 (enum otl_tick); v: the link's timestamp, its target timestamp,
                              its duration, plane id (t: when the callback ran) */
-  OTL_W_DRAW = 67,        /* a: window | region << 30 | redisplay << 31; v: buffer, serial, nextDrawable entry, exit, drawable
+  OTL_W_DRAW = 67,        /* a: window | scaled << 28 | on arrival << 29 | region << 30 | redisplay << 31; v: buffer, serial, nextDrawable entry, exit, drawable
                              id (~0: none), plane id (t: committed) */
   OTL_W_GPU = 68,         /* a: as OTL_W_DRAW; v: serial, GPU start, GPU end, kernel start, kernel end, plane id (t: the callback) */
   OTL_W_SHOWN = 69,       /* a: as OTL_W_DRAW; v: serial, presented time or 0, drawable id, plane id (t: the callback) */
@@ -106,6 +113,24 @@ enum otl_kind {
 
 enum otl_end { OTL_END_EXIT = 0, OTL_END_BUDGET = 1, OTL_END_WRITE = 2, OTL_END_SPACE = 3 };
 enum otl_skip { OTL_SKIP_SLOT = 1, OTL_SKIP_MANY = 2, OTL_SKIP_UNSUPPORTED = 3, OTL_SKIP_FAILED = 4, OTL_SKIP_RESOLVE = 5 };
+/* Why a pass ended or a command buffer was committed: the Direct3D 11 call. */
+enum otl_why {
+  OTL_WHY_OTHER = 0, OTL_WHY_TARGETS = 1, OTL_WHY_HAZARD = 2, OTL_WHY_CLEAR_COLOUR = 3, OTL_WHY_CLEAR_DEPTH = 4,
+  OTL_WHY_CLEAR_VIEW = 5, OTL_WHY_CLEAR_UAV = 6, OTL_WHY_DRAW = 7, OTL_WHY_DISPATCH = 8, OTL_WHY_COPY = 9,
+  OTL_WHY_UPLOAD = 10, OTL_WHY_READBACK = 11, OTL_WHY_RESOLVE = 12, OTL_WHY_END_EVENT = 13, OTL_WHY_END_TIMESTAMP = 14,
+  OTL_WHY_END_OCCLUSION = 15, OTL_WHY_GETDATA = 16, /* GetData that may flush, its query not there */
+  OTL_WHY_GETDATA_STALL = 17, /* GetData(DONOTFLUSH) of an event query that was not there the 64 times before */
+  OTL_WHY_FLUSH = 18, OTL_WHY_SIGNAL = 19, OTL_WHY_WAIT = 20, OTL_WHY_MAP_STAGING = 21, OTL_WHY_KEYED_MUTEX = 22,
+  OTL_WHY_COMMAND_LIST = 23, OTL_WHY_IDLE = 24, OTL_WHY_PRESENT = 25, OTL_WHY_STATE = 26, OTL_WHY_STAGING_WRITE = 27,
+  OTL_WHY_UPSCALE = 28,
+};
+/* What an encoder could not be put beyond, so that it was not put together with a later one. */
+enum otl_stop {
+  OTL_STOP_END = 0, /* nothing: the command buffer's end */
+  OTL_STOP_RENDER = 1, OTL_STOP_COMPUTE = 2, OTL_STOP_BLIT = 3, OTL_STOP_CLEAR = 4, OTL_STOP_RESOLVE = 5, /* needs what it made */
+  OTL_STOP_EVENT = 6, OTL_STOP_TIMESTAMP = 7, OTL_STOP_OTHER = 8,
+  OTL_STOP_SAME = 16, /* added: a render pass of the same targets that could not be joined to it */
+};
 enum otl_tick { OTL_TICK_EMPTY = 0, OTL_TICK_PENDING = 1, OTL_TICK_HIDDEN = 2, OTL_TICK_REDISPLAY = 3 };
 
 /* Histograms of a window, per process; 36 buckets, two per octave from 8 us (bucket 0 is below it). */

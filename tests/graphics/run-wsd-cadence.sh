@@ -6,6 +6,9 @@
 # Usage: run-wsd-cadence.sh <out-folder> <rate>[,<rate>...] [seconds=12] [render-percent=100] [frame-rate=0]
 #   WSD=<wsd binary>            the one to run (default: wsd/bin/wsd of this checkout)
 #   OBELISK_TIMELINE_OFF=1      without the timeline
+#   FRONT=1                     wsd is brought to the front once its window is up (macOS gives the keyboard to no program that the
+#                               app in front did not start: without it, the window is shown over an app that stays the active one)
+#   OBELISK_WSD_PRESENT, OBELISK_WSD_UPSCALE   as wsd takes them
 # Refuses to run while the screen is locked. Records the power state beside the results.
 set -eu
 W=$(cd "$(dirname "$0")" && pwd)
@@ -16,8 +19,10 @@ CLIENT="$W/bin/wsd_client"
 if ioreg -n Root -d1 -a | grep -A1 IOConsoleLocked | grep -q '<true/>'; then echo "the screen is locked: nothing run" >&2; exit 3; fi
 mkdir -p "$OUT"
 APP="$OUT/wsd cadence.app"
-rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS"; cp "$WSD" "$APP/Contents/MacOS/wsd"
-cat > "$APP/Contents/Info.plist" <<PLIST
+mkdir -p "$APP/Contents/MacOS"
+# (a bundle that changes is registered again by macOS, which writes its whole database for it, 12 MB: only when it does)
+cmp -s "$WSD" "$APP/Contents/MacOS/wsd" || { rm -f "$APP/Contents/MacOS/wsd"; cp "$WSD" "$APP/Contents/MacOS/wsd"; }
+[ -f "$APP/Contents/Info.plist" ] || cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -38,6 +43,9 @@ for RATE in $(printf %s "$RATES" | tr , ' '); do
     echo "low power mode (the setting in use): $(pmset -g | awk '/lowpowermode/{print $2}')"
     pmset -g therm
   "$W/others-busy.sh"
+    echo "thermal pressure: $(notifyutil -g com.apple.system.thermalpressurelevel)"; uptime
+    echo "compiling: $(pgrep -x "rustc|clang|cc1plus" | wc -l)"
+    echo "front ${FRONT-0} present ${OBELISK_WSD_PRESENT-} upscale ${OBELISK_WSD_UPSCALE-}"
     echo "wsd: $(shasum -a 256 "$WSD" | cut -c1-16) percent $PERCENT rate $RATE frame_rate $FR"
   } > "$RUN/conditions.txt" 2>&1
   D=$(mktemp -d "${TMPDIR:-/tmp}/wsdc.XXXXXX")
@@ -45,6 +53,8 @@ for RATE in $(printf %s "$RATES" | tr , ' '); do
   caffeinate -dimsu "$APP/Contents/MacOS/wsd" --dir "$D" --exit-on-disconnect --render-percent "$PERCENT" > "$RUN/wsd.log" 2>&1 &
   SPID=$!
   i=0; while [ ! -S "$D/wsd.sock" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+  [ -n "${FRONT-}" ] && (sleep 1.2; /usr/bin/open "$APP") &
+  (sleep 5; echo "front at 5 s: $(lsappinfo info "$(lsappinfo front)" | head -1) (wsd is $SPID)" >> "$RUN/conditions.txt") &
   perl -e 'alarm shift; exec @ARGV' 80 "$CLIENT" "$D/wsd.sock" --cadence "$RATE" "$SECONDS_EACH" --frame-rate "$FR" > "$RUN/client.txt" 2>&1 || true
   i=0; while kill -0 "$SPID" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i+1)); done
   kill "$SPID" 2>/dev/null || true; wait "$SPID" 2>/dev/null || true

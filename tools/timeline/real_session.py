@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""The three real starts with the host timeline: 58, 100 and 45 %, one start each, in that order, never a replacement.
+"""One real start with the host timeline at one scale, with a named combination of switches; never a replacement.
 
-Usage: real_session.py '<the owner's private instance link>'
+Usage: real_session.py '<the owner's private instance link>' --plan 45 [--switch upscale=metalfx] [--switch present=arrival]
 
-For the owner at his Mac, unlocked, plugged in, idle and cool, hands off for about 35 minutes. Everything else has a default:
+One start per invocation: the timeline generation is put in place for it and the released one put back after it, whatever
+happened. At the Mac, unlocked, plugged in, idle and cool, hands off for about eight minutes. The options:
+  --switch NAME=VALUE  upscale=metalfx: wsd scales a frame smaller than the window with MetalFX Spatial; present=<list> of arrival,
+                       attime, nosync, two: how wsd presents (wsd/wsd.m says what each is). None is wsd as ever. They reach wsd
+                       alone (launch.sh), never the game. In the manifest, the result and the folder's name
   --cli PATH         the developer's obelisk-cli (feature developer-timeline), signed as the one that holds the Steam session
   --generation DIR   what scripts/build-timeline-generation.sh of the Obelisk fork wrote
-  --bench DIR        tools/mac-bench of Orbiters-N4N0 (bench.py, not changed)
+  --bench DIR        the folder of bench.py (this one)
   --out DIR          the evidence, one folder per session, readable by this user alone
   --passes N         the encoders and their GPU times of every Nth frame, the same at every scale (8)
   --mb N             the trace's budget per start, in MiB (1536)
-  --plan 58,100,45   the scales
+  --plan 45          the scale, 1 to 100: one
 
 What it does: refuses when the screen is locked, when anything of the engine runs, when the disk is short; holds the display
 awake; puts the timeline generation in the library through the developer's obelisk-cli (verified, atomic, pinned, refused while
-anything of the engine runs); then per scale one start by bench.py (arrival, 120 s warm, three windows of 60 s, no stack sample,
-its own session quit by session), at least 90 s after the last one ended; and in every case, interrupted or failed, puts the
+anything of the engine runs); then one start by bench.py (arrival, the game's app brought to the front, 120 s warm, three windows
+of 60 s cut on the trace's own clock, no stack sample, its own session quit by session), at least 90 s after the last start this
+library knows of ended; and in every case, interrupted or failed, puts the
 released generation back through the same program and proves it by every digest. A start that fails ends the series. Nothing of
 the game is attached to, sampled or touched: of the host programs, what macOS says from outside (ps, lsof, pmset, notifyutil).
 
@@ -87,6 +92,37 @@ def processes():
     return out
 
 
+SWITCHES = {"upscale": ("OBELISK_WSD_UPSCALE", {"metalfx"}), "present": ("OBELISK_WSD_PRESENT", {"arrival", "attime", "nosync", "two"})}
+
+
+def switches(asked):
+    """--switch values -> the variables of the launcher; ValueError for what is not known."""
+    out = {}
+    for text in asked:
+        name, _, value = text.partition("=")
+        if name not in SWITCHES:
+            raise ValueError(f"--switch {text}: {name} is none of {', '.join(SWITCHES)}")
+        variable, known = SWITCHES[name]
+        if variable in out:
+            raise ValueError(f"--switch {name} is given twice")
+        if not value or any(part not in known for part in value.split(",")):
+            raise ValueError(f"--switch {text}: a list of {', '.join(sorted(known))}")
+        out[variable] = value
+    return out
+
+
+def last_ended(library):
+    """When the last session of this library ended, as its record was last written, or None when there is none. A record that
+    cannot be read counts as one that has just been written."""
+    newest = None
+    for path in glob.glob(f"{library}/SteamSessions/*.v2.json"):
+        try:
+            newest = max(newest or 0, os.path.getmtime(path))
+        except OSError:
+            newest = time.time()
+    return newest
+
+
 def engine_running():
     return [f"{pid} {os.path.basename(name)}" for pid, (_, name) in processes().items() if ENGINE.search(name)]
 
@@ -143,6 +179,9 @@ class Session:
         wrong = self.digests("released")
         if wrong:
             problems.append(f"the library's engine files are not the released set this generation was made from: {', '.join(wrong)}")
+        ended = last_ended(self.library)
+        if ended is not None and 0 <= time.time() - ended < self.a.between:
+            problems.append(f"a session of this library ended {time.time() - ended:.0f} s ago: wait until {self.a.between} s have passed")
         here = os.path.realpath(self.a.out)
         for guest in (self.library, os.path.join(HOME, "Library/Caches/cc.orbiters.obelisk-cli")):
             if (here + "/").startswith(os.path.realpath(guest) + "/"):
@@ -240,12 +279,13 @@ class Session:
         return bad
 
     def start(self, percent):
-        folder = os.path.join(self.out, f"start-{percent}")
+        named = "".join(f"-{n}-{v.replace(',', '-')}" for n, (k, _) in SWITCHES.items() for v in [self.a.switches.get(k)] if v)
+        folder = os.path.join(self.out, f"start-{percent}{named}")
         trace = os.path.join(folder, "trace")
         os.makedirs(trace, mode=0o700)
-        say(f"start at {percent} %")
+        say(f"start at {percent} %" + "".join(f", {k}={v}" for k, v in self.a.switches.items()))
         env = self.env | {"OBELISK_DEVELOPER_ENGINE": "timeline", "OBELISK_DEVELOPER_ENGINE_FILES": self.a.generation,
-                          "OBELISK_TIMELINE": trace, "OBELISK_TIMELINE_PASSES": str(self.a.passes), "OBELISK_TIMELINE_MB": str(self.a.mb)}
+                          "OBELISK_TIMELINE": trace, "OBELISK_TIMELINE_PASSES": str(self.a.passes), "OBELISK_TIMELINE_MB": str(self.a.mb)} | self.a.switches
         command = ["/usr/bin/python3", "-I", os.path.join(self.a.bench, "bench.py"), "--cli", self.a.cli, "--percent", str(percent), "--label",
                    str(percent), "--link", self.a.link, "--warm", str(self.a.warm), "--window", str(self.a.window), "--windows",
                    str(self.a.windows), "--no-sample", "--out", f"{folder}/bench.json"]
@@ -316,7 +356,7 @@ class Session:
 
     def report(self, folder, trace, percent, status):
         """One line per window of what is known of it, and whether the series may go on."""
-        result = dict(percent=percent, bench_status=status, windows=[])
+        result = dict(percent=percent, switches=self.a.switches, bench_status=status, windows=[])
         traces = sorted(d for d in glob.glob(f"{trace}/*") if os.path.isdir(d))
         files = sorted(glob.glob(f"{trace}/*/otl-*.bin"))
         result["roles"] = sorted({os.path.basename(f).split("-")[1] for f in files})
@@ -328,23 +368,29 @@ class Session:
         except (OSError, ValueError):
             bench = dict(windows=[], outcome="no result")
         result["outcome"] = bench.get("outcome")
+        result["brought_to_front"] = bench.get("observed", {}).get("fronted")
         clocks = self.clocks(folder, bench)
         for i, w in enumerate(bench.get("windows", []), 1):
             told = dict(window=i, valid=w["valid"], why=w["invalid_because"], submitted=w["guest_present"]["submitted_per_second_counted"],
                         fence_wait_ms=w["guest_present"]["fence_wait_ms_median"], shown_per_s=w["wsd_shown"]["per_second"])
-            if len(traces) == 1 and clocks:
+            if len(traces) == 1 and ("from_uptime_ns" in w or clocks):
                 base = f"{folder}/window-{i}"
-                told["from_ns"], told["to_ns"] = clocks(w["from"]), clocks(w["to"])
+                if "from_uptime_ns" in w:  # stamped on the trace's own clock as it was cut
+                    told["from_ns"], told["to_ns"], told["clock"] = w["from_uptime_ns"], w["to_uptime_ns"], "stamped"
+                else:
+                    told["from_ns"], told["to_ns"], told["clock"] = clocks(w["from"]), clocks(w["to"]), "by the wall clock"
                 text = run(["/usr/bin/python3", "-I", f"{HERE}/otl.py", traces[0], "--from", str(told["from_ns"]), "--to", str(told["to_ns"]),
-                            "--passes", "--cadence", "--csv", f"{base}.csv", "--json", f"{base}.json"], 600)
+                            "--passes", "--splits", "--cadence", "--csv", f"{base}.csv", "--json", f"{base}.json"], 600)
                 write(f"{base}.txt", text)
                 try:
                     with open(f"{base}.json") as f:
                         read = json.load(f)
                     one = read["reports"][0]
+                    told["splits"] = one.get("splits")
                     told.update(lost=read["lost"], not_told=read["not_told"], frames=one["frames"], whole=one["whole"], not_whole=one["not_whole"],
                                 cadence=[{k: c[k] for k in ("plane", "window", "region", "received", "replaced", "shown", "shown_per_s", "zero_time",
-                                                            "shown_interval_ms", "tick_to_shown_ms")} for c in one.get("cadence", [])])
+                                                            "shown_interval_ms", "tick_to_shown_ms", "client_to_shown_ms", "gpu_ms",
+                                                            "drawn_on_arrival", "drawn_scaled")} for c in one.get("cadence", [])])
                 except (OSError, ValueError, KeyError, IndexError) as e:
                     told["reader"] = f"failed: {e}"
             result["windows"].append(told)
@@ -372,7 +418,7 @@ class Session:
         results = []
         try:
             write(f"{self.out}/manifest.json", dict(
-                when=datetime.datetime.now().isoformat(timespec="seconds"), plan=self.a.plan, passes=self.a.passes, mb=self.a.mb, warm=self.a.warm,
+                when=datetime.datetime.now().isoformat(timespec="seconds"), plan=self.a.plan, switches=self.a.switches, passes=self.a.passes, mb=self.a.mb, warm=self.a.warm,
                 window=self.a.window, windows=self.a.windows, generation=self.manifest, cli=dict(path=self.a.cli, sha256=sha(self.a.cli)),
                 version=self.cli("released", "--version")[1], bench_sha256=sha(os.path.join(self.a.bench, "bench.py")), reader_sha256=sha(f"{HERE}/otl.py"),
                 os=run(["/usr/bin/sw_vers"]), hardware=run(["/usr/sbin/sysctl", "-n", "hw.model", "machdep.cpu.brand_string", "hw.memsize"]).split("\n"),
@@ -416,11 +462,12 @@ def main():
     p.add_argument("link")
     p.add_argument("--cli", default=f"{HOME}/.orbiters-forks/timeline-cli/obelisk-cli")
     p.add_argument("--generation", default=f"{HOME}/.orbiters-forks/timeline-generation")
-    p.add_argument("--bench", default=f"{HOME}/Orbiters-N4N0/tools/mac-bench")
+    p.add_argument("--bench", default=HERE)
+    p.add_argument("--switch", action="append", default=[], metavar="NAME=VALUE")
     p.add_argument("--out", default=f"{HOME}/Library/Logs/Obelisk/timeline-sessions")
     p.add_argument("--passes", type=int, default=8)
     p.add_argument("--mb", type=int, default=1536)
-    p.add_argument("--plan", default="58,100,45")
+    p.add_argument("--plan", required=True)
     # for the rehearsal (tools/timeline/rehearse.py) alone
     for name, value in (("--warm", 120), ("--window", 60), ("--windows", 3), ("--between", BETWEEN)):
         p.add_argument(name, type=int, default=value, help=argparse.SUPPRESS)
@@ -428,8 +475,12 @@ def main():
     p.add_argument("--rehearse", action="store_true", help=argparse.SUPPRESS)
     a = p.parse_args()
     a.plan = [int(x) for x in a.plan.split(",")]
-    if not all(1 <= x <= 100 for x in a.plan) or len(a.plan) > 3:
-        p.error("at most three scales of 1 to 100")
+    if not all(1 <= x <= 100 for x in a.plan) or len(a.plan) > (3 if a.rehearse else 1):
+        p.error("one scale of 1 to 100 (one start per invocation)")
+    try:
+        a.switches = switches(a.switch)
+    except ValueError as e:
+        p.error(str(e))
     if not (1 <= a.passes <= 1000 and 64 <= a.mb <= 8192):
         p.error("--passes is 1 to 1000, --mb 64 to 8192")
     if not a.rehearse:

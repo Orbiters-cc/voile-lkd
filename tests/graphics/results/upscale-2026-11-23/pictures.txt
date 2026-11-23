@@ -1,0 +1,10 @@
+1323x860 to 2940x1912: wanted 1, scaler yes (made in 2.0 ms)
+  bilinear        PSNR against the frame drawn at 2940x1912: 25.37 dB
+  metalfx         PSNR against the frame drawn at 2940x1912: 26.56 dB
+  metalfx-copied  PSNR against the frame drawn at 2940x1912: 26.56 dB
+  metalfx-direct  PSNR against the frame drawn at 2940x1912: 26.56 dB
+1705x1109 to 2940x1912: wanted 1, scaler yes (made in 1.2 ms)
+  bilinear        PSNR against the frame drawn at 2940x1912: 26.83 dB
+  metalfx         PSNR against the frame drawn at 2940x1912: 27.98 dB
+  metalfx-copied  PSNR against the frame drawn at 2940x1912: 27.98 dB
+  metalfx-direct  PSNR against the frame drawn at 2940x1912: 27.98 dB

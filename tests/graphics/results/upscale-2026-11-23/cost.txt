@@ -1,0 +1,78 @@
+Mon Nov 23 23:08:11 CET 2026
+23:08  up 18 days, 22:48, 2 users, load averages: 11.62 20.07 16.77
+com.apple.system.thermalpressurelevel 0
+Note: No thermal warning level has been recorded
+Note: No performance warning level has been recorded
+Note: No CPU power status has been recorded
+ lowpowermode         0
+Now drawing from 'AC Power'
+others 40: com.apple.WebKit=5.8 com.apple.WebKit=5.2 opendirectoryd=5.1
+== 25 ms apart
+1323x860 to 2940x1912: wanted 1, scaler yes (made in 2.3 ms)
+  round 1 copy            GPU ms p50 0.207 p10 0.112 p90 0.364
+  round 1 bilinear        GPU ms p50 0.467 p10 0.258 p90 0.600
+  round 1 metalfx (the frame copied out of linear memory first)      GPU ms p50 5.753 p10 2.776 p90 6.191
+  round 1 metalfx (as wsd runs it)  GPU ms p50 3.197 p10 2.532 p90 5.784
+  round 1 metalfx-direct  GPU ms p50 2.990 p10 2.088 p90 5.479
+  round 2 copy            GPU ms p50 0.282 p10 0.111 p90 0.384
+  round 2 bilinear        GPU ms p50 0.467 p10 0.356 p90 0.617
+  round 2 metalfx (the frame copied out of linear memory first)      GPU ms p50 3.341 p10 2.711 p90 6.074
+  round 2 metalfx (as wsd runs it)  GPU ms p50 3.168 p10 2.530 p90 5.735
+  round 2 metalfx-direct  GPU ms p50 3.016 p10 2.390 p90 5.488
+  round 3 copy            GPU ms p50 0.331 p10 0.117 p90 0.373
+  round 3 bilinear        GPU ms p50 0.466 p10 0.290 p90 0.609
+  round 3 metalfx (the frame copied out of linear memory first)      GPU ms p50 3.350 p10 2.723 p90 5.740
+  round 3 metalfx (as wsd runs it)  GPU ms p50 3.168 p10 2.515 p90 5.780
+  round 3 metalfx-direct  GPU ms p50 3.006 p10 2.366 p90 5.489
+1705x1109 to 2940x1912: wanted 1, scaler yes (made in 2.3 ms)
+  round 1 copy            GPU ms p50 0.361 p10 0.198 p90 0.567
+  round 1 bilinear        GPU ms p50 0.470 p10 0.278 p90 0.717
+  round 1 metalfx (the frame copied out of linear memory first)      GPU ms p50 3.470 p10 2.809 p90 6.306
+  round 1 metalfx (as wsd runs it)  GPU ms p50 3.176 p10 2.555 p90 5.752
+  round 1 metalfx-direct  GPU ms p50 3.084 p10 2.473 p90 5.658
+  round 2 copy            GPU ms p50 0.498 p10 0.202 p90 0.570
+  round 2 bilinear        GPU ms p50 0.507 p10 0.426 p90 0.715
+  round 2 metalfx (the frame copied out of linear memory first)      GPU ms p50 3.488 p10 2.832 p90 6.165
+  round 2 metalfx (as wsd runs it)  GPU ms p50 3.187 p10 2.540 p90 5.755
+  round 2 metalfx-direct  GPU ms p50 3.131 p10 2.487 p90 5.673
+  round 3 copy            GPU ms p50 0.431 p10 0.200 p90 0.579
+  round 3 bilinear        GPU ms p50 0.470 p10 0.367 p90 0.713
+  round 3 metalfx (the frame copied out of linear memory first)      GPU ms p50 3.437 p10 2.666 p90 6.053
+  round 3 metalfx (as wsd runs it)  GPU ms p50 3.043 p10 2.377 p90 5.556
+  round 3 metalfx-direct  GPU ms p50 2.994 p10 2.308 p90 5.376
+== one behind the other
+1323x860 to 2940x1912: wanted 1, scaler yes (made in 1.9 ms)
+  round 1 copy            GPU ms p50 0.110 p10 0.069 p90 0.111
+  round 1 bilinear        GPU ms p50 0.465 p10 0.465 p90 0.470
+  round 1 metalfx (the frame copied out of linear memory first)      GPU ms p50 1.551 p10 1.542 p90 1.614
+  round 1 metalfx (as wsd runs it)  GPU ms p50 1.542 p10 1.489 p90 1.707
+  round 1 metalfx-direct  GPU ms p50 1.388 p10 1.381 p90 1.573
+  round 2 copy            GPU ms p50 0.062 p10 0.055 p90 0.075
+  round 2 bilinear        GPU ms p50 0.147 p10 0.143 p90 0.149
+  round 2 metalfx (the frame copied out of linear memory first)      GPU ms p50 1.560 p10 1.552 p90 1.566
+  round 2 metalfx (as wsd runs it)  GPU ms p50 2.080 p10 1.551 p90 2.225
+  round 2 metalfx-direct  GPU ms p50 1.390 p10 1.384 p90 1.401
+  round 3 copy            GPU ms p50 0.058 p10 0.056 p90 0.061
+  round 3 bilinear        GPU ms p50 0.148 p10 0.145 p90 0.150
+  round 3 metalfx (the frame copied out of linear memory first)      GPU ms p50 1.564 p10 1.556 p90 1.929
+  round 3 metalfx (as wsd runs it)  GPU ms p50 1.502 p10 1.494 p90 1.996
+  round 3 metalfx-direct  GPU ms p50 1.562 p10 1.391 p90 1.960
+1705x1109 to 2940x1912: wanted 1, scaler yes (made in 1.2 ms)
+  round 1 copy            GPU ms p50 0.123 p10 0.120 p90 0.129
+  round 1 bilinear        GPU ms p50 0.182 p10 0.165 p90 0.216
+  round 1 metalfx (the frame copied out of linear memory first)      GPU ms p50 1.618 p10 1.608 p90 2.166
+  round 1 metalfx (as wsd runs it)  GPU ms p50 1.539 p10 1.528 p90 2.103
+  round 1 metalfx-direct  GPU ms p50 1.762 p10 1.445 p90 1.999
+  round 2 copy            GPU ms p50 0.129 p10 0.118 p90 0.178
+  round 2 bilinear        GPU ms p50 0.255 p10 0.188 p90 0.281
+  round 2 metalfx (the frame copied out of linear memory first)      GPU ms p50 2.708 p10 1.945 p90 3.358
+  round 2 metalfx (as wsd runs it)  GPU ms p50 1.568 p10 1.528 p90 1.926
+  round 2 metalfx-direct  GPU ms p50 1.606 p10 1.452 p90 1.760
+  round 3 copy            GPU ms p50 0.121 p10 0.117 p90 0.124
+  round 3 bilinear        GPU ms p50 0.196 p10 0.188 p90 0.230
+  round 3 metalfx (the frame copied out of linear memory first)      GPU ms p50 2.204 p10 1.641 p90 2.570
+  round 3 metalfx (as wsd runs it)  GPU ms p50 1.532 p10 1.524 p90 1.867
+  round 3 metalfx-direct  GPU ms p50 1.461 p10 1.453 p90 1.988
+23:10  up 18 days, 22:51, 2 users, load averages: 3.54 13.21 14.48
+others 52: com.apple.Driver=10.2 com.apple.WebKit=6.3 opendirectoryd=5.7
+com.apple.system.thermalpressurelevel 0
