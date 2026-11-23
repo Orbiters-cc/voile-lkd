@@ -91,6 +91,21 @@ void lkd_usermem_set_check_fn(int (*fn)(uint64_t gva, size_t len, int need_write
 
 /* One line on stderr, prefixed "lkd: ". Serialized; safe in any thread, not in signal handlers. */
 void lkd_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* The recent-event ring: one fixed 128-byte text line per event (sequence, host monotonic ms, host pid, the
+ * text), in a file shared by every process of the family, the last LKD_EVENT_RING_LINES events kept. The
+ * file is $LKD_EVENT_RING (the launcher puts it beside the engine log, Orbiters - N4N0's incident capture
+ * copies it); without the variable the ring lives in this process' memory only. Lines are never lost to a
+ * cap: the oldest is overwritten. Sorting the file (after its first line, a header) gives the order.
+ * Safe in any thread, not in signal handlers; never blocks. */
+#define LKD_EVENT_RING_LINES 8192
+#define LKD_EVENT_LINE 128
+void lkd_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* Tests: the ring's mapping (header line first) and its line count, or NULL. */
+const char *lkd_event_ring(size_t *lines);
+/* Log sparingly: true for the first `first` calls of a site, then once every `every`. */
+#define lkd_log_sparse(first, every, ...) do { static _Atomic uint64_t lkd_sp_; \
+    uint64_t lkd_k_ = atomic_fetch_add(&lkd_sp_, 1); \
+    if (lkd_k_ < (first) || ((lkd_k_ - (first)) % (every)) == 0) lkd_log(__VA_ARGS__); } while (0)
 /* LKD_TRACE level (or lkd_trace_enable): 0 off, the default; 1 or 2 on. Diagnostics gated on it cost one relaxed
  * load when off. */
 int lkd_trace_level(void);

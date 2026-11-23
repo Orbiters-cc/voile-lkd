@@ -1,7 +1,10 @@
 /* trace.c: logging and syscall tracing. Owner: core.
  * Lines are formatted into a stack buffer and written with one write(2), so they never interleave and
  * the code needs no lock. Guest memory is never read here: pointers print as hex values. */
+#include <fcntl.h>
 #include <stdarg.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "lkd_internal.h"
@@ -42,6 +45,85 @@ void lkd_log(const char *fmt, ...)
     if (n > (int)sizeof buf - 2) n = (int)sizeof buf - 2;
     buf[n++] = '\n';
     emit(buf, n);
+}
+
+/* ---- the recent-event ring (lkd_internal.h) ------------------------------------------------------- */
+
+#define RING_BYTES ((size_t)(LKD_EVENT_RING_LINES + 1) * LKD_EVENT_LINE)
+
+static char *g_ring;                       /* line 0: 8-byte counter, then the header text; a host fork
+                                            * keeps the mapping (MAP_SHARED): one ring for the family */
+static _Atomic int g_ring_state;           /* 0 not yet, 1 being set up, 2 ready (g_ring may still be NULL) */
+
+static char *ring_map(void)
+{
+    const char *path = getenv("LKD_EVENT_RING");
+    if (path && *path) {
+        int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                ((size_t)st.st_size == RING_BYTES || (st.st_size == 0 && ftruncate(fd, (off_t)RING_BYTES) == 0))) {
+                void *m = mmap(NULL, RING_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                close(fd);
+                if (m != MAP_FAILED) return m;
+            } else {
+                close(fd);
+            }
+        }
+    }
+    void *m = mmap(NULL, RING_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    return m == MAP_FAILED ? NULL : m;
+}
+
+static char *ring(void)
+{
+    int s = atomic_load_explicit(&g_ring_state, memory_order_acquire);
+    if (s == 2) return g_ring;
+    int zero = 0;
+    if (atomic_compare_exchange_strong(&g_ring_state, &zero, 1)) {
+        char *m = ring_map();
+        if (m) {
+            char *h = m + 8;
+            if (h[0] != 'l') {
+                int n = snprintf(h, LKD_EVENT_LINE - 8, "lkd event ring v1: %d lines of %d bytes; sort lines 2+",
+                                 LKD_EVENT_RING_LINES, LKD_EVENT_LINE);
+                memset(h + n, ' ', (size_t)(LKD_EVENT_LINE - 8 - n - 1));
+                h[LKD_EVENT_LINE - 8 - 1] = '\n';
+            }
+        }
+        g_ring = m;
+        atomic_store_explicit(&g_ring_state, 2, memory_order_release);
+        return m;
+    }
+    return NULL; /* another thread is mapping it: this event is only lost while the ring is being created */
+}
+
+const char *lkd_event_ring(size_t *lines)
+{
+    if (lines) *lines = LKD_EVENT_RING_LINES;
+    return ring();
+}
+
+void lkd_event(const char *fmt, ...)
+{
+    char *m = ring();
+    if (!m) return;
+    _Atomic uint64_t *head = (_Atomic uint64_t *)(void *)m;
+    uint64_t k = atomic_fetch_add(head, 1);
+    char line[LKD_EVENT_LINE + 1];
+    int n = snprintf(line, sizeof line, "%012llu %012lld %6d ", (unsigned long long)k,
+                     (long long)(lkd_host_mono_ns() / 1000000), (int)getpid());
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(line + n, sizeof line - (size_t)n, fmt, ap);
+    va_end(ap);
+    n = w < 0 ? n : n + w;
+    if (n > LKD_EVENT_LINE - 1) n = LKD_EVENT_LINE - 1;
+    for (int i = 0; i < n; i++) if (line[i] == '\n') line[i] = ' ';
+    memset(line + n, ' ', (size_t)(LKD_EVENT_LINE - 1 - n));
+    line[LKD_EVENT_LINE - 1] = '\n';
+    memcpy(m + (size_t)(1 + k % LKD_EVENT_RING_LINES) * LKD_EVENT_LINE, line, LKD_EVENT_LINE);
 }
 
 static int fmt_args(char *buf, size_t cap, const lkd_sysreq *rq)

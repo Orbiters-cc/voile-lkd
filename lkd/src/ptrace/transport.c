@@ -129,9 +129,9 @@ int pt_alloc_locked(void)
     for (int i = 0; i < PT_SLOTS; i++) {
         struct pt_slot *s = pt_slot_at(i);
         if (atomic_load(&s->link) != PL_FREE) continue;
-        uint32_t gen = s->gen + 1;
+        uint64_t gen = pt_gen(s) + 1;
         memset((char *)s + offsetof(struct pt_slot, gen), 0, sizeof *s - offsetof(struct pt_slot, gen));
-        s->gen = gen;
+        atomic_store_explicit(&s->gen, gen, memory_order_release);
         atomic_store(&s->tid, 0);
         atomic_store(&s->tracer_pid, 0);
         atomic_store(&s->tracer_tid, 0);
@@ -162,6 +162,8 @@ void pt_free_locked(int i)
     atomic_store(&s->tracer_pid, 0);
     atomic_store(&s->tracer_tid, 0);
     s->stopped = 0;
+    s->astop = 0;
+    s->trap = 0;
     atomic_store(&s->link, PL_FREE);
 }
 
@@ -190,6 +192,11 @@ int pt_host_alive(int32_t host_pid)
     return kill(host_pid, 0) == 0 || errno == EPERM;
 }
 
+int pt_tracer_host_dead(const struct pt_slot *s)
+{
+    return s->tracer_host > 0 && s->tracer_host != getpid() && !pt_host_alive(s->tracer_host);
+}
+
 int pt_tid_alive(int32_t tid)
 {
     lkd_tid_info ti;
@@ -199,40 +206,56 @@ int pt_tid_alive(int32_t tid)
 
 /* ---- wake of a tracee ----------------------------------------------------------------------------- */
 
-/* Tests only (test_ptrace_transport): set in a tracee's process, its wakes do not sync the flags, as if
- * the tracer's wake had not arrived before its SIGSTOP. */
+/* Tests only (test_ptrace_transport). pt_test_hold_wake_sync, set in a tracee's process: its wakes do not
+ * sync the flags, as if the tracer's wake had not arrived before the tracee reached its stop. */
 int pt_test_hold_wake_sync;
+int pt_test_fail_wake;
+int pt_test_exit_after_link;
+int pt_test_fail_local;
 
-static int wake_local(lkd_task *t, unsigned how)
+struct wake_msg { uint32_t how; int32_t slot; uint64_t gen; };
+
+static int wake_local(lkd_task *t, const struct wake_msg *m)
 {
-    if ((how & PT_WAKE_SYNC) && !pt_test_hold_wake_sync) pt_sync_flags(t);
-    if (how & PT_WAKE_TRAP) atomic_fetch_or(&t->flags, LKD_TF_TRACE_STOP);
+    if ((m->how & PT_WAKE_SYNC) && !pt_test_hold_wake_sync) pt_sync_flags(t);
+    if (m->how & PT_WAKE_TRAP) {
+        /* a hint for lkd_ptrace_pending_stop, which decides from the slot under the lock; a wake of a link
+         * that is no longer t's (detached and replaced since the request) sets nothing */
+        int live = m->slot >= 0 && m->slot < PT_SLOTS;
+        if (live) {
+            struct pt_slot *s = pt_slot_at(m->slot);
+            live = atomic_load(&s->link) == PL_ATTACHED && atomic_load(&s->tid) == t->tid && pt_gen(s) == m->gen;
+        }
+        if (live) atomic_fetch_or(&t->flags, LKD_TF_TRACE_STOP);
+    }
     lkd_task_wake(t);
-    if ((how & PT_WAKE_KICK) && lkd_engine() && lkd_engine()->kick) lkd_engine()->kick(t);
+    if ((m->how & PT_WAKE_KICK) && lkd_engine() && lkd_engine()->kick) lkd_engine()->kick(t);
     return 0;
 }
 
 static void op_wake(lkd_famsvc_msg *req, lkd_famsvc_msg *resp)
 {
-    uint32_t how = 0;
-    if (req->len == sizeof how) memcpy(&how, req->data, sizeof how);
+    struct wake_msg m = { 0, -1, 0 };
+    if (req->len == sizeof m) memcpy(&m, req->data, sizeof m);
+    else if (req->len == sizeof m.how) memcpy(&m.how, req->data, sizeof m.how);
     lkd_task *t = lkd_task_lookup(req->target_tid);
     if (!t || t->proc->pid != req->target_pid || t->proc->host_pid != getpid()) {
         if (t) lkd_task_put(t);
         resp->status = -LX_ESRCH;
         return;
     }
-    resp->status = wake_local(t, how);
+    resp->status = wake_local(t, &m);
     lkd_task_put(t);
 }
 
-int pt_wake_tracee(int32_t tgid, int32_t tid, unsigned how)
+int pt_wake_tracee(int32_t tgid, int32_t tid, unsigned how, int slot, uint64_t gen)
 {
     pt_stats_g.wakes++;
+    struct wake_msg m = { how, slot, gen };
     lkd_task *t = lkd_task_lookup(tid);
     if (t) {
         int local = t->proc->pid == tgid && t->proc->host_pid == getpid();
-        int r = local ? wake_local(t, how) : 0;
+        int r = local ? wake_local(t, &m) : 0;
         lkd_task_put(t);
         if (local) return r;
     }
@@ -242,8 +265,8 @@ int pt_wake_tracee(int32_t tgid, int32_t tid, unsigned how)
     req.op = OP_WAKE;
     req.target_pid = tgid;
     req.target_tid = tid;
-    req.data = &how;
-    req.len = sizeof how;
+    req.data = &m;
+    req.len = sizeof m;
     int r = lkd_famsvc_call_pid(tgid, &req, &resp, 2000);
     lkd_famsvc_msg_free(&resp);
     return r;

@@ -773,6 +773,95 @@ LT_TEST(tracer_host_process_killed)
     close(rp[0]); close(rp[1]);
 }
 
+/* Attach during clone: the parent's link is read and the child's made in one critical section, so the child
+ * follows the parent's relationship as it is when the child's link is made: none if the tracer left, the new
+ * tracer's own options if it was replaced. A non-seized child starts with its link's attach stop pending. */
+LT_TEST(clone_follows_the_parent_s_current_link)
+{
+    lkd_task *par = lkd_task_alloc(NULL, 0);
+    lkd_task_publish(par);
+    cpu_init(par);
+    const uint64_t thr = LX_CLONE_VM | LX_CLONE_FS | LX_CLONE_FILES | LX_CLONE_SIGHAND | LX_CLONE_THREAD;
+    /* traced with TRACECLONE: the child is linked to the same tracer, attach stop pending */
+    int pi = pt_link(par->tid, par->proc->pid, getpid(), 1000, 0x7001, 0x7001, getpid(), LX_PTRACE_O_TRACECLONE, 0);
+    LT_CHECK(pi >= 0);
+    lkd_task *c1 = lkd_task_alloc(par, thr);
+    lkd_task_publish(c1);
+    lkd_ptrace_task_init(c1, par, thr);
+    int ci = pt_find_tracee(c1->tid);
+    LT_CHECK(ci >= 0);
+    LT_EQ(lkd_ptrace_tracer_of(c1->tid), 0x7001);
+    LT_EQ(pt_slot_at(ci)->astop, 1);
+    LT_EQ(pt_slot_at(ci)->astop_code, LX_SI_USER);
+    LT_CHECK(atomic_load(&c1->flags) & LKD_TF_TRACE_STOP);
+    LT_CHECK(atomic_load(&c1->ptrace.flags) & LKD_PT_TRACED);
+    /* the tracer left before the child's link is made: no child link */
+    pt_lock();
+    pt_free_locked(pi);
+    pt_unlock();
+    lkd_task *c2 = lkd_task_alloc(par, thr);
+    lkd_task_publish(c2);
+    lkd_ptrace_task_init(c2, par, thr);
+    LT_EQ(pt_find_tracee(c2->tid), -1);
+    /* replaced by a tracer without TRACECLONE: not inherited; with it: inherited by the new tracer */
+    pi = pt_link(par->tid, par->proc->pid, getpid(), 1000, 0x7002, 0x7002, getpid(), 0, 0);
+    lkd_task *c3 = lkd_task_alloc(par, thr);
+    lkd_task_publish(c3);
+    lkd_ptrace_task_init(c3, par, thr);
+    LT_EQ(pt_find_tracee(c3->tid), -1);
+    pt_lock();
+    pt_slot_at(pi)->options = LX_PTRACE_O_TRACECLONE;
+    pt_unlock();
+    lkd_task *c4 = lkd_task_alloc(par, thr);
+    lkd_task_publish(c4);
+    lkd_ptrace_task_init(c4, par, thr);
+    LT_EQ(lkd_ptrace_tracer_of(c4->tid), 0x7002);
+    pt_lock();
+    pt_free_locked(pi);
+    pt_free_locked(ci);
+    int c4i = pt_find_tracee(c4->tid);
+    if (c4i >= 0) pt_free_locked(c4i);
+    pt_unlock();
+}
+
+/* Attach during a non-leader exec: after the leader died and before ptrace follows the rename, an ATTACH to
+ * the leader's tid makes a second link for the same thread. The exec'ing thread keeps its own link; the new
+ * one ends as the death of the thread it was made for (Linux refuses that attach: the leader is a zombie).
+ * Without a link of the old tid, a link to the new tid is the thread's own and stays. */
+LT_TEST(attach_during_a_non_leader_exec)
+{
+    int32_t tg = 0x61000, old = 0x61001;
+    int a = pt_link(old, tg, getpid(), 1000, 0x7001, 0x7001, getpid(), 0, 0);
+    int b = pt_link(tg, tg, getpid(), 1000, 0x7002, 0x7002, getpid(), 0, 0);
+    LT_CHECK(a >= 0 && b >= 0);
+    int32_t ended[4] = { 0 };
+    pt_lock();
+    int n = pt_exec_rename_locked(old, tg, tg, ended);
+    pt_unlock();
+    LT_EQ(n, 1);
+    LT_EQ(ended[0], 0x7002);
+    LT_EQ(atomic_load(&pt_slot_at(a)->tid), tg);
+    LT_EQ(atomic_load(&pt_slot_at(a)->link), PL_ATTACHED);
+    LT_EQ(atomic_load(&pt_slot_at(b)->link), PL_EXITED);
+    LT_EQ(pt_slot_at(b)->exit_status, LX_SIGKILL);
+    LT_EQ(pt_find_tracee(tg), a);
+    LT_EQ(lkd_ptrace_tracer_of(tg), 0x7001);
+    pt_lock();
+    pt_free_locked(a);
+    pt_free_locked(b);
+    pt_unlock();
+    /* no link of the old tid: the new tid's link is kept */
+    b = pt_link(tg, tg, getpid(), 1000, 0x7002, 0x7002, getpid(), 0, 0);
+    pt_lock();
+    n = pt_exec_rename_locked(old, tg, tg, ended);
+    pt_unlock();
+    LT_EQ(n, 0);
+    LT_EQ(atomic_load(&pt_slot_at(b)->link), PL_ATTACHED);
+    pt_lock();
+    pt_free_locked(b);
+    pt_unlock();
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) g_filter = argv[1];
@@ -795,5 +884,7 @@ int main(int argc, char **argv)
     RUN(exec_by_a_non_leader_keeps_the_links);
     RUN(exec_of_a_forked_tracee_keeps_its_tracer);
     RUN(tracer_host_process_killed);
+    RUN(clone_follows_the_parent_s_current_link);
+    RUN(attach_during_a_non_leader_exec);
     return lt_finish();
 }

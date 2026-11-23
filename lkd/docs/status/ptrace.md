@@ -7,10 +7,42 @@ Date: 2026-10-02, 20:40 (after the restart at 20:21). Milestone 3: the EAC seque
 `src/ptrace/` (NOTICE: blocks imported from HyperLinux `proc_ptrace.c`, Apache-2.0):
 
 - `transport.c`: table of links shared by the whole family. An unlinked temporary file is mapped `MAP_SHARED` (512 slots of 3.4 KiB), created by the first process, inherited by `fork`, named by `LKD_PTRACE_FD` for a host re-exec. Mutual exclusion: local mutex (rank 61) plus `fcntl` byte lock on the file (the host kernel releases it when the holder dies: MEASURED, case `lock_is_released_when_the_holder_dies`). Wakeup of the tracee and notification of the tracer through `famsvc` (opcodes 64 and 65 of the ptrace range). No other transport.
-- `stop.c`: tracee side. A stop is published in the slot (Linux code, message, siginfo, register view, FXSAVE and XSAVE images, signal mask) by the tracee's host thread, which parks on its wakeup pipe. The tracer's writes (SETREGS, SETFPREGS, SETSIGINFO, SETSIGMASK, resume signal, mode, step) are commands that the tracee applies itself on resume, in a single critical section; a write after the resume fails (ESRCH). Hooks: `lkd_ptrace_syscall_enter/exit`, `lkd_ptrace_signal_stop`, `lkd_ptrace_event`, `lkd_ptrace_stop`, `lkd_ptrace_trap_stop`.
+- `stop.c`: tracee side. A stop is published in the slot (Linux code, message, siginfo, register view, FXSAVE and XSAVE images, signal mask) by the tracee's host thread, which parks on its wakeup pipe. The tracer's writes (SETREGS, SETFPREGS, SETSIGINFO, SETSIGMASK, resume signal, mode, step) are commands that the tracee applies itself on resume, in a single critical section; a write after the resume fails (ESRCH). Hooks: `lkd_ptrace_syscall_enter/exit`, `lkd_ptrace_signal_stop`, `lkd_ptrace_event`, `lkd_ptrace_stop`, `lkd_ptrace_pending_stop` (the link's pending attach stop and INTERRUPT trap, below).
 - `request.c`: the `ptrace(2)` call in the kernel's error order.
 - `life.c`: `wait4`/`waitid` (`lkd_ptrace_wait_event`, `lkd_ptrace_has_tracees`, `lkd_ptrace_wait_has`), `lkd_ptrace_check_access`, `lkd_ptrace_tracer_of`, death of a tracer (detach, EXITKILL), death of a tracee (`PTRACE_EVENT_EXIT` stop, report to the tracer, vanished host process), fork/vfork/clone auto-attach, module hooks (init, fork, exec, exit).
 - `regs.c`: `getreg/putreg`, selectors, `FLAG_MASK`, FS/GS bases, debug registers, MXCSR, XSAVE header.
+
+## The attach stop (2026-11-23, after the VRChat hang and its fourth verification)
+
+The stop that PTRACE_ATTACH (or the auto-attach of a non-seized child) owes its tracer is **state of the trace link**, never a
+queued SIGSTOP. In Linux it is a queued signal; here that let it be coalesced with another pending SIGSTOP (a second
+tracer's, or an ordinary thread-directed one), flushed by any SIGCONT, or taken as a group stop when the link was gone:
+three short reproductions (`test_ptrace_transport`: `a_second_tracer_gets_its_own_attach_stop`,
+`an_ordinary_stop_after_a_departed_attach_still_stops`, `sigcont_does_not_flush_an_attach_stop`).
+
+- The slot holds `astop` (and its siginfo code: SI_KERNEL for ATTACH, SI_USER for an auto-attach). It is set in the same
+  critical section that makes the link (`pt_link_locked`), so no allocation or delivery can fail between them. It is
+  cleared only when the stop is published to that very generation (`pt_do_stop` with `attach`), when a SIGSTOP
+  signal-delivery-stop of the same link takes its place (Linux coalesces the two), or with the link (free, cancel).
+- The tracee learns of it through `LKD_TF_TRACE_STOP`, a hint set by the tracer's wake (bound to slot and generation: a
+  wake that arrives after a detach and a new attach sets nothing) and by every `pt_sync_flags` while the slot says a stop
+  is pending. `lkd_signal_next` takes it before any queued signal (`lkd_ptrace_pending_stop`), deciding from the slot under
+  the lock: a stale hint invents nothing, a lost one is set again by the next sync. A thread parked in an untraced group
+  stop leaves the park when the hint is set, so an attach to a stopped process is reported.
+- `pt_sync_flags` reads the table and writes the cache in one `pt_lock` section: every synchroniser and every link change
+  is totally ordered, which replaces the bounded re-read loop of `9bf6dfa`. The cache is current before ATTACH returns
+  (the wake is synchronous), so later signal and syscall decisions see the link.
+- Failures: a wake that cannot be delivered undoes the link by generation (ATTACH returns ESRCH) unless the tracee already
+  reached its stop; a tracee that cannot allocate its ptrace state keeps the stop pending and retries every 10 ms
+  (`PT_STOP_RETRY`); the register snapshot no longer allocates. A tracer host process killed between linking and waking
+  (`pt_test_exit_after_link`) leaves the tracee running, and the next ATTACH reclaims the dead link
+  (`reclaim_dead_tracer`); the pending-stop path cancels a link whose tracer died before stopping for it; a tracee parked
+  when its EXITKILL tracer is killed detaches and then dies (the kill is no longer lost to the detach exit).
+- Clone: the parent's link is read and the child's made in one critical section (`lkd_ptrace_task_init`). A non-leader
+  exec that finds a link an ATTACH made to the leader's tid in the rename window ends that link as the thread's death
+  (`pt_exec_rename_locked`). Generations are 64 bits (`PT_VERSION` 2).
+- Every attach, attach-stop publication, detach, cancellation, group stop and SIGCONT resume goes to the recent-event ring
+  (`lkd_event`, the last 8192, `$LKD_EVENT_RING` beside the engine log); the log keeps sparse lines only.
 
 ## Implemented requests
 

@@ -17,6 +17,8 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include "sig.h"
+
 #include "pt_priv.h"
 
 _Atomic uint64_t pt_resume_count;
@@ -25,6 +27,7 @@ struct pt_local *pt_local_of(lkd_task *t, int create)
 {
     struct pt_local *L = __atomic_load_n((struct pt_local **)&t->ptrace.state, __ATOMIC_ACQUIRE);
     if (!L && create) {
+        if (pt_test_fail_local > 0) { pt_test_fail_local--; return NULL; }
         L = calloc(1, sizeof *L);
         if (!L) return NULL;
         L->slot = -1;
@@ -39,8 +42,7 @@ int pt_my_slot(lkd_task *t)
     struct pt_local *L = pt_local_of(t, 0);
     if (L && L->slot >= 0 && pt_table_ready()) {
         struct pt_slot *s = pt_slot_at(L->slot);
-        if (atomic_load(&s->link) == PL_ATTACHED && atomic_load(&s->tid) == t->tid &&
-            __atomic_load_n(&s->gen, __ATOMIC_ACQUIRE) == L->gen)
+        if (atomic_load(&s->link) == PL_ATTACHED && atomic_load(&s->tid) == t->tid && pt_gen(s) == L->gen)
             return L->slot;
     }
     if (!pt_table_ready()) return -1;
@@ -49,50 +51,41 @@ int pt_my_slot(lkd_task *t)
     L = pt_local_of(t, 1);
     if (!L) return -1;
     L->slot = i;
-    L->gen = __atomic_load_n(&pt_slot_at(i)->gen, __ATOMIC_ACQUIRE);
+    L->gen = pt_gen(pt_slot_at(i));
     return i;
-}
-
-/* What the shared table says t's flags are, and its tracer. */
-static uint32_t pt_table_flags(lkd_task *t, int32_t *tracer)
-{
-    uint32_t want = 0;
-    *tracer = 0;
-    int i = pt_table_ready() ? pt_find_tracee(t->tid) : -1;
-    if (i >= 0) {
-        struct pt_slot *s = pt_slot_at(i);
-        want |= LKD_PT_TRACED;
-        *tracer = atomic_load(&s->tracer_tid);
-        unsigned m = __atomic_load_n(&s->mode, __ATOMIC_ACQUIRE);
-        if (m == PM_SYSCALL || m == PM_SYSEMU || __atomic_load_n(&s->trap, __ATOMIC_ACQUIRE))
-            want |= LKD_PT_SYSCALL_TRACE; /* a pending INTERRUPT trap is taken at the next syscall boundary */
-        if (__atomic_load_n(&s->seized, __ATOMIC_ACQUIRE)) want |= LKD_PT_SEIZED;
-        if (__atomic_load_n(&s->step, __ATOMIC_ACQUIRE)) want |= LKD_PT_SINGLESTEP;
-    }
-    return want;
 }
 
 void pt_sync_flags(lkd_task *t)
 {
     const uint32_t mine = LKD_PT_TRACED | LKD_PT_SYSCALL_TRACE | LKD_PT_SEIZED | LKD_PT_SINGLESTEP;
-    int changed = 0;
+    if (!pt_table_ready()) return;
     /* Two threads sync t: t itself (leaving a stop, at an event) and the famsvc thread of t's process (a
-     * tracer's wake). Reading the table and writing the flags is not one step: t could read "no link",
-     * the tracer link t and its wake set TRACED, then t write its stale "untraced" over it, and the
-     * ATTACH's SIGSTOP would stop the whole process (the 2026-11-23 VRChat hang; test_ptrace_reattach).
-     * So read the table again after writing, and write again until both agree: whoever writes last has
-     * then read the table after every link that happened before its write. */
-    for (int round = 0; round < 64; round++) {
-        int32_t tracer = 0;
-        uint32_t want = pt_table_flags(t, &tracer);
-        uint32_t old = atomic_load(&t->ptrace.flags), nw;
-        do { nw = (old & ~mine) | want; } while (!atomic_compare_exchange_weak(&t->ptrace.flags, &old, nw));
-        if ((old & mine) != want) changed = 1;
-        if (t->ptrace.tracer_tid != tracer) { t->ptrace.tracer_tid = tracer; changed = 1; }
-        int32_t again_tracer = 0;
-        if (pt_table_flags(t, &again_tracer) == want && again_tracer == tracer) break;
+     * tracer's wake). Both read the table and write the cache inside one pt_lock section, and every link
+     * change is made under pt_lock too: the syncs and the changes are totally ordered, so the cache always
+     * ends as the table was at the last sync, and a sync follows every change that matters to the tracee
+     * (ATTACH and a tracer's death wake it with PT_WAKE_SYNC, a resume ends in this call). A stale reader
+     * cannot write after a newer one (the 2026-11-23 VRChat hang: "untraced" written over a new link). */
+    uint32_t want = 0;
+    int32_t tracer = 0;
+    int pending = 0;
+    pt_lock();
+    int i = pt_find_tracee(t->tid);
+    if (i >= 0) {
+        struct pt_slot *s = pt_slot_at(i);
+        want |= LKD_PT_TRACED;
+        tracer = atomic_load(&s->tracer_tid);
+        if (s->mode == PM_SYSCALL || s->mode == PM_SYSEMU || s->trap)
+            want |= LKD_PT_SYSCALL_TRACE; /* a pending INTERRUPT trap is taken at the next syscall boundary */
+        if (s->seized) want |= LKD_PT_SEIZED;
+        if (s->step) want |= LKD_PT_SINGLESTEP;
+        pending = s->astop || (s->trap && s->seized);
     }
-    if (changed) lkd_registry_publish(t);
+    uint32_t old = atomic_load(&t->ptrace.flags), nw;
+    do { nw = (old & ~mine) | want; } while (!atomic_compare_exchange_weak(&t->ptrace.flags, &old, nw));
+    int32_t oldtr = __atomic_exchange_n(&t->ptrace.tracer_tid, tracer, __ATOMIC_ACQ_REL);
+    if (pending) atomic_fetch_or(&t->flags, LKD_TF_TRACE_STOP); /* taken by lkd_ptrace_pending_stop */
+    pt_unlock();
+    if (oldtr != tracer || (old & mine) != want) lkd_registry_publish(t);
 }
 
 void pt_requeue_signal(lkd_task *t, int sig)
@@ -175,29 +168,36 @@ static void apply_resume(lkd_task *t, struct pt_local *L, const struct pt_resume
     }
 }
 
-static int tracer_dead(const struct pt_slot *s)
-{
-    return s->tracer_host > 0 && s->tracer_host != getpid() && !pt_host_alive(s->tracer_host);
-}
 
 int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
 {
     memset(out, 0, sizeof *out);
-    int i = pt_my_slot(t);
-    if (i < 0) { pt_sync_flags(t); return 0; }
-    struct pt_local *L = pt_local_of(t, 1);
-    if (!L) return 0;
-    if (rq->bound && (i != rq->bind_slot || L->gen != rq->bind_gen)) { pt_sync_flags(t); return 0; }
+    struct pt_local *L;
+    int i;
+    uint64_t gen;
+    if (rq->bound) {
+        /* A stop of one link (the attach stop, an INTERRUPT trap): nothing may be decided from the cache. */
+        L = pt_local_of(t, 1);
+        if (!L) return rq->attach ? PT_STOP_RETRY : 0; /* nothing consumed: the stop stays pending */
+        i = rq->bind_slot;
+        gen = rq->bind_gen;
+        L->slot = i;
+        L->gen = gen;
+    } else {
+        i = pt_my_slot(t);
+        if (i < 0) { pt_sync_flags(t); return 0; }
+        L = pt_local_of(t, 1);
+        if (!L) return 0;
+        gen = L->gen;
+    }
     const lkd_engine_ops *ops = lkd_engine();
-    uint32_t gen = L->gen;
 
-    /* Snapshot, on this thread, outside every lock. */
+    /* Snapshot, on this thread, outside every lock. No allocation: a stop must not be lost to memory. */
     lkd_regs r;
     memset(&r, 0, sizeof r);
     int regs_ok = ops->get_regs(t, &r) == 0;
     if (regs_ok) patch_view(rq, &r);
-    uint8_t *xs = malloc(PT_XS_MAX);
-    if (!xs) return 0;
+    uint8_t xs[PT_XS_MAX];
     memset(xs, 0, PT_XS_MAX);
     size_t xlen = PT_XS_MAX;
     int xs_ok = ops->get_fp(t, LKD_FP_XSAVE, xs, &xlen) == 0;
@@ -219,11 +219,19 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
 
     pt_lock();
     struct pt_slot *s = pt_slot_at(i);
-    if (atomic_load(&s->link) != PL_ATTACHED || atomic_load(&s->tid) != t->tid || s->gen != gen) {
+    if (atomic_load(&s->link) != PL_ATTACHED || atomic_load(&s->tid) != t->tid || pt_gen(s) != gen ||
+        (rq->attach && !s->astop)) {
+        /* the link is gone, was replaced, or its attach stop was already reported (or cancelled) */
         pt_unlock();
-        free(xs);
         pt_sync_flags(t);
         return 0;
+    }
+    int was_attach = 0;
+    if (s->astop && (rq->attach || (rq->kind == PK_SIGNAL && rq->code == LX_SIGSTOP))) {
+        /* published to this generation: the attach stop is consumed. A SIGSTOP stop of the same link takes
+         * its place, as a pending SIGSTOP and the attach's SIGSTOP are one signal in Linux. */
+        s->astop = 0;
+        was_attach = 1;
     }
     s->kind = (uint32_t)rq->kind;
     s->code = rq->code;
@@ -265,12 +273,15 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
     s->reported = 0;
     s->stopped = 1;
     int32_t tracer_pid = atomic_load(&s->tracer_pid);
+    int32_t tracer_tid = atomic_load(&s->tracer_tid);
     uint32_t uid = s->uid;
     int why = (int)s->why;
     int code = s->code;
     pt_stats_g.stops++;
     pt_unlock();
-    free(xs);
+    if (was_attach)
+        lkd_event("ptrace: tid %d attach stop published to tracer %d (link %d gen %llu)", (int)t->tid, (int)tracer_tid,
+                  i, (unsigned long long)gen);
 
     atomic_fetch_or(&t->ptrace.flags, LKD_PT_STOPPED);
     lkd_registry_publish(t);
@@ -282,11 +293,12 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
     uint64_t newmask = 0;
     size_t nxlen = 0;
     int result = 1;
+    int exitkill = 0;
     for (;;) {
         pt_lock();
         s = pt_slot_at(i);
         int detached = 0, resumed = 0, killed = 0;
-        if (atomic_load(&s->tid) != t->tid || s->gen != gen || atomic_load(&s->link) == PL_FREE) {
+        if (atomic_load(&s->tid) != t->tid || pt_gen(s) != gen || atomic_load(&s->link) == PL_FREE) {
             detached = 1; /* the slot was recycled under us: nobody controls this task any more */
         } else if (atomic_load(&s->link) == PL_DETACHED) {
             detached = 1;
@@ -295,20 +307,21 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
         } else if (!rq->ignore_fatal && (atomic_load(&t->flags) & LKD_TF_FATAL)) {
             s->stopped = 0;
             killed = 1;
-        } else if ((L->tick++ % 8) == 7 && tracer_dead(s)) {
-            /* the tracer's host process vanished without running its exit path */
+        } else if ((L->tick++ % 8) == 7 && pt_tracer_host_dead(s)) {
+            /* the tracer's host process vanished without running its exit path: what its exit_ptrace() would
+             * have done, here (detach with the signal dropped; EXITKILL: SIGKILL after the detach) */
             s->resume_sig = 0;
             s->stopped = 0;
             atomic_store(&s->link, PL_DETACHED);
             detached = 1;
-            if (s->options & LX_PTRACE_O_EXITKILL) killed = 2;
+            if (s->options & LX_PTRACE_O_EXITKILL) exitkill = 1;
         }
         if (detached || resumed) {
-            out->sig = (s->link == PL_FREE || s->gen != gen) ? 0 : s->resume_sig;
+            out->sig = (atomic_load(&s->link) == PL_FREE || pt_gen(s) != gen) ? 0 : s->resume_sig;
             out->mode = s->mode;
             out->step = (int)s->step;
             out->detached = detached;
-            if (s->gen == gen && s->tid == t->tid) {
+            if (pt_gen(s) == gen && atomic_load(&s->tid) == t->tid) {
                 if (s->regs_dirty) { out->regs_changed = 1; out->regs = s->regs; s->regs_dirty = 0; }
                 if (s->si_dirty) { out->si_changed = 1; out->si = s->si; s->si_dirty = 0; }
                 int want_xs = s->xs_dirty || (s->fx_dirty && s->xs_ok); /* one coherent image */
@@ -333,9 +346,22 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
         struct pollfd p = { .fd = t->wake_rd, .events = POLLIN };
         if (poll(&p, 1, 100) > 0) { char b[64]; while (read(t->wake_rd, b, sizeof b) > 0) { } }
     }
+    if (exitkill) {
+        /* exit_ptrace(): __ptrace_detach(), then SIGKILL for PTRACE_O_EXITKILL. The kill is not undone by the
+         * detach that came first: this task dies at once, the rest of its process with it. */
+        lkd_event("ptrace: tid %d: dead tracer %d had EXITKILL: killing process %d", (int)t->tid,
+                  (int)atomic_load(&s->tracer_tid), (int)t->proc->pid);
+        struct lx_siginfo ksi;
+        memset(&ksi, 0, sizeof ksi);
+        ksi.si_signo = LX_SIGKILL;
+        ksi.si_code = LX_SI_KERNEL;
+        (void)lkd_sig_send_pid(NULL, t->proc->pid, LX_SIGKILL, &ksi);
+        atomic_fetch_or(&t->flags, LKD_TF_FATAL);
+        result = -1;
+    }
     if (result > 0 && !rq->ignore_fatal && (atomic_load(&t->flags) & LKD_TF_FATAL)) result = -1;
     atomic_fetch_and(&t->ptrace.flags, ~LKD_PT_STOPPED);
-    if (result < 0) { free(nfx); free(nxs); lkd_registry_publish(t); return -1; }
+    if (result < 0) { free(nfx); free(nxs); if (out->detached) L->slot = -1; pt_sync_flags(t); lkd_registry_publish(t); return -1; }
     pt_resume_count++;
     apply_resume(t, L, out, nfx, fx_dirty, nxs, nxlen, xs_dirty, newmask, mask_dirty);
     free(nfx);
@@ -453,58 +479,6 @@ int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info)
     return rs.sig;
 }
 
-#define PT_ATTACH_MAGIC 0x4c4b4154 /* "TAKL": an attach stop, see lkd_ptrace_attach_stop */
-
-void lkd_ptrace_mark_attach_stop(struct lx_siginfo *si, int slot, uint32_t gen, int32_t tracer_tid)
-{
-    si->u._si_pad[24] = PT_ATTACH_MAGIC;
-    si->u._si_pad[25] = slot;
-    si->u._si_pad[26] = (int32_t)gen;
-    si->u._si_pad[27] = tracer_tid;
-}
-
-static _Atomic int attach_logs;
-
-int lkd_ptrace_attach_stop(lkd_task *t, struct lx_siginfo *info)
-{
-    if (info->u._si_pad[24] != PT_ATTACH_MAGIC) return LKD_PT_NOT_ATTACH_STOP;
-    int slot = info->u._si_pad[25];
-    uint32_t gen = (uint32_t)info->u._si_pad[26];
-    int32_t tracer = info->u._si_pad[27];
-    memset(&info->u._si_pad[24], 0, 4 * sizeof info->u._si_pad[0]); /* the tracer's GETSIGINFO sees Linux's */
-    int live = 0;
-    if (pt_table_ready() && slot >= 0 && slot < PT_SLOTS) {
-        pt_lock();
-        struct pt_slot *s = pt_slot_at(slot);
-        live = atomic_load(&s->link) == PL_ATTACHED && atomic_load(&s->tid) == t->tid && s->gen == gen;
-        pt_unlock();
-    }
-    pt_sync_flags(t); /* the tracer's wake may not have synced t yet, or a stale sync undid it */
-    if (live) {
-        struct pt_stop_req q;
-        memset(&q, 0, sizeof q);
-        q.kind = PK_SIGNAL;
-        q.code = LX_SIGSTOP;
-        q.si = info;
-        q.nr = -1;
-        q.bound = 1;
-        q.bind_slot = slot;
-        q.bind_gen = gen;
-        struct pt_resume rs;
-        int r = pt_do_stop(t, &q, &rs);
-        if (r < 0) return -1;
-        if (r > 0) {
-            if (rs.si_changed) *info = rs.si;
-            return rs.sig;
-        }
-        /* r == 0: the link went between the check and the stop */
-    }
-    if (atomic_fetch_add(&attach_logs, 1) < 16)
-        lkd_log("ptrace: tid %d dropped the attach SIGSTOP of tracer %d (link %d gen %u): the link is gone",
-                (int)t->tid, (int)tracer, slot, gen);
-    return 0;
-}
-
 int lkd_ptrace_event(lkd_task *t, int event, uint64_t msg)
 {
     int i = pt_my_slot(t);
@@ -581,18 +555,102 @@ int lkd_ptrace_stop(lkd_task *t, lkd_stop_kind kind, int signo, int *resume_sign
     return 0;
 }
 
-/* PTRACE_INTERRUPT: the pending trap becomes a PTRACE_EVENT_STOP stop at the next safe point. Called by
- * the sig module when it sees LKD_TF_TRACE_STOP in lkd_signal_next (docs/requests/ptrace-1.md). Returns
- * 0, or -1 if the task was killed in the stop. */
-int lkd_ptrace_trap_stop(lkd_task *t)
+/* The stops a link keeps pending for its tracee (lkd_signal_next saw LKD_TF_TRACE_STOP, the hint that
+ * pt_sync_flags and the tracer's wake set): the attach stop first (a signal-delivery-stop of SIGSTOP,
+ * Linux's 0x137f), then an INTERRUPT trap (PTRACE_EVENT_STOP). Both are read from the slot under the lock,
+ * so a stale or lost hint can neither invent a stop nor lose one: the next sync sets the hint again while
+ * the slot says a stop is pending. A link whose tracer's host process is dead is cancelled here, before
+ * any stop, as that tracer's exit path would have (EXITKILL kills). Returns the signal the tracer resumed
+ * the attach stop with (*info is its siginfo), 0, or -1 if the task must die. Docs: docs/status/ptrace.md, "The attach stop". */
+int lkd_ptrace_pending_stop(lkd_task *t, struct lx_siginfo *info)
 {
-    int i = pt_my_slot(t);
-    if (i < 0) { atomic_fetch_and(&t->flags, ~LKD_TF_TRACE_STOP); return 0; }
-    struct pt_stop_req q;
-    memset(&q, 0, sizeof q);
-    q.kind = PK_GROUP;
-    q.code = LX_SIGTRAP | (LX_PTRACE_EVENT_STOP << 8);
-    q.nr = -1;
-    struct pt_resume rs;
-    return pt_do_stop(t, &q, &rs) < 0 ? -1 : 0;
+    for (;;) {
+        if (!pt_table_ready()) return 0;
+        int kill = 0, cancelled = 0;
+        int32_t ctgid = 0, ctid = 0, tracer = 0;
+        uint32_t astop = 0, trap = 0, seized = 0;
+        int32_t acode = 0;
+        uint64_t gen = 0;
+        pt_lock();
+        int i = pt_find_tracee(t->tid);
+        if (i >= 0) {
+            struct pt_slot *s = pt_slot_at(i);
+            gen = pt_gen(s);
+            astop = s->astop;
+            acode = s->astop_code;
+            trap = s->trap;
+            seized = s->seized;
+            tracer = atomic_load(&s->tracer_tid);
+            if ((astop || trap) && pt_tracer_host_dead(s)) {
+                pt_cancel_link_locked(i, &kill, &ctgid, &ctid);
+                cancelled = 1;
+            }
+        }
+        pt_unlock();
+        if (cancelled) {
+            lkd_event("ptrace: tid %d: tracer %d of link %d gen %llu died before its stop: link cancelled%s",
+                      (int)t->tid, (int)tracer, i, (unsigned long long)gen, kill ? ", EXITKILL" : "");
+            if (kill) {
+                struct lx_siginfo ksi;
+                memset(&ksi, 0, sizeof ksi);
+                ksi.si_signo = LX_SIGKILL;
+                ksi.si_code = LX_SI_KERNEL;
+                (void)lkd_sig_send_pid(NULL, t->proc->pid, LX_SIGKILL, &ksi);
+                return -1;
+            }
+            pt_sync_flags(t);
+            continue;
+        }
+        if (i < 0 || (!astop && !trap)) { pt_sync_flags(t); return 0; }
+        struct pt_stop_req q;
+        memset(&q, 0, sizeof q);
+        q.nr = -1;
+        q.bound = 1;
+        q.bind_slot = i;
+        q.bind_gen = gen;
+        struct pt_resume rs;
+        if (astop) {
+            /* ptrace_attach(): send_sig_info(SIGSTOP, SEND_SIG_PRIV) (SI_KERNEL, no sender); the auto-attach
+             * of ptrace_init_task() sets the bit alone (collect_signal's SI_USER placeholder) */
+            struct lx_siginfo si;
+            memset(&si, 0, sizeof si);
+            si.si_signo = LX_SIGSTOP;
+            si.si_code = acode;
+            q.kind = PK_SIGNAL;
+            q.code = LX_SIGSTOP;
+            q.si = &si;
+            q.attach = 1;
+            int r = pt_do_stop(t, &q, &rs);
+            if (r < 0) return -1;
+            if (r == PT_STOP_RETRY) {
+                /* out of memory before anything was published: the stop stays the link's, try again soon */
+                lkd_event("ptrace: tid %d: attach stop of link %d gen %llu deferred (no memory)", (int)t->tid, i,
+                          (unsigned long long)gen);
+                atomic_fetch_or(&t->flags, LKD_TF_TRACE_STOP);
+                struct pollfd p = { .fd = t->wake_rd, .events = POLLIN };
+                (void)poll(&p, 1, 10);
+                return 0;
+            }
+            if (r == 0) continue; /* link gone or replaced, or its stop already reported: look again */
+            if (rs.sig > 0 && rs.sig <= LX_NSIG) {
+                if (rs.si_changed) {
+                    *info = rs.si;
+                    info->si_signo = rs.sig;
+                } else {
+                    /* ptrace_signal(): a signal chosen by the tracer gets a SI_USER siginfo naming it */
+                    memset(info, 0, sizeof *info);
+                    info->si_signo = rs.sig;
+                    info->si_code = LX_SI_USER;
+                    info->u.kill.pid = tracer;
+                }
+                return rs.sig;
+            }
+            continue; /* an INTERRUPT may be pending as well */
+        }
+        if (!seized) { pt_sync_flags(t); return 0; } /* a trap only exists for SEIZE links */
+        q.kind = PK_GROUP;
+        q.code = LX_SIGTRAP | (LX_PTRACE_EVENT_STOP << 8);
+        int r = pt_do_stop(t, &q, &rs);
+        return r < 0 ? -1 : 0;
+    }
 }

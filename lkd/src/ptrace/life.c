@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "pt_priv.h"
+#include "sig.h"
 
 #define CAP_SYS_PTRACE 19
 
@@ -32,13 +33,13 @@ int pt_resolve_tid(int32_t tid, int32_t *tgid, int32_t *host, uint32_t *uid, cha
     return r < 0 ? -LX_ESRCH : 0;
 }
 
-int pt_link(int32_t tid, int32_t tgid, int32_t tracee_host, uint32_t uid, int32_t tracer_pid,
-            int32_t tracer_tid, int32_t tracer_host, uint32_t options, int seized)
+int pt_link_locked(int32_t tid, int32_t tgid, int32_t tracee_host, uint32_t uid, int32_t tracer_pid,
+                   int32_t tracer_tid, int32_t tracer_host, uint32_t options, int seized, int with_stop,
+                   int astop_code)
 {
-    pt_lock();
-    if (pt_find_tracee(tid) >= 0) { pt_unlock(); return -LX_EPERM; }
+    if (pt_find_tracee(tid) >= 0) return -LX_EPERM;
     int i = pt_alloc_locked();
-    if (i < 0) { pt_unlock(); return -LX_EAGAIN; }
+    if (i < 0) return -LX_EAGAIN;
     struct pt_slot *s = pt_slot_at(i);
     s->tgid = tgid;
     s->tracee_host = tracee_host;
@@ -46,11 +47,77 @@ int pt_link(int32_t tid, int32_t tgid, int32_t tracee_host, uint32_t uid, int32_
     s->uid = uid;
     s->options = options;
     s->seized = (uint32_t)seized;
+    s->astop = with_stop != 0;      /* reserved with the link: nothing can fail between the two */
+    s->astop_code = astop_code;
     atomic_store(&s->tracer_pid, tracer_pid);
     atomic_store(&s->tracer_tid, tracer_tid);
     atomic_store(&s->tid, tid);
+    return i;
+}
+
+int pt_link(int32_t tid, int32_t tgid, int32_t tracee_host, uint32_t uid, int32_t tracer_pid,
+            int32_t tracer_tid, int32_t tracer_host, uint32_t options, int seized)
+{
+    pt_lock();
+    int i = pt_link_locked(tid, tgid, tracee_host, uid, tracer_pid, tracer_tid, tracer_host, options, seized, 0, 0);
     pt_unlock();
     return i;
+}
+
+void pt_cancel_link_locked(int i, int *kill, int32_t *tgid, int32_t *tid)
+{
+    struct pt_slot *s = pt_slot_at(i);
+    *tgid = s->tgid;
+    *tid = atomic_load(&s->tid);
+    *kill = (s->options & LX_PTRACE_O_EXITKILL) != 0;
+    s->resume_sig = 0; /* a tracer that disappears resumes its tracee with the signal suppressed */
+    s->mode = PM_CONT;
+    s->step = 0;
+    s->trap = 0;
+    s->astop = 0;      /* the attach stop goes with its link */
+    s->regs_dirty = s->fx_dirty = s->xs_dirty = s->si_dirty = s->mask_dirty = 0;
+    if (s->stopped) {
+        s->stopped = 0;
+        atomic_store(&s->link, PL_DETACHED); /* the parked tracee frees the slot */
+    } else {
+        pt_free_locked(i);
+    }
+}
+
+int pt_exec_rename_locked(int32_t old, int32_t now, int32_t tgid, int32_t ended[4])
+{
+    int n = 0;
+    int mine = -1;
+    for (int i = 0; i < PT_SLOTS; i++) {
+        struct pt_slot *s = pt_slot_at(i);
+        if (atomic_load(&s->link) == PL_ATTACHED && atomic_load(&s->tid) == old && s->tgid == tgid) mine = i;
+    }
+    for (int i = 0; i < PT_SLOTS; i++) {
+        struct pt_slot *s = pt_slot_at(i);
+        uint32_t l = atomic_load(&s->link);
+        if (l != PL_ATTACHED && l != PL_EXITED) continue;
+        if (old != now && mine >= 0 && i != mine && l == PL_ATTACHED && atomic_load(&s->tid) == now &&
+            s->tgid == tgid) {
+            /* Made by an ATTACH to the leader's tid in the window where the leader had died and this thread
+             * had not yet been renamed. In Linux that attach finds the leader's exit_state and fails; here it
+             * has returned 0 already, so its tracer sees what happened to the thread it attached: it died. */
+            if (n < 4) ended[n] = atomic_load(&s->tracer_pid);
+            n++;
+            s->stopped = 0;
+            s->astop = 0;
+            s->trap = 0;
+            s->exit_status = LX_SIGKILL;
+            atomic_store(&s->link, PL_EXITED);
+            continue;
+        }
+        /* only links of this thread group: tid_seen may still be the parent's tid in a fork child (the
+         * ptrace fork hook runs before task switches the identity), and the parent's tid must not be
+         * mistaken for an old tid of this process (the EAC exec probes: the tracer lost its tracee) */
+        if (atomic_load(&s->tid) == old && l == PL_ATTACHED && s->tgid == tgid) atomic_store(&s->tid, now);
+        if (atomic_load(&s->tracer_tid) == old && atomic_load(&s->tracer_pid) == tgid)
+            atomic_store(&s->tracer_tid, now);
+    }
+    return n;
 }
 
 /* ---- wait4 / waitid -------------------------------------------------------------------------------- */
@@ -197,6 +264,16 @@ int lkd_ptrace_wait_event(lkd_task *waiter, int32_t sel_pid, unsigned options, s
     return found;
 }
 
+int lkd_ptrace_attach_stop_pending(lkd_task *t)
+{
+    if (!pt_table_ready()) return 0;
+    pt_lock();
+    int i = pt_find_tracee(t->tid);
+    int r = i >= 0 && pt_slot_at(i)->astop;
+    pt_unlock();
+    return r;
+}
+
 int32_t lkd_ptrace_tracer_of(int32_t tid)
 {
     int i = pt_table_ready() ? pt_find_tracee(tid) : -1;
@@ -250,23 +327,13 @@ void pt_tracer_gone(lkd_task *t, int whole_process)
         if (whole_process ? atomic_load(&s->tracer_pid) != me_pid : atomic_load(&s->tracer_tid) != me_tid) continue;
         if (l == PL_EXITED) { pt_free_locked(i); continue; }
         /* exit_ptrace(): __ptrace_unlink() each tracee; EXITKILL ones are killed */
-        act[n].tgid = s->tgid;
-        act[n].tid = atomic_load(&s->tid);
-        act[n].kill = (s->options & LX_PTRACE_O_EXITKILL) != 0;
-        s->resume_sig = 0; /* a tracer that disappears resumes its tracee with the signal suppressed */
-        s->mode = PM_CONT;
-        s->step = 0;
-        s->regs_dirty = s->fx_dirty = s->xs_dirty = s->si_dirty = s->mask_dirty = 0;
-        if (s->stopped) {
-            s->stopped = 0;
-            atomic_store(&s->link, PL_DETACHED); /* the parked tracee frees the slot */
-        } else {
-            pt_free_locked(i);
-        }
+        pt_cancel_link_locked(i, &act[n].kill, &act[n].tgid, &act[n].tid);
         n++;
     }
     pt_unlock();
     for (int k = 0; k < n; k++) {
+        lkd_event("ptrace: tracer %d (pid %d) gone: link of tid %d cancelled%s", (int)me_tid, (int)me_pid,
+                  (int)act[k].tid, act[k].kill ? ", EXITKILL" : "");
         if (act[k].kill) {
             struct lx_siginfo si;
             memset(&si, 0, sizeof si);
@@ -274,7 +341,7 @@ void pt_tracer_gone(lkd_task *t, int whole_process)
             si.si_code = LX_SI_KERNEL;
             (void)lkd_sig_send_pid(NULL, act[k].tgid, LX_SIGKILL, &si);
         }
-        (void)pt_wake_tracee(act[k].tgid, act[k].tid, PT_WAKE_SYNC);
+        (void)pt_wake_tracee(act[k].tgid, act[k].tid, PT_WAKE_SYNC, -1, 0);
     }
     if (!whole_process) {
         uint32_t f = atomic_load(&t->ptrace.flags);
@@ -304,13 +371,12 @@ void lkd_ptrace_fork_child(lkd_task *t)
     int i = pt_my_slot(t);
     memset(&L->inherit, 0, sizeof L->inherit);
     if (i >= 0) {
-        struct pt_slot *s = pt_slot_at(i);
+        /* traced at fork: lkd_ptrace_task_init reads the parent's link again, under the lock, when it makes
+         * the child's (the tracer may have left in between) */
         L->inherit.valid = 1;
-        L->inherit.tracer_pid = atomic_load(&s->tracer_pid);
-        L->inherit.tracer_tid = atomic_load(&s->tracer_tid);
-        L->inherit.tracer_host = s->tracer_host;
-        L->inherit.options = s->options;
-        L->inherit.seized = s->seized;
+        L->inherit.slot = i;
+        L->inherit.gen = L->gen;
+        L->inherit.parent_tid = t->tid;
     }
     L->slot = -1;
     L->emu = 0;
@@ -338,45 +404,52 @@ void lkd_ptrace_task_init(lkd_task *child, lkd_task *parent, uint64_t clone_flag
 {
     struct pt_local *LC = pt_local_of(child, 1);
     if (!LC) return;
-    struct { int valid; int32_t tracer_pid, tracer_tid, tracer_host; uint32_t options, seized; } in;
+    int32_t ptid, ptgid;
+    int was_traced;
     if (child == parent) {
-        in.valid = LC->inherit.valid; in.tracer_pid = LC->inherit.tracer_pid; in.tracer_tid = LC->inherit.tracer_tid;
-        in.tracer_host = LC->inherit.tracer_host; in.options = LC->inherit.options; in.seized = LC->inherit.seized;
+        /* host fork child: the parent thread is in the other process now */
+        was_traced = LC->inherit.valid;
+        ptid = LC->inherit.parent_tid;
+        ptgid = LC->creator_pid;
         LC->inherit.valid = 0;
     } else {
-        memset(&in, 0, sizeof in);
         LC->creator_tid = parent->tid;
         LC->creator_pid = parent->proc->pid;
-        int i = pt_my_slot(parent);
-        if (i >= 0) {
-            struct pt_slot *s = pt_slot_at(i);
-            in.valid = 1;
-            in.tracer_pid = atomic_load(&s->tracer_pid);
-            in.tracer_tid = atomic_load(&s->tracer_tid);
-            in.tracer_host = s->tracer_host;
-            in.options = s->options;
-            in.seized = s->seized;
+        ptid = parent->tid;
+        ptgid = parent->proc->pid;
+        was_traced = pt_table_ready() && pt_find_tracee(ptid) >= 0;
+    }
+    if (!was_traced || !pt_table_ready()) return;
+    int ev = event_of_clone(clone_flags);
+    int i = -1, seized = 0;
+    int32_t tracer_tid = 0;
+    uint64_t gen = 0;
+    /* The parent's link is read and the child's made in one critical section: a tracer that detaches or
+     * dies meanwhile is either before (no child link) or after (it cancels the child's link with its own). */
+    pt_lock();
+    int pi = pt_find_tracee(ptid);
+    if (pi >= 0 && pt_slot_at(pi)->tgid == ptgid) {
+        struct pt_slot *ps = pt_slot_at(pi);
+        uint32_t opts = ps->options;
+        int traced_event = !(clone_flags & LX_CLONE_UNTRACED) && (opts & (1u << ev));
+        if ((clone_flags & LX_CLONE_PTRACE) || traced_event) {
+            seized = (int)ps->seized;
+            tracer_tid = atomic_load(&ps->tracer_tid);
+            i = pt_link_locked(child->tid, child->proc->pid, getpid(), child->proc->cred.uid,
+                               atomic_load(&ps->tracer_pid), tracer_tid, ps->tracer_host, opts, seized,
+                               !seized, LX_SI_USER);
+            if (i >= 0) {
+                if (seized) pt_slot_at(i)->trap = 1;
+                gen = pt_gen(pt_slot_at(i));
+            }
         }
     }
-    if (!in.valid) return;
-    int ev = event_of_clone(clone_flags);
-    int traced_event = !(clone_flags & LX_CLONE_UNTRACED) && (in.options & (1u << ev));
-    if (!(clone_flags & LX_CLONE_PTRACE) && !traced_event) return;
-    int i = pt_link(child->tid, child->proc->pid, getpid(), child->proc->cred.uid, in.tracer_pid,
-                    in.tracer_tid, in.tracer_host, in.options, (int)in.seized);
+    pt_unlock();
     if (i < 0) return;
     LC->slot = -1;
-    if (in.seized) {
-        atomic_fetch_or(&child->flags, LKD_TF_TRACE_STOP);
-        pt_slot_at(i)->trap = 1;
-    } else {
-        struct lx_siginfo si;
-        memset(&si, 0, sizeof si);
-        si.si_signo = LX_SIGSTOP;
-        si.si_code = LX_SI_USER;
-        lkd_ptrace_mark_attach_stop(&si, i, __atomic_load_n(&pt_slot_at(i)->gen, __ATOMIC_ACQUIRE), in.tracer_tid);
-        lkd_sig_send_task(child, LX_SIGSTOP, &si, 1);
-    }
+    lkd_event("ptrace: tid %d auto-attached to tracer %d (link %d gen %llu%s)", (int)child->tid, (int)tracer_tid, i,
+              (unsigned long long)gen, seized ? ", seized" : "");
+    atomic_fetch_or(&child->flags, LKD_TF_TRACE_STOP);
     pt_sync_flags(child);
 }
 
@@ -386,21 +459,18 @@ void lkd_ptrace_exec_commit(lkd_task *t)
     struct pt_local *L = pt_local_of(t, 0);
     if (!L || L->tid_seen == t->tid || !pt_table_ready()) return;
     int32_t old = L->tid_seen;
+    int32_t ended[4];
     pt_lock();
-    for (int i = 0; i < PT_SLOTS; i++) {
-        struct pt_slot *s = pt_slot_at(i);
-        uint32_t l = atomic_load(&s->link);
-        if (l != PL_ATTACHED && l != PL_EXITED) continue;
-        /* only links of this thread group: tid_seen may still be the parent's tid in a fork child (the
-         * ptrace fork hook runs before task switches the identity), and the parent's tid must not be
-         * mistaken for an old tid of this process (the EAC exec probes: the tracer lost its tracee) */
-        if (atomic_load(&s->tid) == old && l == PL_ATTACHED && s->tgid == t->proc->pid) atomic_store(&s->tid, t->tid);
-        if (atomic_load(&s->tracer_tid) == old && atomic_load(&s->tracer_pid) == t->proc->pid)
-            atomic_store(&s->tracer_tid, t->tid);
-    }
+    int n = pt_exec_rename_locked(old, t->tid, t->proc->pid, ended);
     pt_unlock();
+    for (int k = 0; k < n && k < 4; k++) {
+        lkd_event("ptrace: exec of tid %d -> %d ended a link made to %d meanwhile (tracer pid %d)", (int)old,
+                  (int)t->tid, (int)t->tid, (int)ended[k]);
+        pt_notify_tracer(ended[k], t->tid, t->proc->cred.uid, LX_CLD_KILLED, LX_SIGKILL);
+    }
     L->tid_seen = t->tid;
     L->slot = -1;
+    pt_sync_flags(t);
 }
 
 /* A tracee thread leaves: PTRACE_EVENT_EXIT stop first (do_exit(): ptrace_event(PTRACE_EVENT_EXIT, code)),

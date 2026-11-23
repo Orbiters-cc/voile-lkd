@@ -131,12 +131,12 @@ LT_TEST(wake_crosses_processes)
     char b;
     LT_EQ(read(up[0], &b, 1), 1);
     usleep(50000);
-    LT_EQ(pt_wake_tracee((int32_t)pid, (int32_t)pid, 0), 0);
+    LT_EQ(pt_wake_tracee((int32_t)pid, (int32_t)pid, 0, -1, 0), 0);
     LT_EQ(get64(ack[0]), 1);
     int st;
     LT_EQ(wait_pid((int32_t)pid, &st, 0), pid);
     /* a process that does not exist */
-    LT_ERRNO(pt_wake_tracee(0x3ffffff0, 0x3ffffff0, 0), LX_ESRCH);
+    LT_ERRNO(pt_wake_tracee(0x3ffffff0, 0x3ffffff0, 0, -1, 0), LX_ESRCH);
     close(up[0]); close(up[1]); close(ack[0]); close(ack[1]);
 }
 
@@ -273,7 +273,7 @@ LT_TEST(round_trip_process_tracee)
 
 struct two {
     volatile int64_t beat_a, beat_b;
-    volatile int hold_a, quit, skip_sync;
+    volatile int hold_a, quit, skip_sync, fail_local, killed;
     volatile int32_t tid_a, tid_b, pid, host;
 };
 static struct two *g_two;
@@ -287,6 +287,7 @@ static void two_loop(lkd_task *t, volatile int64_t *beat, int held)
         __atomic_add_fetch(beat, 1, __ATOMIC_RELAXED);
         usleep(200);
     }
+    if (died) g_two->killed = 1;              /* the fixture's own exit is 0 whatever killed it: say so */
 }
 
 static void *two_b_main(void *a)
@@ -302,6 +303,7 @@ static void two_child(lkd_task *a)
     alarm(60);
     cpu_init(a);
     pt_test_hold_wake_sync = g_two->skip_sync;
+    pt_test_fail_local = g_two->fail_local;     /* b's first pt_local allocations fail (b has none yet) */
     const uint64_t thr = LX_CLONE_VM | LX_CLONE_FS | LX_CLONE_FILES | LX_CLONE_SIGHAND | LX_CLONE_THREAD;
     lkd_task *b = lkd_task_alloc(a, thr);
     lkd_task_publish(b);
@@ -433,6 +435,284 @@ LT_TEST(an_ordinary_stop_still_stops_the_process)
     two_end(pid);
 }
 
+
+/* ---- the attach stop is the link's, never a queued signal (fourth verification, findings 1, 5, 6) ------ */
+
+/* A forked guest process that attaches to `tid` (ATTACH, or SEIZE with `opts`), reports the result, then
+ * either exits at once (mode 0), or waits for the attach stop, reports it, sets `opts` with SETOPTIONS and
+ * sleeps until its host process is killed (mode 1). hook: pt_test_exit_after_link in that process. */
+static int64_t tracer_fork(int32_t tid, int mode, uint32_t opts, int hook, int rp[2])
+{
+    if (pipe(rp) != 0) return -1;
+    fflush(NULL);
+    int64_t x = sct(TR, LKD_NR_fork, 0, 0, 0, 0, 0, 0);
+    if (x == 0) {
+        lkd_task *t = lkd_current();
+        alarm(30);
+        pt_test_exit_after_link = hook;
+        int64_t r = sct(t, LKD_NR_ptrace, LX_PTRACE_ATTACH, (uint64_t)tid, 0, 0, 0, 0);
+        put64(rp[1], r);
+        if (mode == 1 && r == 0) {
+            int st = 0;
+            int64_t w = -1;
+            for (int i = 0; i < 6000 && w <= 0; i++) {
+                w = sct(t, LKD_NR_wait4, (uint64_t)tid, P(&st), LX_WALL | LX_WNOHANG, 0, 0, 0);
+                if (w <= 0) usleep(500);
+            }
+            put64(rp[1], w == tid ? st : -1);
+            put64(rp[1], sct(t, LKD_NR_ptrace, LX_PTRACE_SETOPTIONS, (uint64_t)tid, 0, opts, 0, 0));
+            put64(rp[1], (int64_t)getpid());
+            sleep(25);
+            _exit(0);
+        }
+        int sx;
+        (void)sct(t, LKD_NR_exit_group, 0, 0, 0, 0, 0, 0);
+        if (lkd_task_release(t, &sx)) _exit(sx);
+        _exit(90);
+    }
+    return x;
+}
+
+/* Verifier's cross1: tracer A attaches and exits while the target is held, tracer B attaches before the
+ * release. Before: both attaches succeeded, the queue coalesced B's SIGSTOP with A's, the target discarded
+ * A's obsolete generation and B waited for ever while the target ran. Now B's link has its own stop. */
+LT_TEST(a_second_tracer_gets_its_own_attach_stop)
+{
+    int64_t pid = two_start(0);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    g_two->hold_a = 1;
+    usleep(5000);
+    int rp[2];
+    int64_t x = tracer_fork(a, 0, 0, 0, rp);
+    LT_CHECK(x > 0);
+    LT_EQ(get64(rp[0]), 0);
+    int sx;
+    LT_EQ(wait_pid((int32_t)x, &sx, 0), x);
+    LT_EQ(lkd_ptrace_tracer_of(a), 0);
+    LT_EQ(PT(LX_PTRACE_ATTACH, a, 0, 0), 0);
+    g_two->hold_a = 0;
+    int st = 0;
+    LT_EQ(two_wait(a, &st, 3000), a);
+    LT_EQ(st, 0x137f);
+    LT_CHECK(beats_in(&g_two->beat_b, 200) > 0);       /* only A is stopped */
+    int64_t a0 = g_two->beat_a;
+    usleep(100000);
+    LT_EQ(g_two->beat_a, a0);
+    LT_EQ(PT(LX_PTRACE_DETACH, a, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    close(rp[0]); close(rp[1]);
+    two_end(pid);
+}
+
+/* Verifier's cross2: an ordinary thread-directed SIGSTOP sent after a departed tracer's attach must stop the
+ * process as job control says (it used to be coalesced with the obsolete attach stop and dropped: the
+ * sibling ran 700 heartbeats in 200 ms). */
+LT_TEST(an_ordinary_stop_after_a_departed_attach_still_stops)
+{
+    int64_t pid = two_start(0);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    g_two->hold_a = 1;
+    usleep(5000);
+    int rp[2];
+    int64_t x = tracer_fork(a, 0, 0, 0, rp);
+    LT_CHECK(x > 0);
+    LT_EQ(get64(rp[0]), 0);
+    int sx;
+    LT_EQ(wait_pid((int32_t)x, &sx, 0), x);
+    LT_EQ(sct(TR, LKD_NR_tgkill, (uint64_t)pid, (uint64_t)a, LX_SIGSTOP, 0, 0, 0), 0);
+    g_two->hold_a = 0;
+    usleep(100000);
+    LT_EQ(beats_in(&g_two->beat_b, 200), 0);
+    LT_EQ(beats_in(&g_two->beat_a, 1), 0);
+    LT_EQ(sct(TR, LKD_NR_kill, (uint64_t)pid, LX_SIGCONT, 0, 0, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    LT_CHECK(beats_in(&g_two->beat_b, 200) > 0);
+    close(rp[0]); close(rp[1]);
+    two_end(pid);
+}
+
+/* Verifier's cont: a SIGCONT (to a sibling) flushes pending stop signals; it must not flush a live attach's
+ * stop. Both with the flag sync withheld (the stop is taken before the cache says traced) and without. */
+static void sigcont_case(int skip_sync)
+{
+    int64_t pid = two_start(skip_sync);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    g_two->hold_a = 1;
+    usleep(5000);
+    LT_EQ(PT(LX_PTRACE_ATTACH, a, 0, 0), 0);
+    LT_EQ(sct(TR, LKD_NR_tgkill, (uint64_t)pid, (uint64_t)g_two->tid_b, LX_SIGCONT, 0, 0, 0), 0);
+    LT_EQ(sct(TR, LKD_NR_kill, (uint64_t)pid, LX_SIGCONT, 0, 0, 0, 0), 0);
+    g_two->hold_a = 0;
+    int st = 0;
+    LT_EQ(two_wait(a, &st, 3000), a);
+    LT_EQ(st, 0x137f);
+    int64_t a0 = g_two->beat_a;
+    LT_CHECK(beats_in(&g_two->beat_b, 200) > 0);
+    LT_EQ(g_two->beat_a, a0);
+    LT_EQ(PT(LX_PTRACE_DETACH, a, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    two_end(pid);
+}
+LT_TEST(sigcont_does_not_flush_an_attach_stop) { sigcont_case(0); sigcont_case(1); }
+
+/* The tracer's host process dies between linking and waking its tracee (no exit path runs): the target
+ * goes on running, and the next ATTACH is not refused for ever with EPERM: it reclaims the dead link and
+ * gets its own stop. */
+LT_TEST(tracer_killed_between_link_and_wake)
+{
+    int64_t pid = two_start(0);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    int rp[2];
+    int64_t x = tracer_fork(a, 0, 0, 1, rp);
+    LT_CHECK(x > 0);
+    int sx;
+    LT_EQ(wait_pid((int32_t)x, &sx, 0), x);           /* _exit(77) right after pt_link: nothing was sent */
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);       /* the target was not stopped by a lost stop */
+    LT_CHECK(beats_in(&g_two->beat_b, 100) > 0);
+    LT_EQ(PT(LX_PTRACE_ATTACH, a, 0, 0), 0);           /* not EPERM: the dead tracer's link was reclaimed */
+    int st = 0;
+    LT_EQ(two_wait(a, &st, 3000), a);
+    LT_EQ(st, 0x137f);
+    LT_CHECK(beats_in(&g_two->beat_b, 200) > 0);
+    LT_EQ(PT(LX_PTRACE_DETACH, a, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    close(rp[0]); close(rp[1]);
+    two_end(pid);
+}
+
+/* The wake of an ATTACH cannot be delivered: the attach fails (ESRCH) and its link is undone by generation,
+ * so no stop is left behind for a tracer that was told it has none; a later ATTACH works. */
+LT_TEST(an_undelivered_attach_is_undone)
+{
+    int64_t pid = two_start(0);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    pt_test_fail_wake = 1;
+    LT_ERRNO(PT(LX_PTRACE_ATTACH, a, 0, 0), LX_ESRCH);
+    LT_EQ(pt_test_fail_wake, 0);
+    LT_EQ(lkd_ptrace_tracer_of(a), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    LT_EQ(PT(LX_PTRACE_ATTACH, a, 0, 0), 0);
+    int st = 0;
+    LT_EQ(two_wait(a, &st, 3000), a);
+    LT_EQ(st, 0x137f);
+    LT_EQ(PT(LX_PTRACE_DETACH, a, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    two_end(pid);
+}
+
+/* The tracee cannot allocate its ptrace state when it reaches the attach stop (injected: its first three
+ * pt_local allocations fail): the stop is not consumed as "link gone", it is retried and reported. */
+LT_TEST(attach_stop_survives_an_allocation_failure)
+{
+    int64_t pid;
+    {
+        /* two_start with b's allocations failing */
+        g_two = mmap(NULL, sizeof *g_two, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+        LT_CHECK(g_two != MAP_FAILED);
+        memset((void *)g_two, 0, sizeof *g_two);
+        g_two->fail_local = 3;
+        fflush(NULL);
+        pid = sct(TR, LKD_NR_fork, 0, 0, 0, 0, 0, 0);
+        if (pid == 0) { two_child(lkd_current()); _exit(92); }
+        for (int i = 0; i < 4000 && (g_two->beat_a < 20 || g_two->beat_b < 20); i++) usleep(1000);
+    }
+    LT_CHECK(pid > 0 && g_two->beat_b >= 20);
+    int32_t b = g_two->tid_b;
+    LT_EQ(PT(LX_PTRACE_ATTACH, b, 0, 0), 0);
+    int st = 0;
+    LT_EQ(two_wait(b, &st, 3000), b);
+    LT_EQ(st, 0x137f);
+    LT_CHECK(beats_in(&g_two->beat_a, 200) > 0);       /* the process was not stopped */
+    LT_EQ(PT(LX_PTRACE_DETACH, b, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_b, 300) > 0);
+    two_end(pid);
+}
+
+/* EXITKILL while parked: the tracer's host process is killed while its tracee sits in the attach stop. The
+ * parked tracee detaches itself and, because of EXITKILL, dies (it used to take the detach exit first and
+ * run on). The control without EXITKILL runs on. */
+static void exitkill_case(uint32_t opts)
+{
+    int64_t pid = two_start(0);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    int rp[2];
+    int64_t x = tracer_fork(a, 1, opts, 0, rp);
+    LT_CHECK(x > 0);
+    LT_EQ(get64(rp[0]), 0);
+    LT_EQ(get64(rp[0]), 0x137f);
+    LT_EQ(get64(rp[0]), 0);                             /* SETOPTIONS */
+    int64_t host = get64(rp[0]);
+    LT_CHECK(host > 0);
+    LT_EQ(kill((pid_t)host, SIGKILL), 0);
+    int sx;
+    (void)wait_pid((int32_t)x, &sx, 0);
+    if (opts & LX_PTRACE_O_EXITKILL) {
+        int st = 0;
+        int64_t t0 = mono_ns();
+        LT_EQ(wait_pid((int32_t)pid, &st, 0), pid);     /* the tracee's process ended ... */
+        LT_EQ(g_two->killed, 1);                       /* ... killed (SIGKILL), not run on */
+        LT_CHECK(mono_ns() - t0 < 5000000000ll);
+        g_two->host = 0;
+        munmap((void *)g_two, sizeof *g_two);
+    } else {
+        int64_t t0 = mono_ns();
+        while (mono_ns() - t0 < 5000000000ll && beats_in(&g_two->beat_a, 100) == 0) { }
+        LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+        LT_EQ(g_two->killed, 0);
+        two_end(pid);
+    }
+    close(rp[0]); close(rp[1]);
+}
+LT_TEST(exitkill_while_parked_kills) { exitkill_case(LX_PTRACE_O_EXITKILL); exitkill_case(0); }
+
+/* A tracer attaching to a process already in a group stop gets the attach stop reported (it used to wait
+ * until SIGCONT); SIGCONT afterwards resumes the rest. */
+LT_TEST(attach_to_a_group_stopped_process)
+{
+    int64_t pid = two_start(0);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    LT_EQ(sct(TR, LKD_NR_kill, (uint64_t)pid, LX_SIGSTOP, 0, 0, 0, 0), 0);
+    usleep(100000);
+    LT_EQ(beats_in(&g_two->beat_b, 200), 0);
+    LT_EQ(PT(LX_PTRACE_ATTACH, a, 0, 0), 0);
+    int st = 0;
+    LT_EQ(two_wait(a, &st, 3000), a);
+    LT_EQ(st, 0x137f);
+    LT_EQ(PT(LX_PTRACE_DETACH, a, 0, 0), 0);
+    LT_EQ(sct(TR, LKD_NR_kill, (uint64_t)pid, LX_SIGCONT, 0, 0, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    LT_CHECK(beats_in(&g_two->beat_b, 200) > 0);
+    two_end(pid);
+}
+
+/* The recent-event ring keeps every attach and group stop (the capped logs could hide the one that matters):
+ * 9000 events, the ring keeps the newest LKD_EVENT_RING_LINES, each a full line. */
+LT_TEST(event_ring_keeps_the_recent_events)
+{
+    size_t lines = 0;
+    const char *m = lkd_event_ring(&lines);
+    LT_CHECK(m != NULL);
+    LT_EQ(lines, LKD_EVENT_RING_LINES);
+    for (int i = 0; i < 9000; i++) lkd_event("test event %d", i);
+    int found_last = 0, found_old = 0;
+    for (size_t k = 1; k <= lines; k++) {
+        const char *l = m + k * LKD_EVENT_LINE;
+        LT_EQ(l[LKD_EVENT_LINE - 1], '\n');
+        if (strstr(l, "test event 8999 ") && memchr(l, '\n', LKD_EVENT_LINE) == l + LKD_EVENT_LINE - 1) found_last = 1;
+        if (strstr(l, "test event 0 ")) found_old = 1;
+    }
+    LT_EQ(found_last, 1);
+    LT_EQ(found_old, 0);
+    LT_EQ(memcmp(m + 8, "lkd event ring v1", 17), 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) g_filter = argv[1];
@@ -446,5 +726,14 @@ int main(int argc, char **argv)
     RUN(attach_stop_before_the_flag_update);
     RUN(tracer_exits_before_the_attach_stop);
     RUN(an_ordinary_stop_still_stops_the_process);
+    RUN(a_second_tracer_gets_its_own_attach_stop);
+    RUN(an_ordinary_stop_after_a_departed_attach_still_stops);
+    RUN(sigcont_does_not_flush_an_attach_stop);
+    RUN(tracer_killed_between_link_and_wake);
+    RUN(an_undelivered_attach_is_undone);
+    RUN(attach_stop_survives_an_allocation_failure);
+    RUN(exitkill_while_parked_kills);
+    RUN(attach_to_a_group_stopped_process);
+    RUN(event_ring_keeps_the_recent_events);
     return lt_finish();
 }

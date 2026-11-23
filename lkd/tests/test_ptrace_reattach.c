@@ -37,7 +37,7 @@ static void spinner_body(lkd_task *t)
     cpu_init(t);
     int64_t r = gsys(t, LKD_NR_fork, 0, 0, 0, 0, 0, 0, &died);
     if (r == 0) {
-        alarm(90);
+        alarm(getenv("LKD_REATTACH_ROUNDS") ? 7200 : 90);
         g_sh->host = (int32_t)getpid();
         g_sh->tid = t->tid;
         /* A busy guest thread: one syscall, then the engine's safe point, in a loop. */
@@ -71,26 +71,37 @@ LT_TEST(attach_detach_at_speed_never_stops_the_process)
     memset((void *)g_sh, 0, sizeof *g_sh);
     fflush(NULL);
     int64_t pid = sct(TR, LKD_NR_fork, 0, 0, 0, 0, 0, 0);
-    if (pid == 0) { alarm(90); spinner_body(lkd_current()); _exit(93); }
+    if (pid == 0) { alarm(getenv("LKD_REATTACH_ROUNDS") ? 7200 : 90); spinner_body(lkd_current()); _exit(93); }
     LT_CHECK(pid > 0);
     for (int i = 0; i < 4000 && g_sh->progress < 100; i++) usleep(1000);
     int32_t tid = g_sh->tid;
     LT_CHECK(tid > 0 && g_sh->progress >= 100);
 
+    /* LKD_REATTACH_ROUNDS=N runs exactly N rounds (N >= 1; anything else fails the test rather than pass with
+     * none); without it 60000 rounds or 40 s, whichever comes first, and at least 1000 must complete. */
     const char *env = getenv("LKD_REATTACH_ROUNDS");
-    int rounds = env ? atoi(env) : 60000;
-    int64_t budget_ns = (int64_t)(env ? 600 : 40) * 1000000000ll;
+    long rounds = 60000;
+    int exact = 0;
+    if (env) {
+        char *end = NULL;
+        errno = 0;
+        rounds = strtol(env, &end, 10);
+        LT_CHECK(errno == 0 && end != env && *end == 0 && rounds >= 1 && rounds <= 100000000);
+        if (!(errno == 0 && end != env && *end == 0 && rounds >= 1 && rounds <= 100000000)) rounds = 0;
+        exact = 1;
+    }
+    int64_t budget_ns = exact ? INT64_MAX : 40ll * 1000000000ll;
     int64_t t0 = mono_ns();
     int done = 0, lost = -1, odd = 0;
     int64_t worst_ns = 0;
-    for (int k = 0; k < rounds && mono_ns() - t0 < budget_ns; k++) {
+    for (long k = 0; k < rounds && mono_ns() - t0 < budget_ns; k++) {
         int64_t a = mono_ns();
         if (PT(LX_PTRACE_ATTACH, tid, 0, 0) != 0) { odd++; break; }
         int st = 0;
         int64_t r = wait_stop(tid, &st, 3000);
         if (r != tid) {
             /* wine: the watchdog aborts the wait, resume_after_ptrace detaches (and fails) */
-            lost = k;
+            lost = (int)k;
             (void)PT(LX_PTRACE_DETACH, tid, 0, 0);
             break;
         }
@@ -111,6 +122,8 @@ LT_TEST(attach_detach_at_speed_never_stops_the_process)
             (long long)(worst_ns / 1000), lost, odd, (long long)(after - before));
     LT_EQ(lost, -1);
     LT_EQ(odd, 0);
+    if (exact) LT_EQ(done, rounds);           /* every requested round, none skipped by a budget */
+    else LT_CHECK(done >= 1000);
     LT_CHECK(after > before);
     g_sh->quit = 1;
     if (lost >= 0 && g_sh->host > 0) kill((pid_t)g_sh->host, SIGKILL); /* a stopped process never quits */
@@ -124,7 +137,7 @@ int main(int argc, char **argv)
     if (argc > 1) g_filter = argv[1];
     test_setup(1);
     alarm(0);
-    alarm(700);
+    alarm(getenv("LKD_REATTACH_ROUNDS") ? 7200 : 700); /* an exact run may be long */
     RUN(attach_detach_at_speed_never_stops_the_process);
     return lt_finish();
 }

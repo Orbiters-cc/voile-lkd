@@ -89,24 +89,37 @@ static int64_t do_traceme(lkd_task *t)
     int i = pt_link(t->tid, t->proc->pid, getpid(), t->proc->cred.uid, tpid, ttid, host, 0, 0);
     if (i < 0) return i;
     L->slot = i;
-    L->gen = pt_slot_at(i)->gen;
+    L->gen = pt_gen(pt_slot_at(i));
     pt_sync_flags(t);
     return 0;
 }
 
-/* Trace of attaches (this process is the tracer): the first ones, any whose wake or SIGSTOP failed, and
- * a count every 4096, so that the log of a hang names the link a stray stop came from. */
-static void pt_trace_attach(int32_t tracer, int32_t tgid, int32_t tid, int slot, uint32_t gen, int seize, int wake,
-                            int sent)
+/* A link of tid whose tracer's host process died without its exit path (killed from outside, possibly
+ * between linking and waking its tracee) would refuse every later ATTACH with EPERM: end it as that exit
+ * path would have, then let the new ATTACH proceed. */
+static void reclaim_dead_tracer(int32_t tid)
 {
-    static _Atomic uint64_t n;
-    static _Atomic int failed_logs;
-    uint64_t k = atomic_fetch_add(&n, 1) + 1;
-    int bad = wake < 0 || sent < 0;
-    if (k <= 4 || (k & 4095) == 0 || (bad && atomic_fetch_add(&failed_logs, 1) < 32))
-        lkd_log("ptrace: attach %llu: tracer tid %d -> pid %d tid %d, link %d gen %u%s, wake %d, SIGSTOP %d",
-                (unsigned long long)k, (int)tracer, (int)tgid, (int)tid, slot, gen, seize ? " (seize)" : "", wake,
-                sent);
+    int kill = 0, done = 0;
+    int32_t tgid = 0, ttid = 0, dead = 0;
+    pt_lock();
+    int i = pt_find_tracee(tid);
+    if (i >= 0 && pt_tracer_host_dead(pt_slot_at(i))) {
+        dead = atomic_load(&pt_slot_at(i)->tracer_tid);
+        pt_cancel_link_locked(i, &kill, &tgid, &ttid);
+        done = 1;
+    }
+    pt_unlock();
+    if (!done) return;
+    lkd_event("ptrace: link of tid %d to dead tracer %d reclaimed by a new ATTACH%s", (int)tid, (int)dead,
+              kill ? ", EXITKILL" : "");
+    if (kill) {
+        struct lx_siginfo si;
+        memset(&si, 0, sizeof si);
+        si.si_signo = LX_SIGKILL;
+        si.si_code = LX_SI_KERNEL;
+        (void)lkd_sig_send_pid(NULL, tgid, LX_SIGKILL, &si);
+    }
+    (void)pt_wake_tracee(tgid, ttid, PT_WAKE_SYNC, -1, 0);
 }
 
 static int64_t do_attach(lkd_task *t, int64_t req, int32_t pid, uint64_t addr, uint64_t data)
@@ -129,22 +142,48 @@ static int64_t do_attach(lkd_task *t, int64_t req, int32_t pid, uint64_t addr, u
     e = lkd_ptrace_check_access(t, tgid, LKD_PTRACE_MODE_ATTACH);
     if (e < 0) return e;
     if (state == LKD_PS_ZOMBIE || state == LKD_PS_DEAD) return -LX_EPERM; /* task->exit_state */
-    int i = pt_link(pid, tgid, host, uid, t->proc->pid, t->tid, getpid(), opts, seize);
+    reclaim_dead_tracer(pid);
+    /* The link and its attach stop are made together (ptrace_attach(): the SIGSTOP is part of the attach):
+     * the stop belongs to this generation of the link, not to the signal queue. */
+    pt_lock();
+    int i = pt_link_locked(pid, tgid, host, uid, t->proc->pid, t->tid, getpid(), opts, seize,
+                           !seize, LX_SI_KERNEL);
+    uint64_t gen = i >= 0 ? pt_gen(pt_slot_at(i)) : 0;
+    pt_unlock();
     if (i < 0) return i;
+    if (pt_test_exit_after_link) _exit(77); /* tests: the tracer's host process dies here, no exit path */
     atomic_fetch_or(&t->ptrace.flags, LKD_PT_TRACER);
-    uint32_t gen = __atomic_load_n(&pt_slot_at(i)->gen, __ATOMIC_ACQUIRE);
-    /* the tracee re-reads its slot (flags) before it can see the SIGSTOP */
-    int w = pt_wake_tracee(tgid, pid, PT_WAKE_SYNC | PT_WAKE_KICK);
-    int sent = 0;
-    if (!seize) {
-        struct lx_siginfo si;
-        memset(&si, 0, sizeof si);
-        si.si_signo = LX_SIGSTOP;
-        si.si_code = LX_SI_KERNEL; /* send_sig_info(SIGSTOP, SEND_SIG_PRIV, task) */
-        lkd_ptrace_mark_attach_stop(&si, i, gen, t->tid);   /* bound to this link: never a group stop */
-        sent = lkd_sig_send_tid(NULL, tgid, pid, LX_SIGSTOP, &si);
+    /* The tracee re-reads its slot (flags) and is told a stop is pending, before the request returns. */
+    int w;
+    if (pt_test_fail_wake > 0) { pt_test_fail_wake--; w = -LX_ESRCH; }
+    else w = pt_wake_tracee(tgid, pid, PT_WAKE_SYNC | PT_WAKE_KICK | PT_WAKE_TRAP, i, gen);
+    if (w < 0) {
+        /* Not delivered (the tracee's process is unreachable): undo this generation's link unless the tracee
+         * reached its stop anyway (the wake arrived and only the answer was lost). */
+        int undone = 0;
+        pt_lock();
+        struct pt_slot *s = pt_slot_at(i);
+        if (atomic_load(&s->link) == PL_ATTACHED && atomic_load(&s->tid) == pid && pt_gen(s) == gen &&
+            !s->stopped && (seize || s->astop)) {
+            pt_free_locked(i);
+            undone = 1;
+        }
+        pt_unlock();
+        lkd_event("ptrace: attach of tid %d by %d (link %d gen %llu): wake failed (%d), %s", (int)pid, (int)t->tid,
+                  i, (unsigned long long)gen, w, undone ? "link undone" : "the tracee stopped anyway");
+        lkd_log_sparse(32, 1024, "ptrace: attach of tid %d by tid %d: the wake failed (%d), %s", (int)pid,
+                       (int)t->tid, w, undone ? "attach undone (ESRCH)" : "the tracee stopped anyway");
+        if (undone) return -LX_ESRCH;
     }
-    pt_trace_attach(t->tid, tgid, pid, i, gen, seize, w, sent);
+    /* Every attach in the event ring; a count in the log every 4096. */
+    static _Atomic uint64_t n_attach;
+    uint64_t k = atomic_fetch_add(&n_attach, 1) + 1;
+    lkd_event("ptrace: attach %llu: tracer %d -> pid %d tid %d, link %d gen %llu%s, wake %d", (unsigned long long)k,
+              (int)t->tid, (int)tgid, (int)pid, i, (unsigned long long)gen, seize ? " (seize)" : "", w);
+    if (k <= 4 || (k & 4095) == 0)
+        lkd_log("ptrace: attach %llu: tracer tid %d -> pid %d tid %d, link %d gen %llu%s, wake %d",
+                (unsigned long long)k, (int)t->tid, (int)tgid, (int)pid, i, (unsigned long long)gen,
+                seize ? " (seize)" : "", w);
     return 0;
 }
 
@@ -308,8 +347,9 @@ static int64_t do_resume(lkd_task *t, int32_t pid, int64_t req, uint64_t data)
     s->resumed_seq = s->seq;
     s->stopped = 0;
     pt_stats_g.resumes++;
+    uint64_t gen = pt_gen(s);
     pt_unlock();
-    (void)pt_wake_tracee(tgid, pid, 0);
+    (void)pt_wake_tracee(tgid, pid, 0, i, gen);
     return 0;
 }
 
@@ -325,8 +365,11 @@ static int64_t do_detach(lkd_task *t, int32_t pid, uint64_t data)
     s->resume_sig = (int32_t)data;
     s->stopped = 0;
     atomic_store(&s->link, PL_DETACHED); /* the parked tracee applies pending commands, then frees the slot */
+    uint64_t gen = pt_gen(s);
     pt_unlock();
-    (void)pt_wake_tracee(tgid, pid, 0);
+    lkd_event("ptrace: detach of tid %d by %d (link %d gen %llu), signal %d", (int)pid, (int)t->tid, i,
+              (unsigned long long)gen, (int)data);
+    (void)pt_wake_tracee(tgid, pid, 0, i, gen);
     return 0;
 }
 
@@ -545,10 +588,12 @@ static int64_t do_interrupt(lkd_task *t, int32_t pid)
     if (!s->seized) { pt_unlock(); return -LX_EIO; }
     int32_t tgid = s->tgid;
     s->trap = 1; /* at least one trap follows, even if the tracee is stopped now */
+    uint64_t gen = pt_gen(s);
     pt_unlock();
     unsigned how = PT_WAKE_SYNC | PT_WAKE_KICK;
     if (lkd_sig_trace_stop_supported()) how |= PT_WAKE_TRAP;
-    (void)pt_wake_tracee(tgid, pid, how);
+    /* bound to this link's generation: a wake that arrives after a detach and a new attach sets nothing */
+    (void)pt_wake_tracee(tgid, pid, how, i, gen);
     return 0;
 }
 

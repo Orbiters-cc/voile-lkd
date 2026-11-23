@@ -122,10 +122,10 @@ static int prepare_signal(lkd_task *target, struct lkd_sigproc *sp, int sig, str
         if (sp->stop_state == SP_STOPPED) why = LX_CLD_CONTINUED;
         else if (sp->stop_state == SP_STOPPING) why = LX_CLD_STOPPED;
         if (why) {
-            static _Atomic int cont_logs;
-            if (atomic_fetch_add(&cont_logs, 1) < 16)
-                lkd_log("sig: SIGCONT resumes process %d (%s, stopped by signal %d)", (int)p->pid,
-                        why == LX_CLD_CONTINUED ? "stopped" : "stopping", sp->stop_signo);
+            lkd_event("sig: SIGCONT resumes process %d (%s, stopped by signal %d)", (int)p->pid,
+                      why == LX_CLD_CONTINUED ? "stopped" : "stopping", sp->stop_signo);
+            lkd_log_sparse(16, 1024, "sig: SIGCONT resumes process %d (%s, stopped by signal %d)", (int)p->pid,
+                           why == LX_CLD_CONTINUED ? "stopped" : "stopping", sp->stop_signo);
             sp->cld_notify = why;
             sp->cld_status = why == LX_CLD_CONTINUED ? LX_SIGCONT : sp->stop_signo;
             sp->stop_state = SP_RUNNING;

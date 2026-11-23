@@ -208,6 +208,9 @@ static int park(lkd_task *t)
     } else {
         for (;;) {
             if (atomic_load(&t->flags) & LKD_TF_FATAL) { fatal = 1; break; }
+            /* A tracer attached while the process is stopped: report the attach stop now (ptrace_attach() of
+             * a stopped task re-traps it at once); the tracer's resume then decides, as in Linux. */
+            if (atomic_load(&t->flags) & LKD_TF_TRACE_STOP) break;
             sig_lock(sp);
             int stopped = sp->stop_state != SP_RUNNING;
             sig_unlock(sp);
@@ -273,21 +276,28 @@ int lkd_signal_next(lkd_task *t)
             sig_notify_parent(p, code, status);
             continue;
         }
+        struct lx_siginfo info;
+        int sig;
         if (atomic_load(&t->flags) & LKD_TF_TRACE_STOP) {
-            /* PTRACE_INTERRUPT (or the trap of an auto-attached seized child): a PTRACE_EVENT_STOP at this
-             * safe point, before any signal (get_signal: do_jobctl_trap, kernel/signal.c v6.12). */
+            /* The stops the trace link keeps pending (the attach stop, an INTERRUPT trap or a seized child's)
+             * come before any queued signal (get_signal: do_jobctl_trap first, kernel/signal.c v6.12). They live
+             * in the link, never in the queue: coalescing and SIGCONT's flush cannot lose or misdirect them. */
             sig_unlock(sp);
             atomic_fetch_and(&t->flags, ~LKD_TF_TRACE_STOP);
-            if (lkd_ptrace_trap_stop(t) < 0) return die(t);
-            continue;
+            int ps = lkd_ptrace_pending_stop(t, &info);
+            if (ps < 0) return die(t);
+            if (ps == 0) continue;
+            /* the tracer resumed the attach stop with a signal: deliver it, without another ptrace stop */
+            sig = ps;
+            if (atomic_load(&t->sigmask) & LX_SIGBIT(sig)) { sig_send_task_full(t, sig, &info, 1, 0); continue; }
+            goto act;
         }
         if (atomic_load(&t->flags) & LKD_TF_GROUP_STOP) {
             sig_unlock(sp);
             if (park(t) < 0) return die(t);
             continue;
         }
-        struct lx_siginfo info;
-        int sig = sig_dequeue_locked(t, sp, ~atomic_load(&t->sigmask), &info);
+        sig = sig_dequeue_locked(t, sp, ~atomic_load(&t->sigmask), &info);
         if (!sig) {
             if (t->restore_sigmask) {
                 /* Nothing was delivered: the temporary mask of sigsuspend/ppoll/pselect ends here. */
@@ -305,20 +315,11 @@ int lkd_signal_next(lkd_task *t)
         sig_recalc_locked(t, sp);
         sig_unlock(sp);
 
-        int ns = LKD_PT_NOT_ATTACH_STOP;
-        int attach_stop = 0;
-        /* An attach's SIGSTOP belongs to its trace link: reported to that tracer, or dropped with the link.
-         * Taken as an ordinary stop it would stop the whole process for good. */
-        if (sig == LX_SIGSTOP) {
-            ns = lkd_ptrace_attach_stop(t, &info);
-            attach_stop = ns != LKD_PT_NOT_ATTACH_STOP;
-        }
-        if (!attach_stop && (atomic_load(&t->ptrace.flags) & LKD_PT_TRACED) && sig != LX_SIGKILL)
-            ns = lkd_ptrace_signal_stop(t, sig, &info);
-        if (ns != LKD_PT_NOT_ATTACH_STOP) {
+        if ((atomic_load(&t->ptrace.flags) & LKD_PT_TRACED) && sig != LX_SIGKILL) {
+            int ns = lkd_ptrace_signal_stop(t, sig, &info);
             if (ns < 0) { atomic_fetch_or(&t->flags, LKD_TF_FATAL); return die(t); }
             if (ns == 0) continue;
-            if (ns != sig || attach_stop) {
+            if (ns != sig) {
                 /* ptrace_signal: a new signal from the tracer gets a fresh SI_USER siginfo */
                 memset(&info, 0, sizeof info);
                 info.si_signo = ns;
@@ -335,6 +336,7 @@ int lkd_signal_next(lkd_task *t)
             }
         }
 
+    act:
         sig_lock(sp);
         struct lkd_sighand *h = sig_hand(t);
         struct lx_sigaction act = h->act[sig - 1];
@@ -350,12 +352,15 @@ int lkd_signal_next(lkd_task *t)
             if (d == LX_SIGDFL_IGN || d == LX_SIGDFL_CONT) { sig_unlock(sp); continue; }
             if (d == LX_SIGDFL_STOP) {
                 /* Wine never stops a process by job control: a group stop in a game is a fault until shown
-                 * otherwise. Say which signal, who sent it and what ptrace knew, for the next one. */
-                static _Atomic int stop_logs;
-                if (atomic_fetch_add(&stop_logs, 1) < 16)
-                    lkd_log("sig: signal %d (code %d, from pid %d) stops process %d at tid %d; ptrace flags 0x%x, "
-                            "tracer in the table %d", sig, info.si_code, (int)info.u.kill.pid, (int)p->pid,
-                            (int)t->tid, (unsigned)atomic_load(&t->ptrace.flags), (int)lkd_ptrace_tracer_of(t->tid));
+                 * otherwise. Say which signal, who sent it and what ptrace knew, for the next one: every one in
+                 * the event ring, the first ones and then one in 1024 in the log. */
+                lkd_event("sig: signal %d (code %d, from pid %d) stops process %d at tid %d; ptrace 0x%x tracer %d",
+                          sig, info.si_code, (int)info.u.kill.pid, (int)p->pid, (int)t->tid,
+                          (unsigned)atomic_load(&t->ptrace.flags), (int)lkd_ptrace_tracer_of(t->tid));
+                lkd_log_sparse(16, 1024, "sig: signal %d (code %d, from pid %d) stops process %d at tid %d; ptrace "
+                               "flags 0x%x, tracer in the table %d (all of them: the event ring)", sig, info.si_code,
+                               (int)info.u.kill.pid, (int)p->pid, (int)t->tid,
+                               (unsigned)atomic_load(&t->ptrace.flags), (int)lkd_ptrace_tracer_of(t->tid));
                 struct sig_wakeset ws = { 0 };
                 initiate_stop(t, sp, sig, &ws);
                 sig_unlock(sp);
@@ -527,6 +532,8 @@ int lkd_sig_status(lkd_task *t, struct lkd_sig_status *out)
     uint64_t lim = t->proc->rlimits[LX_RLIMIT_SIGPENDING].rlim_cur;
     out->queue_max = lim > SIG_QUEUE_HARD_MAX ? SIG_QUEUE_HARD_MAX : (uint32_t)lim;
     sig_unlock(sp);
+    /* the attach stop lives in the trace link, not the queue; Linux shows it as a pending SIGSTOP */
+    if (lkd_ptrace_attach_stop_pending(t)) out->pnd |= LX_SIGBIT(LX_SIGSTOP);
     return 0;
 }
 

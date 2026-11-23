@@ -25,7 +25,7 @@
 #define PT_XS_MAX 2048          /* largest XSAVE image kept per stop */
 #define PT_TASK_SIZE_MAX 0x00007ffffffff000ull
 #define PT_MAGIC 0x4c4b445054524331ull /* "LKDPTRC1" */
-#define PT_VERSION 1
+#define PT_VERSION 2              /* 2: 64-bit generations, the attach stop in the slot */
 
 /* Kind of the stop in a slot. */
 enum { PK_NONE = 0, PK_SYS_ENTRY = 1, PK_SYS_EXIT = 2, PK_SIGNAL = 3, PK_EVENT = 4, PK_GROUP = 5 };
@@ -40,7 +40,7 @@ struct pt_slot {
     _Atomic int32_t tid;         /* tracee thread id */
     _Atomic int32_t tracer_pid;  /* tracer thread group (lock-free scans of wait and TracerPid) */
     _Atomic int32_t tracer_tid;
-    uint32_t gen;                /* bumped at every allocation */
+    _Atomic uint64_t gen;        /* bumped at every allocation (64 bits: never wraps in a session) */
     int32_t tgid;                /* tracee thread group */
     int32_t tracee_host;         /* host pid of the tracee's process (refreshed at every stop) */
     int32_t tracer_host;
@@ -72,6 +72,12 @@ struct pt_slot {
     struct lx_siginfo si;
     uint64_t sigmask;
     uint64_t dr[8];              /* u_debugreg as stored by POKEUSER (no hardware breakpoint behind) */
+    /* The attach stop of this link (PTRACE_ATTACH, or the auto-attach of a non-seized child): owned by the
+     * link, never a queued signal. Set with the link (pt_link_locked), cleared only when the stop is
+     * published to this generation (pt_do_stop) or with the link itself (pt_free_locked, alloc). Signal
+     * coalescing and SIGCONT's flush of stop signals cannot touch it. */
+    uint32_t astop;
+    int32_t astop_code;          /* si_code of its siginfo: SI_KERNEL (ATTACH) or SI_USER (auto-attach) */
 };
 
 /* ---- transport.c -------------------------------------------------------------------------------- */
@@ -82,13 +88,18 @@ struct pt_slot *pt_slot_at(int i);
 void pt_lock(void);
 void pt_unlock(void);
 int pt_alloc_locked(void);                 /* index of a free slot (marked ATTACHED, gen bumped) or -1 */
+static inline uint64_t pt_gen(const struct pt_slot *s) { return atomic_load_explicit(&((struct pt_slot *)s)->gen, memory_order_acquire); }
 void pt_free_locked(int i);
-int pt_find_tracee(int32_t tid);           /* lock-free hint: slot of tid in ATTACHED/DETACHED state, -1 */
+int pt_find_tracee(int32_t tid);           /* slot of tid in ATTACHED state, -1 (a hint unless pt_lock is held) */
+/* Does the tracer of slot s live? Its host process ran no exit path if it was killed from outside. */
+int pt_tracer_host_dead(const struct pt_slot *s);
 int pt_host_alive(int32_t host_pid);       /* host process exists and is not a zombie */
 int pt_tid_alive(int32_t tid);             /* guest thread exists and is not dead (registry) */
 /* Tracer -> tracee: make tid (in thread group tgid) re-read its slot. how: PT_WAKE_* bits. */
 enum { PT_WAKE_SYNC = 1, PT_WAKE_KICK = 2, PT_WAKE_TRAP = 4 };
-int pt_wake_tracee(int32_t tgid, int32_t tid, unsigned how);
+/* The wake names the link it is for (slot, gen): PT_WAKE_TRAP of a link that is no longer tid's is ignored,
+ * and a pending stop is only ever taken from the slot under the lock (the wake is a hint). slot < 0: none. */
+int pt_wake_tracee(int32_t tgid, int32_t tid, unsigned how, int slot, uint64_t gen);
 /* Tracee -> tracer: SIGCHLD (CLD_TRAPPED or exit) and wake of the tracer process' wait4 callers. */
 void pt_notify_tracer(int32_t tracer_pid, int32_t tracee_tid, uint32_t uid, int cld_code, int cld_status);
 void pt_transport_init(void);
@@ -104,7 +115,7 @@ extern struct pt_stats pt_stats_g;
 
 struct pt_local {
     int slot;                         /* cached slot index, validated against gen and tid */
-    uint32_t gen;
+    uint64_t gen;
     int32_t creator_tid, creator_pid; /* thread that created this process (TRACEME's tracer) */
     int32_t tid_seen;                 /* tid at the last hook (a non-leader exec changes it) */
     int emu;                          /* PTRACE_SYSEMU in effect: no syscall-exit stop */
@@ -113,8 +124,9 @@ struct pt_local {
     int exited;                       /* task_exit already ran */
     struct {                          /* the tracer link of the parent, captured in the fork child */
         int valid;
-        int32_t tracer_pid, tracer_tid, tracer_host;
-        uint32_t options, seized;
+        int slot;                     /* the parent's link at fork, revalidated under the lock */
+        uint64_t gen;
+        int32_t parent_tid;
     } inherit;
 };
 struct pt_local *pt_local_of(lkd_task *t, int create);
@@ -130,9 +142,10 @@ struct pt_stop_req {
     int why;                      /* CLD_TRAPPED, or CLD_STOPPED for a non-seized group stop */
     int no_siginfo;               /* group stop of a non-seized tracee: GETSIGINFO is EINVAL */
     int ignore_fatal;             /* PTRACE_EVENT_EXIT of a task that is dying anyway */
-    int bound;                    /* stop only for the link (bind_slot, bind_gen): an attach's SIGSTOP */
+    int bound;                    /* stop only for the link (bind_slot, bind_gen) */
     int bind_slot;
-    uint32_t bind_gen;
+    uint64_t bind_gen;
+    int attach;                   /* the link's attach stop: published only while astop is set, clears it */
 };
 struct pt_resume {
     int sig;                      /* signal chosen by the tracer (0 = none) */
@@ -145,14 +158,23 @@ struct pt_resume {
     int si_changed;
     struct lx_siginfo si;
 };
-/* Park t in a stop. Returns 1 (stopped and resumed, *out filled), 0 (not traced: no stop), -1 (the task
- * must die). Called on t's own thread with no LKD lock held. */
+/* Park t in a stop. Returns 1 (stopped and resumed, *out filled), 0 (not traced, or the bound link is gone:
+ * no stop), PT_STOP_RETRY (out of memory before publication: nothing was consumed, try again later), -1 (the
+ * task must die). Called on t's own thread with no LKD lock held. */
+#define PT_STOP_RETRY 2
 int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out);
 /* Slot index of t if t is traced, else -1 (validates the cached index). */
 int pt_my_slot(lkd_task *t);
-/* Re-derive t->ptrace.flags and tracer_tid from the slot; publish the registry if they changed. ANY. */
+/* Re-derive t->ptrace.flags and tracer_tid from the table, in one critical section of pt_lock (so every
+ * synchroniser of t is ordered with every link change: the last one to write has read the table after all
+ * changes that came before it), and set LKD_TF_TRACE_STOP when the link has a stop pending (attach stop,
+ * INTERRUPT trap). Publishes the registry if they changed. ANY thread of t's process, no LKD lock held. */
 void pt_sync_flags(lkd_task *t);
-extern int pt_test_hold_wake_sync; /* tests: wakes of this process skip the flag sync (transport.c) */
+/* Tests only. */
+extern int pt_test_hold_wake_sync;   /* wakes of this process skip the flag sync and the stop hint (transport.c) */
+extern int pt_test_fail_wake;        /* the next N attach wakes fail as if the tracee's process were unreachable */
+extern int pt_test_exit_after_link;  /* ATTACH: the tracer's host process _exits right after linking */
+extern int pt_test_fail_local;       /* the next N pt_local allocations fail */
 /* After a syscall-stop resume: queue the tracer's signal like send_sig(sig, current, 1). */
 void pt_requeue_signal(lkd_task *t, int sig);
 
@@ -176,6 +198,18 @@ void pt_tracer_gone(lkd_task *t, int whole_process);
  * Returns the slot index, -LX_EPERM if tid is already traced, -LX_EAGAIN if the table is full. */
 int pt_link(int32_t tid, int32_t tgid, int32_t tracee_host, uint32_t uid, int32_t tracer_pid,
             int32_t tracer_tid, int32_t tracer_host, uint32_t options, int seized);
+/* The same with the lock held, and the link's attach stop reserved with it when with_stop (its siginfo code
+ * astop_code: SI_KERNEL for ATTACH, SI_USER for an auto-attach). */
+int pt_link_locked(int32_t tid, int32_t tgid, int32_t tracee_host, uint32_t uid, int32_t tracer_pid,
+                   int32_t tracer_tid, int32_t tracer_host, uint32_t options, int seized, int with_stop,
+                   int astop_code);
+/* Cancel link i as its tracer's death would (pt_tracer_gone): EXITKILL is returned in *kill. Lock held. */
+void pt_cancel_link_locked(int i, int *kill, int32_t *tgid, int32_t *tid);
+/* de_thread(): links of tid `old` in thread group tgid now name `now`. A link that an ATTACH made to `now`
+ * meanwhile (the leader's tid, after the leader died and before this rename) cannot coexist with the
+ * exec'ing thread's own: it is ended as the death of the thread it was made for, and its tracer told.
+ * Returns the number of such links ended (their tracer pids in ended[], up to 4). Lock held. */
+int pt_exec_rename_locked(int32_t old, int32_t now, int32_t tgid, int32_t ended[4]);
 /* Thread group id and host pid of any thread of the family; 0 or -LX_ESRCH. */
 int pt_resolve_tid(int32_t tid, int32_t *tgid, int32_t *host, uint32_t *uid, char *state);
 
