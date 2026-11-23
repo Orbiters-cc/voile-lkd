@@ -265,6 +265,174 @@ LT_TEST(round_trip_process_tracee)
     LT_EQ(st, 9);
 }
 
+/* ---- the attach stop belongs to its trace link (the 2026-11-23 VRChat hang) ------------------------------
+ * A guest process with two threads: A is the target of PTRACE_ATTACH and is held between system calls so
+ * that its attach SIGSTOP stays pending while the test arranges the order; B only beats. Heartbeats and
+ * the hold live in shared memory. */
+#include <sys/mman.h>
+
+struct two {
+    volatile int64_t beat_a, beat_b;
+    volatile int hold_a, quit, skip_sync;
+    volatile int32_t tid_a, tid_b, pid, host;
+};
+static struct two *g_two;
+
+static void two_loop(lkd_task *t, volatile int64_t *beat, int held)
+{
+    int died = 0;
+    while (!g_two->quit && !died) {
+        while (held && g_two->hold_a && !g_two->quit) usleep(200);
+        (void)gsys(t, LKD_NR_getpid, 0, 0, 0, 0, 0, 0, &died);
+        __atomic_add_fetch(beat, 1, __ATOMIC_RELAXED);
+        usleep(200);
+    }
+}
+
+static void *two_b_main(void *a)
+{
+    lkd_task *t = a;
+    lkd_set_current(t);
+    two_loop(t, &g_two->beat_b, 0);
+    return NULL;
+}
+
+static void two_child(lkd_task *a)
+{
+    alarm(60);
+    cpu_init(a);
+    pt_test_hold_wake_sync = g_two->skip_sync;
+    const uint64_t thr = LX_CLONE_VM | LX_CLONE_FS | LX_CLONE_FILES | LX_CLONE_SIGHAND | LX_CLONE_THREAD;
+    lkd_task *b = lkd_task_alloc(a, thr);
+    lkd_task_publish(b);
+    cpu_init(b);
+    pthread_t th;
+    if (pthread_create(&th, NULL, two_b_main, b)) _exit(91);
+    g_two->tid_a = a->tid;
+    g_two->tid_b = b->tid;
+    g_two->pid = a->proc->pid;
+    g_two->host = (int32_t)getpid();
+    two_loop(a, &g_two->beat_a, 1);
+    _exit(0);
+}
+
+static int64_t two_start(int skip_sync)
+{
+    g_two = mmap(NULL, sizeof *g_two, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    if (g_two == MAP_FAILED) return -1;
+    memset((void *)g_two, 0, sizeof *g_two);
+    g_two->skip_sync = skip_sync;
+    fflush(NULL);
+    int64_t pid = sct(TR, LKD_NR_fork, 0, 0, 0, 0, 0, 0);
+    if (pid == 0) { two_child(lkd_current()); _exit(92); }
+    for (int i = 0; i < 4000 && (g_two->beat_a < 20 || g_two->beat_b < 20); i++) usleep(1000);
+    return pid;
+}
+
+static void two_end(int64_t pid)
+{
+    g_two->quit = 1;
+    g_two->hold_a = 0;
+    usleep(20000);
+    if (g_two->host > 0) kill((pid_t)g_two->host, SIGKILL);
+    int st;
+    (void)wait_pid((int32_t)pid, &st, LX_WALL);
+    munmap((void *)g_two, sizeof *g_two);
+}
+
+/* How far a heartbeat moves in ms milliseconds. */
+static int64_t beats_in(volatile int64_t *beat, int ms)
+{
+    int64_t b0 = *beat;
+    usleep((useconds_t)ms * 1000);
+    return *beat - b0;
+}
+
+/* A stop reported for tid within ms (wait4 __WALL polled, like wine's 3 s watchdog), its status in *st. */
+static int64_t two_wait(int32_t tid, int *st, int ms)
+{
+    int64_t deadline = mono_ns() + (int64_t)ms * 1000000;
+    for (;;) {
+        int64_t r = wait_pid(tid, st, LX_WALL | LX_WNOHANG);
+        if (r != 0 || mono_ns() > deadline) return r;
+        usleep(200);
+    }
+}
+
+/* The tracee takes the attach SIGSTOP before its flags say it is traced (the wake's sync is withheld): the
+ * stop must still be the tracer's, for the target's tid alone; the sibling beats on; DETACH(0) resumes. */
+LT_TEST(attach_stop_before_the_flag_update)
+{
+    int64_t pid = two_start(1);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    g_two->hold_a = 1;
+    usleep(5000);
+    LT_EQ(PT(LX_PTRACE_ATTACH, a, 0, 0), 0);
+    g_two->hold_a = 0;                                 /* A reaches its safe point with stale flags */
+    int st = 0;
+    LT_EQ(two_wait(a, &st, 3000), a);
+    LT_EQ(st, 0x137f);
+    LT_CHECK(beats_in(&g_two->beat_b, 200) > 0);       /* only A is stopped */
+    int64_t a0 = g_two->beat_a;
+    usleep(100000);
+    LT_EQ(g_two->beat_a, a0);
+    LT_EQ(PT(LX_PTRACE_DETACH, a, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    LT_CHECK(beats_in(&g_two->beat_b, 100) > 0);
+    two_end(pid);
+}
+
+/* The tracer exits after queuing the attach SIGSTOP and before the tracee takes it: the link is freed with
+ * the tracer, and its stop with it. The process must not stop. */
+LT_TEST(tracer_exits_before_the_attach_stop)
+{
+    int64_t pid = two_start(0);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    int32_t a = g_two->tid_a;
+    g_two->hold_a = 1;
+    usleep(5000);
+    int rp[2];
+    LT_EQ(pipe(rp), 0);
+    fflush(NULL);
+    int64_t x = sct(TR, LKD_NR_fork, 0, 0, 0, 0, 0, 0);
+    if (x == 0) {
+        lkd_task *t = lkd_current();
+        alarm(30);
+        int64_t r = sct(t, LKD_NR_ptrace, LX_PTRACE_ATTACH, (uint64_t)a, 0, 0, 0, 0);
+        put64(rp[1], r);
+        int sx;
+        (void)sct(t, LKD_NR_exit_group, 0, 0, 0, 0, 0, 0);
+        if (lkd_task_release(t, &sx)) _exit(sx);
+        _exit(90);
+    }
+    LT_CHECK(x > 0);
+    LT_EQ(get64(rp[0]), 0);
+    int sx;
+    LT_EQ(wait_pid((int32_t)x, &sx, 0), x);              /* the tracer is gone, its links freed */
+    LT_EQ(lkd_ptrace_tracer_of(a), 0);
+    g_two->hold_a = 0;
+    LT_CHECK(beats_in(&g_two->beat_a, 400) > 0);
+    LT_CHECK(beats_in(&g_two->beat_b, 200) > 0);
+    close(rp[0]); close(rp[1]);
+    two_end(pid);
+}
+
+/* Control: an ordinary SIGSTOP from another process still stops every thread, until SIGCONT. */
+LT_TEST(an_ordinary_stop_still_stops_the_process)
+{
+    int64_t pid = two_start(0);
+    LT_CHECK(pid > 0 && g_two->beat_a >= 20);
+    LT_EQ(sct(TR, LKD_NR_kill, (uint64_t)pid, LX_SIGSTOP, 0, 0, 0, 0), 0);
+    usleep(100000);
+    LT_EQ(beats_in(&g_two->beat_a, 300), 0);
+    LT_EQ(beats_in(&g_two->beat_b, 1), 0);
+    LT_EQ(sct(TR, LKD_NR_kill, (uint64_t)pid, LX_SIGCONT, 0, 0, 0, 0), 0);
+    LT_CHECK(beats_in(&g_two->beat_a, 300) > 0);
+    LT_CHECK(beats_in(&g_two->beat_b, 100) > 0);
+    two_end(pid);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) g_filter = argv[1];
@@ -275,5 +443,8 @@ int main(int argc, char **argv)
     RUN(wake_crosses_processes);
     RUN(round_trip_thread_tracee);
     RUN(round_trip_process_tracee);
+    RUN(attach_stop_before_the_flag_update);
+    RUN(tracer_exits_before_the_attach_stop);
+    RUN(an_ordinary_stop_still_stops_the_process);
     return lt_finish();
 }

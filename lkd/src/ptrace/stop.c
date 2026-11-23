@@ -53,27 +53,46 @@ int pt_my_slot(lkd_task *t)
     return i;
 }
 
-void pt_sync_flags(lkd_task *t)
+/* What the shared table says t's flags are, and its tracer. */
+static uint32_t pt_table_flags(lkd_task *t, int32_t *tracer)
 {
     uint32_t want = 0;
-    int32_t tracer = 0;
+    *tracer = 0;
     int i = pt_table_ready() ? pt_find_tracee(t->tid) : -1;
     if (i >= 0) {
         struct pt_slot *s = pt_slot_at(i);
         want |= LKD_PT_TRACED;
-        tracer = atomic_load(&s->tracer_tid);
+        *tracer = atomic_load(&s->tracer_tid);
         unsigned m = __atomic_load_n(&s->mode, __ATOMIC_ACQUIRE);
         if (m == PM_SYSCALL || m == PM_SYSEMU || __atomic_load_n(&s->trap, __ATOMIC_ACQUIRE))
             want |= LKD_PT_SYSCALL_TRACE; /* a pending INTERRUPT trap is taken at the next syscall boundary */
         if (__atomic_load_n(&s->seized, __ATOMIC_ACQUIRE)) want |= LKD_PT_SEIZED;
         if (__atomic_load_n(&s->step, __ATOMIC_ACQUIRE)) want |= LKD_PT_SINGLESTEP;
     }
+    return want;
+}
+
+void pt_sync_flags(lkd_task *t)
+{
     const uint32_t mine = LKD_PT_TRACED | LKD_PT_SYSCALL_TRACE | LKD_PT_SEIZED | LKD_PT_SINGLESTEP;
-    uint32_t old = atomic_load(&t->ptrace.flags), nw;
-    do { nw = (old & ~mine) | want; } while (!atomic_compare_exchange_weak(&t->ptrace.flags, &old, nw));
-    int32_t oldtr = t->ptrace.tracer_tid;
-    t->ptrace.tracer_tid = tracer;
-    if (oldtr != tracer || (old & mine) != want) lkd_registry_publish(t);
+    int changed = 0;
+    /* Two threads sync t: t itself (leaving a stop, at an event) and the famsvc thread of t's process (a
+     * tracer's wake). Reading the table and writing the flags is not one step: t could read "no link",
+     * the tracer link t and its wake set TRACED, then t write its stale "untraced" over it, and the
+     * ATTACH's SIGSTOP would stop the whole process (the 2026-11-23 VRChat hang; test_ptrace_reattach).
+     * So read the table again after writing, and write again until both agree: whoever writes last has
+     * then read the table after every link that happened before its write. */
+    for (int round = 0; round < 64; round++) {
+        int32_t tracer = 0;
+        uint32_t want = pt_table_flags(t, &tracer);
+        uint32_t old = atomic_load(&t->ptrace.flags), nw;
+        do { nw = (old & ~mine) | want; } while (!atomic_compare_exchange_weak(&t->ptrace.flags, &old, nw));
+        if ((old & mine) != want) changed = 1;
+        if (t->ptrace.tracer_tid != tracer) { t->ptrace.tracer_tid = tracer; changed = 1; }
+        int32_t again_tracer = 0;
+        if (pt_table_flags(t, &again_tracer) == want && again_tracer == tracer) break;
+    }
+    if (changed) lkd_registry_publish(t);
 }
 
 void pt_requeue_signal(lkd_task *t, int sig)
@@ -168,6 +187,7 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
     if (i < 0) { pt_sync_flags(t); return 0; }
     struct pt_local *L = pt_local_of(t, 1);
     if (!L) return 0;
+    if (rq->bound && (i != rq->bind_slot || L->gen != rq->bind_gen)) { pt_sync_flags(t); return 0; }
     const lkd_engine_ops *ops = lkd_engine();
     uint32_t gen = L->gen;
 
@@ -431,6 +451,58 @@ int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info)
     if (r == 0) return signo;
     if (rs.si_changed) *info = rs.si;
     return rs.sig;
+}
+
+#define PT_ATTACH_MAGIC 0x4c4b4154 /* "TAKL": an attach stop, see lkd_ptrace_attach_stop */
+
+void lkd_ptrace_mark_attach_stop(struct lx_siginfo *si, int slot, uint32_t gen, int32_t tracer_tid)
+{
+    si->u._si_pad[24] = PT_ATTACH_MAGIC;
+    si->u._si_pad[25] = slot;
+    si->u._si_pad[26] = (int32_t)gen;
+    si->u._si_pad[27] = tracer_tid;
+}
+
+static _Atomic int attach_logs;
+
+int lkd_ptrace_attach_stop(lkd_task *t, struct lx_siginfo *info)
+{
+    if (info->u._si_pad[24] != PT_ATTACH_MAGIC) return LKD_PT_NOT_ATTACH_STOP;
+    int slot = info->u._si_pad[25];
+    uint32_t gen = (uint32_t)info->u._si_pad[26];
+    int32_t tracer = info->u._si_pad[27];
+    memset(&info->u._si_pad[24], 0, 4 * sizeof info->u._si_pad[0]); /* the tracer's GETSIGINFO sees Linux's */
+    int live = 0;
+    if (pt_table_ready() && slot >= 0 && slot < PT_SLOTS) {
+        pt_lock();
+        struct pt_slot *s = pt_slot_at(slot);
+        live = atomic_load(&s->link) == PL_ATTACHED && atomic_load(&s->tid) == t->tid && s->gen == gen;
+        pt_unlock();
+    }
+    pt_sync_flags(t); /* the tracer's wake may not have synced t yet, or a stale sync undid it */
+    if (live) {
+        struct pt_stop_req q;
+        memset(&q, 0, sizeof q);
+        q.kind = PK_SIGNAL;
+        q.code = LX_SIGSTOP;
+        q.si = info;
+        q.nr = -1;
+        q.bound = 1;
+        q.bind_slot = slot;
+        q.bind_gen = gen;
+        struct pt_resume rs;
+        int r = pt_do_stop(t, &q, &rs);
+        if (r < 0) return -1;
+        if (r > 0) {
+            if (rs.si_changed) *info = rs.si;
+            return rs.sig;
+        }
+        /* r == 0: the link went between the check and the stop */
+    }
+    if (atomic_fetch_add(&attach_logs, 1) < 16)
+        lkd_log("ptrace: tid %d dropped the attach SIGSTOP of tracer %d (link %d gen %u): the link is gone",
+                (int)t->tid, (int)tracer, slot, gen);
+    return 0;
 }
 
 int lkd_ptrace_event(lkd_task *t, int event, uint64_t msg)

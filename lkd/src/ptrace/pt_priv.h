@@ -130,6 +130,9 @@ struct pt_stop_req {
     int why;                      /* CLD_TRAPPED, or CLD_STOPPED for a non-seized group stop */
     int no_siginfo;               /* group stop of a non-seized tracee: GETSIGINFO is EINVAL */
     int ignore_fatal;             /* PTRACE_EVENT_EXIT of a task that is dying anyway */
+    int bound;                    /* stop only for the link (bind_slot, bind_gen): an attach's SIGSTOP */
+    int bind_slot;
+    uint32_t bind_gen;
 };
 struct pt_resume {
     int sig;                      /* signal chosen by the tracer (0 = none) */
@@ -149,6 +152,7 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
 int pt_my_slot(lkd_task *t);
 /* Re-derive t->ptrace.flags and tracer_tid from the slot; publish the registry if they changed. ANY. */
 void pt_sync_flags(lkd_task *t);
+extern int pt_test_hold_wake_sync; /* tests: wakes of this process skip the flag sync (transport.c) */
 /* After a syscall-stop resume: queue the tracer's signal like send_sig(sig, current, 1). */
 void pt_requeue_signal(lkd_task *t, int sig);
 

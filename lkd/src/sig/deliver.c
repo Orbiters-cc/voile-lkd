@@ -305,11 +305,20 @@ int lkd_signal_next(lkd_task *t)
         sig_recalc_locked(t, sp);
         sig_unlock(sp);
 
-        if ((atomic_load(&t->ptrace.flags) & LKD_PT_TRACED) && sig != LX_SIGKILL) {
-            int ns = lkd_ptrace_signal_stop(t, sig, &info);
+        int ns = LKD_PT_NOT_ATTACH_STOP;
+        int attach_stop = 0;
+        /* An attach's SIGSTOP belongs to its trace link: reported to that tracer, or dropped with the link.
+         * Taken as an ordinary stop it would stop the whole process for good. */
+        if (sig == LX_SIGSTOP) {
+            ns = lkd_ptrace_attach_stop(t, &info);
+            attach_stop = ns != LKD_PT_NOT_ATTACH_STOP;
+        }
+        if (!attach_stop && (atomic_load(&t->ptrace.flags) & LKD_PT_TRACED) && sig != LX_SIGKILL)
+            ns = lkd_ptrace_signal_stop(t, sig, &info);
+        if (ns != LKD_PT_NOT_ATTACH_STOP) {
             if (ns < 0) { atomic_fetch_or(&t->flags, LKD_TF_FATAL); return die(t); }
             if (ns == 0) continue;
-            if (ns != sig) {
+            if (ns != sig || attach_stop) {
                 /* ptrace_signal: a new signal from the tracer gets a fresh SI_USER siginfo */
                 memset(&info, 0, sizeof info);
                 info.si_signo = ns;
@@ -340,6 +349,13 @@ int lkd_signal_next(lkd_task *t)
             enum lx_sig_default d = sig == LX_SIGKILL ? LX_SIGDFL_TERM : lx_sig_default_action(sig);
             if (d == LX_SIGDFL_IGN || d == LX_SIGDFL_CONT) { sig_unlock(sp); continue; }
             if (d == LX_SIGDFL_STOP) {
+                /* Wine never stops a process by job control: a group stop in a game is a fault until shown
+                 * otherwise. Say which signal, who sent it and what ptrace knew, for the next one. */
+                static _Atomic int stop_logs;
+                if (atomic_fetch_add(&stop_logs, 1) < 16)
+                    lkd_log("sig: signal %d (code %d, from pid %d) stops process %d at tid %d; ptrace flags 0x%x, "
+                            "tracer in the table %d", sig, info.si_code, (int)info.u.kill.pid, (int)p->pid,
+                            (int)t->tid, (unsigned)atomic_load(&t->ptrace.flags), (int)lkd_ptrace_tracer_of(t->tid));
                 struct sig_wakeset ws = { 0 };
                 initiate_stop(t, sp, sig, &ws);
                 sig_unlock(sp);

@@ -374,6 +374,7 @@ void lkd_ptrace_task_init(lkd_task *child, lkd_task *parent, uint64_t clone_flag
         memset(&si, 0, sizeof si);
         si.si_signo = LX_SIGSTOP;
         si.si_code = LX_SI_USER;
+        lkd_ptrace_mark_attach_stop(&si, i, __atomic_load_n(&pt_slot_at(i)->gen, __ATOMIC_ACQUIRE), in.tracer_tid);
         lkd_sig_send_task(child, LX_SIGSTOP, &si, 1);
     }
     pt_sync_flags(child);

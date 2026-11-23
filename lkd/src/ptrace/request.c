@@ -94,6 +94,21 @@ static int64_t do_traceme(lkd_task *t)
     return 0;
 }
 
+/* Trace of attaches (this process is the tracer): the first ones, any whose wake or SIGSTOP failed, and
+ * a count every 4096, so that the log of a hang names the link a stray stop came from. */
+static void pt_trace_attach(int32_t tracer, int32_t tgid, int32_t tid, int slot, uint32_t gen, int seize, int wake,
+                            int sent)
+{
+    static _Atomic uint64_t n;
+    static _Atomic int failed_logs;
+    uint64_t k = atomic_fetch_add(&n, 1) + 1;
+    int bad = wake < 0 || sent < 0;
+    if (k <= 4 || (k & 4095) == 0 || (bad && atomic_fetch_add(&failed_logs, 1) < 32))
+        lkd_log("ptrace: attach %llu: tracer tid %d -> pid %d tid %d, link %d gen %u%s, wake %d, SIGSTOP %d",
+                (unsigned long long)k, (int)tracer, (int)tgid, (int)tid, slot, gen, seize ? " (seize)" : "", wake,
+                sent);
+}
+
 static int64_t do_attach(lkd_task *t, int64_t req, int32_t pid, uint64_t addr, uint64_t data)
 {
     int seize = req == LX_PTRACE_SEIZE;
@@ -117,15 +132,19 @@ static int64_t do_attach(lkd_task *t, int64_t req, int32_t pid, uint64_t addr, u
     int i = pt_link(pid, tgid, host, uid, t->proc->pid, t->tid, getpid(), opts, seize);
     if (i < 0) return i;
     atomic_fetch_or(&t->ptrace.flags, LKD_PT_TRACER);
+    uint32_t gen = __atomic_load_n(&pt_slot_at(i)->gen, __ATOMIC_ACQUIRE);
     /* the tracee re-reads its slot (flags) before it can see the SIGSTOP */
-    (void)pt_wake_tracee(tgid, pid, PT_WAKE_SYNC | PT_WAKE_KICK);
+    int w = pt_wake_tracee(tgid, pid, PT_WAKE_SYNC | PT_WAKE_KICK);
+    int sent = 0;
     if (!seize) {
         struct lx_siginfo si;
         memset(&si, 0, sizeof si);
         si.si_signo = LX_SIGSTOP;
         si.si_code = LX_SI_KERNEL; /* send_sig_info(SIGSTOP, SEND_SIG_PRIV, task) */
-        (void)lkd_sig_send_tid(NULL, tgid, pid, LX_SIGSTOP, &si);
+        lkd_ptrace_mark_attach_stop(&si, i, gen, t->tid);   /* bound to this link: never a group stop */
+        sent = lkd_sig_send_tid(NULL, tgid, pid, LX_SIGSTOP, &si);
     }
+    pt_trace_attach(t->tid, tgid, pid, i, gen, seize, w, sent);
     return 0;
 }
 

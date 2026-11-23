@@ -51,6 +51,16 @@ void lkd_ptrace_syscall_exit_replaced(lkd_task *t);
  * rewritten by the tracer (SETSIGINFO). Returns the signal to deliver (0 = suppressed by CONT(0)),
  * or -1 if the task was killed while stopped. Not called for untraced tasks (returns signo). */
 int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info);
+/* A SIGSTOP that PTRACE_ATTACH (or an auto-attach) queued carries the trace link it belongs to (slot and
+ * generation, in the tail of the siginfo union). lkd_signal_next hands every dequeued SIGSTOP here first:
+ * LKD_PT_NOT_ATTACH_STOP if it is an ordinary one (job control, kill: the usual semantics); otherwise the
+ * stop is reported to that link's tracer if the link still lives, and dropped (0) if the link is gone
+ * or was replaced (its tracer exited or detached before the tracee took it): an attach's SIGSTOP never
+ * stops the whole process. Returns the signal the tracer resumed with, 0 to drop, -1 if killed. */
+#define LKD_PT_NOT_ATTACH_STOP (-2)
+int lkd_ptrace_attach_stop(lkd_task *t, struct lx_siginfo *info);
+/* Mark si as the attach stop of link (slot, gen) made by tracer_tid. */
+void lkd_ptrace_mark_attach_stop(struct lx_siginfo *si, int slot, uint32_t gen, int32_t tracer_tid);
 /* PTRACE_EVENT_* stop (fork, vfork, clone, exec, vfork_done, exit) if the matching PTRACE_O_TRACE*
  * option is set; msg is the value PTRACE_GETEVENTMSG returns. Returns 1 if a stop happened. */
 int lkd_ptrace_event(lkd_task *t, int event, uint64_t msg);
