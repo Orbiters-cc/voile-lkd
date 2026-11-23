@@ -22,6 +22,10 @@
  *   or: wsd_client <socket> --pointer-check [X Y]
  *   runs only the pointer check, in a window shown without activation, at screen pixels (X, Y) when given.
  *   or: wsd_client <socket> --hide-check [X Y]   (the same window placement)
+ *   or: wsd_client <socket> --cadence <rate> <seconds> [--frame-rate N]
+ *   numbered moving frames as a game sends them: full screen, one overlay plane (PRESENT_REGION) of the size wsd tells
+ *   (its --render-percent), three images; the rate is frames per second (a fraction is taken), the seconds at most 60.
+ *   --frame-rate N asks for a display-link range of N (SET_FRAME_RATE), which no game does. See run-wsd-cadence.sh.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -139,8 +143,10 @@ static uint64_t *g_presented, *g_latency, *g_encode;
 static int g_npresented, g_nzero, g_replaced, g_errors;
 
 /* A w x h BGRA8 buffer in shared memory (shm_open + unlink), attached to wsd as buffer id by SCM_RIGHTS. */
-static struct buf attach_buffer(uint32_t id, uint32_t w, uint32_t h) {
-  size_t sz = (size_t)w * h * 4;
+static uint32_t stride_of(uint32_t w) { return (w * 4 + 255) & ~255u; } /* a multiple of Metal's linear texture alignment */
+
+static struct buf attach_buffer(uint32_t id, uint32_t w, uint32_t h, uint32_t stride) {
+  size_t sz = (size_t)stride * h;
   char name[32];
   snprintf(name, sizeof(name), "/wsdc-%d-%u", getpid(), id);
   struct buf b = {shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600), NULL, 0};
@@ -149,7 +155,7 @@ static struct buf attach_buffer(uint32_t id, uint32_t w, uint32_t h) {
   if (ftruncate(b.fd, (off_t)sz)) die("ftruncate");
   b.px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, b.fd, 0);
   if (b.px == MAP_FAILED) die("mmap");
-  struct wsd_buffer_attach a = {id, w, h, w * 4, WSD_FMT_BGRA8, 0, 0, sz};
+  struct wsd_buffer_attach a = {id, w, h, stride, WSD_FMT_BGRA8, 0, 0, sz};
   send_msg(WSD_BUFFER_ATTACH, &a, sizeof(a), NULL, 0, b.fd);
   return b;
 }
@@ -674,7 +680,7 @@ static void warp_at(int32_t ox, int32_t oy, uint32_t x, uint32_t y) {
 }
 static void present_frame(uint32_t id, uint32_t w, uint32_t h) {
   size_t sz = (size_t)w * h * 4;
-  struct buf b = attach_buffer(id, w, h);
+  struct buf b = attach_buffer(id, w, h, w * 4);
   memset(b.px, 0x80, sz);
   struct wsd_present p = {WIN, id, id, now_ns()};
   send_msg(WSD_PRESENT, &p, sizeof(p), NULL, 0, -1);
@@ -752,10 +758,123 @@ static void hide_check(pid_t server, int place, int32_t x, int32_t y) {
   close_window();
 }
 
+/* ---- cadence: a full-screen game's frames at a rate, and when each was shown ---- */
+
+#define CADENCE_MAX 4096
+struct cadence_frame { uint64_t sent, shown, tick; };
+static struct cadence_frame g_cadence[CADENCE_MAX];
+static int g_cadence_zero, g_cadence_replaced;
+
+static void cadence_event(const struct event *e) {
+  if (e->type == WSD_EV_PRESENTED) {
+    const struct wsd_ev_presented *p = (const void *)e->data;
+    g_cadence_replaced += p->replaced;
+    if (p->serial >= 1 && p->serial <= CADENCE_MAX) {
+      g_cadence[p->serial - 1].tick = p->encoded_ns;
+      g_cadence[p->serial - 1].shown = p->presented_ns;
+    }
+    if (!p->presented_ns) g_cadence_zero++;
+  } else {
+    handle_async(e);
+  }
+}
+
+static void fill(uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, uint32_t x0, uint32_t x1, uint32_t bgra) {
+  for (uint32_t y = 0; y < h; y++)
+    for (uint32_t x = x0; x < x1 && x < w; x++) ((uint32_t *)(px + (size_t)y * stride))[x] = bgra;
+}
+
+static void cadence(const struct wsd_hello_reply *hr, double rate, double seconds, uint32_t frame_rate) {
+  uint32_t w = hr->display_width_px, h = hr->display_height_px, drawn[NBUF] = {0};
+  struct event e;
+  struct wsd_window_create wc = {WIN, w, h, WSD_STYLE_BORDERLESS};
+  send_msg(WSD_WINDOW_CREATE, &wc, sizeof(wc), "wsd_client cadence", 18, -1);
+  struct wsd_window_flag show = {WIN, 1}, fs = {WIN, 1}, fr = {WIN, frame_rate};
+  send_msg(WSD_WINDOW_SHOW, &show, sizeof(show), NULL, 0, -1);
+  if (!wait_type(WSD_EV_RESIZE, &e, 2000)) die("no RESIZE after show");
+  send_msg(WSD_WINDOW_FULLSCREEN, &fs, sizeof(fs), NULL, 0, -1);
+  if (wait_type(WSD_EV_RESIZE, &e, 1500)) {
+    const struct wsd_ev_resize *r = (const void *)e.data;
+    w = r->width_px;
+    h = r->height_px;
+  }
+  uint32_t stride = stride_of(w);
+  if (frame_rate) send_msg(WSD_SET_FRAME_RATE, &fr, sizeof(fr), NULL, 0, -1);
+  for (uint32_t i = 0; i < NBUF; i++) {
+    g_buf[i] = attach_buffer(i + 1, w, h, stride);
+    fill(g_buf[i].px, w, h, stride, 0, w, 0xFF203040u);
+  }
+  int frames = (int)(rate * seconds);
+  if (frames > CADENCE_MAX) frames = CADENCE_MAX;
+  usleep(700000); /* the full screen settles */
+  while (next_event(&e, 0)) cadence_event(&e);
+  if (g_errors) die("wsd refused a buffer");
+  int starved = 0, sent = 0;
+  uint64_t t0 = now_ns() + 50000000ull;
+  for (int f = 0; f < frames; f++) {
+    uint64_t deadline = t0 + (uint64_t)(f * 1e9 / rate);
+    for (uint64_t t; (t = now_ns()) < deadline;) {
+      int ms = (int)((deadline - t) / 1000000);
+      if (next_event(&e, ms > 0 ? ms : 0)) cadence_event(&e);
+      else if (!ms) { while (now_ns() < deadline) {} break; }
+    }
+    int b = -1;
+    do { /* as the guest's reuse gate: an image is drawn again once it is released */
+      while (next_event(&e, 0)) cadence_event(&e);
+      for (int i = 0; i < NBUF && b < 0; i++) if (!g_buf[(f + i) % NBUF].busy) b = (f + i) % NBUF;
+      if (b < 0) { starved++; if (!next_event(&e, 500)) die("no image came back in 0.5 s"); cadence_event(&e); }
+    } while (b < 0);
+    if (b < 0) continue;
+    uint32_t x = (uint32_t)f * 16 % (w - 64);
+    fill(g_buf[b].px, w, h, stride, drawn[b], drawn[b] + 32, 0xFF203040u);
+    fill(g_buf[b].px, w, h, stride, x, x + 32, 0xFFFFFFFFu);
+    for (uint32_t bit = 0; bit < 12; bit++) /* the frame's number, in squares at the top */
+      for (uint32_t y = 16; y < 48; y++)
+        for (uint32_t k = 0; k < 32; k++)
+          ((uint32_t *)(g_buf[b].px + (size_t)y * stride))[16 + bit * 40 + k] = (f >> bit) & 1 ? 0xFFFFC020u : 0xFF101010u;
+    drawn[b] = x;
+    g_buf[b].busy = 1;
+    g_cadence[f].sent = now_ns();
+    struct wsd_present_region p = {{WIN, (uint32_t)b + 1, (uint64_t)f + 1, g_cadence[f].sent}, 0, 0, w, h};
+    send_msg(WSD_PRESENT_REGION, &p, sizeof(p), NULL, 0, -1);
+    sent++;
+  }
+  uint64_t end = now_ns() + 400000000ull;
+  while (now_ns() < end) if (next_event(&e, 20)) cadence_event(&e);
+  fs.value = 0;
+  send_msg(WSD_WINDOW_FULLSCREEN, &fs, sizeof(fs), NULL, 0, -1);
+
+  /* shown intervals as display refreshes: what a person sees of the rate */
+  double refresh = 1e9 / (hr->max_refresh_hz ? hr->max_refresh_hz : 60);
+  int shown = 0, hist[9] = {0}, ni = 0;
+  uint64_t first = 0, last = 0;
+  static uint64_t iv[CADENCE_MAX], lat[CADENCE_MAX];
+  for (int f = 0; f < frames; f++) {
+    if (!g_cadence[f].shown) continue;
+    lat[shown++] = g_cadence[f].shown - g_cadence[f].sent;
+    if (last) {
+      iv[ni] = g_cadence[f].shown - last;
+      int n = (int)((double)iv[ni++] / refresh + 0.5);
+      hist[n > 8 ? 8 : n]++;
+    } else first = g_cadence[f].shown;
+    last = g_cadence[f].shown;
+  }
+  printf("CADENCE rate=%.1f size=%ux%u frame_rate=%u due=%d sent=%d shown=%d replaced=%d zero=%d starved=%d sent_per_s=%.2f "
+         "shown_per_s=%.2f refreshes", rate, w, h, frame_rate, frames, sent, shown, g_cadence_replaced, g_cadence_zero, starved,
+         sent / seconds, last > first ? (shown - 1) * 1e9 / (double)(last - first) : 0.0);
+  for (int i = 0; i < 9; i++) if (hist[i]) printf(" %d%s:%d", i, i == 8 ? "+" : "", hist[i]);
+  printf("\n");
+  pct("shown interval", iv, ni, NULL);
+  pct("latency submit->shown", lat, shown, NULL);
+  close_window();
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s <socket> [seconds] [rates] [--no-pointer]\n", argv[0]); return 2; }
   int render_percent = -1, render_fullscreen = 0; /* render_percent: the --render-check value, -1 without the option */
   int mode_check_only = 0, place = 0;
+  double cadence_rate = 0, cadence_seconds = 0;
+  uint32_t cadence_frame_rate = 0;
   int32_t place_x = 0, place_y = 0;
   void (*window_check)(pid_t, int, int32_t, int32_t) = NULL; /* --pointer-check or --hide-check, run alone */
   for (int i = 2; i < argc; i++) {
@@ -765,6 +884,12 @@ int main(int argc, char **argv) {
       if (i + 2 < argc && argv[i + 1][0] != '-') { place = 1; place_x = atoi(argv[++i]); place_y = atoi(argv[++i]); }
       continue;
     }
+    if (!strcmp(argv[i], "--cadence") && i + 2 < argc) {
+      cadence_rate = atof(argv[++i]);
+      cadence_seconds = atof(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--frame-rate") && i + 1 < argc) { cadence_frame_rate = (uint32_t)atoi(argv[++i]); continue; }
     if (!strcmp(argv[i], "--render-check")) render_percent = i + 1 < argc ? atoi(argv[++i]) : 0;
     else if (!strcmp(argv[i], "--fullscreen")) render_fullscreen = 1;
     else if (!strcmp(argv[i], "--mode-check")) mode_check_only = 1;
@@ -802,6 +927,11 @@ int main(int argc, char **argv) {
     return finish();
   }
 
+  if (cadence_rate >= 1 && cadence_rate <= 240 && cadence_seconds > 0 && cadence_seconds <= 60) {
+    cadence(&hr, cadence_rate, cadence_seconds, cadence_frame_rate);
+    return finish();
+  }
+
   if (mode_check_only) {
     mode_check(&hr, argv[1]);
     return finish();
@@ -821,7 +951,7 @@ int main(int argc, char **argv) {
   printf("window shown: %ux%u px scale=%.3f\n", rs->width_px, rs->height_px, rs->backing_scale_x1000 / 1000.0);
   CHECK(rs->width_px == g_w && rs->height_px == g_h, "window size %ux%u", rs->width_px, rs->height_px);
 
-  for (int i = 0; i < NBUF; i++) g_buf[i] = attach_buffer((uint32_t)i + 1, g_w, g_h);
+  for (int i = 0; i < NBUF; i++) g_buf[i] = attach_buffer((uint32_t)i + 1, g_w, g_h, g_w * 4);
 
   static uint64_t pres[4096], lat[4096], enc[4096];
   g_presented = pres; g_latency = lat; g_encode = enc;

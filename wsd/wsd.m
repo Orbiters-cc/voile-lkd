@@ -31,6 +31,8 @@
 #include <stdatomic.h>
 #include "wsd_protocol.h"
 #include "wsd_keymap.h"
+#define OTL_IMPLEMENTATION
+#include "otl.h"
 
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
@@ -1205,11 +1207,21 @@ static CAMetalLayer *make_metal_layer(void) {
 
 - (void)releaseBuffer:(WsdBuffer *)b serial:(uint64_t)serial shown:(BOOL)shown {
   struct wsd_ev_release r = {b.bufferId, shown, serial};
+  if (otl_active()) otl_put(otl_now(), OTL_W_RELEASE, b.bufferId | (shown ? 1u << 31 : 0), serial, 0, 0, 0, 0, 0);
   [self.client send:WSD_EV_RELEASE payload:&r len:sizeof(r) extra:nil];
 }
 
 /* Display-link tick: encode the latest pending frame, if any. */
 - (void)tick:(CADisplayLink *)link {
+  if (otl_active()) {
+    WsdWindow *p = self.overlay ?: self;
+    BOOL seen = self.window.visible && (self.window.occlusionState & NSWindowOcclusionStateVisible);
+    otl_put(otl_now(), OTL_W_TICK,
+            (self.windowId & 0xffff) | (!seen ? OTL_TICK_HIDDEN : p.pendingBuffer ? OTL_TICK_PENDING
+                                        : p.redisplay ? OTL_TICK_REDISPLAY : OTL_TICK_EMPTY) << 16,
+            (uint64_t)(link.timestamp * 1e9), (uint64_t)(link.targetTimestamp * 1e9), (uint64_t)(link.duration * 1e9),
+            0, 0, 0);
+  }
   [self tickPlane];
   if (self.overlay) [self.overlay tickPlane];
 }
@@ -1226,7 +1238,13 @@ static CAMetalLayer *make_metal_layer(void) {
   if (!(self.window.occlusionState & NSWindowOcclusionStateVisible)) return;
   uint64_t tick_ns = now_ns();
   id<CAMetalDrawable> d = [self.layer nextDrawable];
-  if (!d) return; /* keep it pending */
+  uint64_t drawable_ns = otl_active() ? otl_now() : 0;
+  if (!d) { /* keep it pending */
+    if (otl_active())
+      otl_put(drawable_ns, OTL_W_DRAW, self.windowId | (self.isOverlay ? 1u << 30 : 0) | (redisplay ? 1u << 31 : 0),
+              b.bufferId, self.pendingSerial, tick_ns, drawable_ns, ~0ull, 0);
+    return;
+  }
   if (redisplay) self.redisplay = NO;
   else { self.pendingBuffer = nil; self.lastBuffer = b; self.redisplayTries = 0; self.overlayGone = NO; }
   CGSize want = CGSizeMake(b.width, b.height);
@@ -1248,9 +1266,18 @@ static CAMetalLayer *make_metal_layer(void) {
   self.replaced = 0;
   uint64_t serial = self.pendingSerial;
   __weak WsdWindow *weakSelf = self;
+  uint32_t otl_window = self.windowId | (self.isOverlay ? 1u << 30 : 0) | (redisplay ? 1u << 31 : 0);
+  if (otl_active()) {
+    otl_hist(OTL_H_A, drawable_ns - tick_ns);
+    if (!redisplay) otl_hist(OTL_H_B, tick_ns - self.pendingReceivedNs);
+  }
   [d addPresentedHandler:^(id<MTLDrawable> dr) {
     struct wsd_ev_presented e2 = ev;
     e2.presented_ns = (uint64_t)(dr.presentedTime * 1e9);
+    if (otl_active()) {
+      otl_put(otl_now(), OTL_W_SHOWN, otl_window, serial, e2.presented_ns, dr.drawableID, 0, 0, 0);
+      if (e2.presented_ns > drawable_ns) otl_hist(OTL_H_C, e2.presented_ns - drawable_ns);
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
       WsdWindow *sw = weakSelf;
       if (e2.presented_ns) sw.nPresented++; else sw.nZero++;
@@ -1293,10 +1320,14 @@ static CAMetalLayer *make_metal_layer(void) {
   CAMetalLayer *layer = self.layer;
   [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
     (void)layer;
+    if (otl_active())
+      otl_put(otl_now(), OTL_W_GPU, otl_window, serial, (uint64_t)(c.GPUStartTime * 1e9), (uint64_t)(c.GPUEndTime * 1e9),
+              (uint64_t)(c.kernelStartTime * 1e9), (uint64_t)(c.kernelEndTime * 1e9), 0);
     if (!redisplay)
       dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf releaseBuffer:b serial:serial shown:YES]; });
   }];
   [cb commit];
+  if (otl_active()) otl_put(otl_now(), OTL_W_DRAW, otl_window, b.bufferId, serial, tick_ns, drawable_ns, d.drawableID, 0);
 }
 
 /* Moves and/or resizes the content area. Pixels are converted with the effective scale (backing_scale()); y counts
@@ -1775,6 +1806,8 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     return;
   }
   void *p = mmap(NULL, maplen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)floor_off);
+  if (otl_active())
+    otl_put(otl_now(), OTL_W_ATTACH, a->buffer_id, otl_identity(fd), (uint64_t)a->width << 32 | a->height, a->format, 0, 0, 0);
   close(fd); /* the mapping keeps the object alive */
   if (p == MAP_FAILED) { [self error:WSD_BUFFER_ATTACH code:-errno]; return; }
   size_t len = (size_t)maplen;
@@ -2020,6 +2053,9 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     WsdBuffer *b = self.buffers[@(m->buffer_id)];
     if (!w) break;
     if (!b) { [self error:type code:-ENOENT]; break; }
+    if (otl_active())
+      otl_put(otl_now(), OTL_W_RX, w.windowId | (w.pendingBuffer ? 1u << 31 : 0), b.bufferId, m->serial, m->client_time_ns, rx,
+              w.pendingBuffer ? w.pendingSerial : 0, 0);
     if (w.pendingBuffer) { /* mailbox: the newer frame replaces the unshown one */
       [w releaseBuffer:w.pendingBuffer serial:w.pendingSerial shown:NO];
       w.replaced++;
@@ -2135,6 +2171,9 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     if (!b) { [self error:type code:-ENOENT]; break; }
     WsdWindow *o = [w overlayAt:NSMakeRect(m->x, m->y, m->width, m->height)];
     app_icon_game(self);
+    if (otl_active())
+      otl_put(otl_now(), OTL_W_RX, w.windowId | 1u << 30 | (o.pendingBuffer ? 1u << 31 : 0), b.bufferId, m->present.serial,
+              m->present.client_time_ns, rx, o.pendingBuffer ? o.pendingSerial : 0, 0);
     if (o.pendingBuffer) {
       [o releaseBuffer:o.pendingBuffer serial:o.pendingSerial shown:NO];
       o.replaced++;
@@ -2598,6 +2637,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IOLBF, 0);
     if (render_percent) g_render_percent = parse_render_percent(render_percent);
     g_probe_enabled = getenv("WSD_LATENCY_PROBE") != NULL;
+    otl_init("wsd");
 
     g_dev = MTLCreateSystemDefaultDevice();
     g_queue = [g_dev newCommandQueue];
