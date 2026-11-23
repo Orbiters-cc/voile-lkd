@@ -76,6 +76,11 @@ void pt_sync_flags(lkd_task *t)
     if (oldtr != tracer || (old & mine) != want) lkd_registry_publish(t);
 }
 
+void lkd_ptrace_resync(lkd_task *t)
+{
+    pt_sync_flags(t);
+}
+
 void pt_requeue_signal(lkd_task *t, int sig)
 {
     if (sig < 1 || sig > LX_NSIG) return;

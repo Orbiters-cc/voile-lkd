@@ -8,6 +8,7 @@ LKD_WEAK int lkd_ptrace_syscall_enter(lkd_task *t, lkd_sysreq *rq, int64_t *skip
 LKD_WEAK void lkd_ptrace_syscall_exit(lkd_task *t, int64_t *ret) { (void)t; (void)ret; }
 LKD_WEAK void lkd_ptrace_syscall_exit_replaced(lkd_task *t) { (void)t; }
 LKD_WEAK int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info) { (void)t; (void)info; return signo; }
+LKD_WEAK void lkd_ptrace_resync(lkd_task *t) { (void)t; }
 LKD_WEAK int lkd_ptrace_event(lkd_task *t, int event, uint64_t msg) { (void)t; (void)event; (void)msg; return 0; }
 LKD_WEAK void lkd_ptrace_task_init(lkd_task *child, lkd_task *parent, uint64_t clone_flags)
 { (void)child; (void)parent; (void)clone_flags; }

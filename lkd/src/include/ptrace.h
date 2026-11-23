@@ -51,6 +51,9 @@ void lkd_ptrace_syscall_exit_replaced(lkd_task *t);
  * rewritten by the tracer (SETSIGINFO). Returns the signal to deliver (0 = suppressed by CONT(0)),
  * or -1 if the task was killed while stopped. Not called for untraced tasks (returns signo). */
 int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info);
+/* Re-reads t's ptrace state from the shared table (OWNER): a tracer that linked t and sent its attach
+ * SIGSTOP may not have reached t's own flags yet (its wake crosses processes and may time out). */
+void lkd_ptrace_resync(lkd_task *t);
 /* PTRACE_EVENT_* stop (fork, vfork, clone, exec, vfork_done, exit) if the matching PTRACE_O_TRACE*
  * option is set; msg is the value PTRACE_GETEVENTMSG returns. Returns 1 if a stop happened. */
 int lkd_ptrace_event(lkd_task *t, int event, uint64_t msg);

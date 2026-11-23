@@ -305,6 +305,11 @@ int lkd_signal_next(lkd_task *t)
         sig_recalc_locked(t, sp);
         sig_unlock(sp);
 
+        /* A SIGSTOP may be a PTRACE_ATTACH's: the tracer links t in the shared table before it sends
+         * it, but its wake of t (which syncs t's flags) crosses processes and may not have arrived.
+         * Untraced, the SIGSTOP would stop the whole process for good (a group stop the tracer never
+         * continues): re-read the table before deciding. */
+        if (sig == LX_SIGSTOP) lkd_ptrace_resync(t);
         if ((atomic_load(&t->ptrace.flags) & LKD_PT_TRACED) && sig != LX_SIGKILL) {
             int ns = lkd_ptrace_signal_stop(t, sig, &info);
             if (ns < 0) { atomic_fetch_or(&t->flags, LKD_TF_FATAL); return die(t); }
