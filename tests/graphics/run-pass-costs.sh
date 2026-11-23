@@ -5,7 +5,7 @@
 # Usage: run-pass-costs.sh <runtime> <home> <launch.sh> <out-folder> <render-percent> <seconds per mode> [mode ...]
 #   <runtime>   a copy of a Voile release's linux folder; <home> one whose prefix was made with it (wineboot)
 #   <launch.sh> Obelisk's crates/game-runtime/src/wine/linux_engine/launch.sh, branch perf-timeline
-#   TIMELINE=1  with the host timeline; INTERVAL=n the sync interval (0)
+#   TIMELINE=1  with the host timeline; INTERVAL=n the sync interval (0); QUEUE=n frames the guest's driver lets wait for the display (1)
 # Refuses to run while the screen is locked.
 set -u
 W=$(cd "$(dirname "$0")" && pwd)
@@ -22,7 +22,7 @@ cp "$W/bin/pass_costs.exe" "$INSTALL/"
   echo "low power mode (the setting in use): $(pmset -g | awk '/lowpowermode/{print $2}')"
   pmset -g therm
   "$W/others-busy.sh"
-  echo "percent $PERCENT interval ${INTERVAL-0} timeline ${TIMELINE-0} modes: $*"
+  echo "percent $PERCENT interval ${INTERVAL-0} queue ${QUEUE-1} timeline ${TIMELINE-0} modes: $*"
   for f in engine/wsd graphics/libexec/virgl_render_server graphics/bin/virgl_test_server graphics/lib/libvirglrenderer.1.dylib \
            graphics/dxmt-native.framework/Versions/A/dxmt-native; do
     echo "$f $(shasum -a 256 "$RUNTIME/$f" | cut -c1-16)"
@@ -34,7 +34,7 @@ caffeinate -dimsu "$RUNTIME/engine/run-with-timeout.sh" 170 /bin/bash "$LAUNCH" 
   --render-percent "$PERCENT" --env HOME=/home/user --env USER=user --env LOGNAME=user --env PATH=/opt/wine/bin:/usr/bin:/bin \
   --env LANG=en_US.UTF-8 --env LC_ALL=en_US.UTF-8 --env WINEPREFIX=/home/user/prefix --env WINEARCH=win64 \
   --env WINEDEBUG=-all --env "WINEDLLOVERRIDES=mscoree,mshtml=;winemenubuilder.exe=d;d3d11,dxgi,d3d12=n" \
-  --env VTEST_SOCKET_NAME=/run/obelisk/vtest.sock --env NPT_DEBUG=force_vtest \
+  --env VTEST_SOCKET_NAME=/run/obelisk/vtest.sock --env NPT_DEBUG=force_vtest ${QUEUE:+--env NPT_PRESENT_QUEUE=$QUEUE} \
   -- /opt/game/pass_costs.exe "$SECONDS_EACH" "${INTERVAL-0}" "$@" > "$OUT/run.log" 2>&1
 echo "rc=$?" >> "$OUT/run.log"
 rm -rf "$INSTALL"

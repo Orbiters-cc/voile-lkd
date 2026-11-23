@@ -384,6 +384,15 @@ static void m_readback_end(unsigned f) {
 static void at_flush(unsigned, int n) { if (n == 133) ctx->Flush(); }
 static void m_flush(unsigned f) { scene_with(f, at_flush); }
 
+/* the scene after the CPU's own work of a frame, steady or one in four twice as long: what a deeper present queue could hide */
+static void spin(double ms) {
+  unsigned long long end = ns() + (unsigned long long)(ms * 1e6);
+  while (ns() < end) {}
+}
+static void think8(unsigned f) { spin(8); scene_with(f, nullptr); }
+static void think16(unsigned f) { spin(16); scene_with(f, nullptr); }
+static void think_uneven(unsigned f) { spin(f % 4 ? 10 : 34); scene_with(f, nullptr); }
+
 struct Mode { const char *name; void (*frame)(unsigned); };
 static const Mode kModes[] = {
     {"trivial", trivial}, {"copies4", copies}, {"offscreen", offscreen}, {"msaa-resolve", msaa_resolve},
@@ -396,6 +405,7 @@ static const Mode kModes[] = {
     {"q-stamp-mid", q_stamp_mid}, {"q-occ-mid", q_occ_mid}, {"q-occ-alone", q_occ_alone}, {"q-event-pollflush", q_event_pollflush},
     {"m-discard", m_discard}, {"m-nooverwrite", m_nooverwrite}, {"m-dyntex", m_dyntex}, {"m-update", m_update},
     {"m-readback", m_readback}, {"m-readback-end", m_readback_end}, {"m-flush", m_flush},
+    {"think8", think8}, {"think16", think16}, {"think-uneven", think_uneven},
 };
 
 static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcA(h, m, w, l); }
