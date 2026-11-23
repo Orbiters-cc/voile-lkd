@@ -36,3 +36,17 @@ Any of, separated by commas:
 - `nosync`: `displaySyncEnabled` off. `two`: two drawables instead of three. For measurements.
 
 What each gives: `tests/timeline/results/2026-11-23-switches.md`.
+
+## `OBELISK_DXMT_QUERY_RESCUE=once` (the render server's)
+
+Not `wsd`'s: DXMT's (branch `perf-timeline`, `src/d3d11/d3d11_query.hpp`), given by the same `launch.sh` to the render server alone. Unset, DXMT does exactly what it
+did. With it, a look with `D3D11_ASYNC_GETDATA_DONOTFLUSH` at an event or timestamp-disjoint query that was not there 64 looks in a row
+commits what has been recorded only while the query's marker has not been handed to the encoder (then once), and says `S_FALSE` from there on; unset, each such look
+commits whatever has been recorded since the one before, every 100 us, until the GPU gets to the query.
+`GetData` with flags 0, `Flush`, both `End`s, timestamps, occlusion queries and readbacks are as they were.
+
+What is kept apart: the looks and `End` change a query's state under a lock of their own that nothing waits under; the one commit is made under the
+device's lock, taken only when it is free, after the decision is made again under it, and never when the commit would wait for the GPU. So a look,
+made under Neptune's feedback lock, never waits for the GPU and cannot close a ring of locks.
+
+`tests/graphics/query_client.cpp` (`run-query-client.sh`) is what it was proven with; `otl.py --queries` tells what the looks of a recording flushed.

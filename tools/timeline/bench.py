@@ -2,7 +2,9 @@
 """One benchmark run of VRChat on a Mac through obelisk-cli (docs/mac-performance.md of Orbiters-N4N0, the procedure).
 
 This is tools/mac-bench/bench.py of Orbiters-N4N0 (as of 4bf9ecb9) with two things more, to be taken over there: the game is brought
-to the front (below) and every window's cuts are stamped on the trace's clock (`from_uptime_ns`, `to_uptime_ns`).
+to the front (below) and every window's cuts are stamped on the trace's clock (`from_uptime_ns`, `to_uptime_ns`). And one that is for
+comparing two starts by eye and by number (--picture): the picture of the window of this session's own window server, by its window id, never
+of the screen, three times half a second apart, --picture-at seconds after the local player arrived, before the first window.
 
 Why to the front: macOS gives the keyboard to no program that the app in front neither started nor yields to, so the window of a
 game started from a terminal or a service is shown, full screen, over an app that stays the active one (2026-11-23: nine windows
@@ -270,6 +272,23 @@ def opened_engine_log(old, since):
     return None
 
 
+def take_pictures(state, tool, base, arrived):
+    """The window of this session's own window server, three times half a second apart (how much of it moves by itself)."""
+    out = []
+    for i in range(1, 4):
+        own = [pid for pid, path in state["programs"].items() if path.endswith("/wsd")]
+        path = f"{base}-{i}.png"
+        one = {"at": now(), "after_arrival_s": round(now() - arrived, 2), "uptime_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "file": None}
+        if len(own) == 1:
+            told = run([tool, "shot", str(own[0]), path], 15).split()
+            if len(told) == 4 and os.path.isfile(path):
+                os.chmod(path, 0o600)
+                one.update(file=os.path.basename(path), window=int(told[0]), points=[int(told[1]), int(told[2])], layer=int(told[3]))
+        out.append(one)
+        time.sleep(0.5)
+    return out
+
+
 def paths(own):
     """The programs of the processes `own`, by path (`tree` gives names alone)."""
     out = {}
@@ -535,6 +554,9 @@ def measure(ending):
     ap.add_argument("--label", default="")
     ap.add_argument("--no-sample", action="store_true")
     ap.add_argument("--allow-locked", action="store_true")
+    ap.add_argument("--picture", metavar="BASE", help="pictures of the game's window, BASE-1.png to BASE-3.png")
+    ap.add_argument("--picture-tool", help="tools/timeline/window_picture.m, built")
+    ap.add_argument("--picture-at", type=float, default=100, help="seconds after the arrival")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     if a.percent is not None and not 1 <= a.percent <= 100:
@@ -616,8 +638,10 @@ def measure(ending):
             if now() - tried >= 5:
                 tried = now()
                 bring_to_front(state, dict(state["programs"]))
+            if a.picture and "pictures" not in res and now() - arrived >= a.picture_at:
+                res["pictures"] = take_pictures(state, a.picture_tool, a.picture, arrived)
             calm = now() - arrived >= a.warm and settled(list(lines)[-4000:], now())
-            time.sleep(1)
+            time.sleep(0.1 if a.picture and "pictures" not in res and now() - arrived + 1 >= a.picture_at else 1)
         if not calm:
             res["outcome"] = "did not settle (frames were still held after the warm time): nothing scored" if lives() else "the game ended before any window"
             return status

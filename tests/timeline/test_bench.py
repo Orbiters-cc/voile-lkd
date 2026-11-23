@@ -74,6 +74,27 @@ class Scoring(unittest.TestCase):
         why = "; ".join(bench.summarize(lines, 10.0, 70.0, state, False, moves)["invalid_because"])
         self.assertIn(f"Safari in {len([x for x in state['look'] if 10 <= x['at'] < 70])} of", why)
 
+    def test_the_pictures_are_of_the_own_window_server_s_window_alone(self):
+        ran, kept = [], (bench.run, bench.time.sleep)
+        with tempfile.TemporaryDirectory() as d:
+            def run(cmd, timeout=10):
+                ran.append(cmd)
+                open(cmd[3], "w").close()
+                return "77 1470 956 0\n"
+            try:
+                bench.run, bench.time.sleep = run, lambda s: None
+                programs = {7: "/bin/bash", 8: "/x/VRChat.app/Contents/MacOS/wsd"}
+                got = bench.take_pictures({"programs": programs}, "/tool", f"{d}/picture", bench.now())
+                self.assertEqual([p["file"] for p in got], ["picture-1.png", "picture-2.png", "picture-3.png"])
+                self.assertEqual({tuple(c[:3]) for c in ran}, {("/tool", "shot", "8")})
+                self.assertEqual((got[0]["window"], got[0]["points"]), (77, [1470, 956]))
+                for other in ({7: "/bin/bash"}, programs | {9: "/y/wsd"}):  # none of its own, or not known which: no picture
+                    ran.clear()
+                    self.assertEqual([p["file"] for p in bench.take_pictures({"programs": other}, "/tool", f"{d}/none", bench.now())], [None] * 3)
+                    self.assertEqual(ran, [])
+            finally:
+                bench.run, bench.time.sleep = kept
+
     def test_the_game_is_brought_to_the_front_by_its_own_bundle_only(self):
         ran, kept = [], {n: getattr(bench, n) for n in ("run", "frontmost", "front_name")}
         try:

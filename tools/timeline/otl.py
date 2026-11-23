@@ -24,7 +24,7 @@ K = dict(THREAD=1, SUMMARY=2, HIST=3, LOST=4, END=5, N_EXPORT=16, N_SIGNAL=18, N
          N_FLUSH=23, V_RETIRE=24, N_GONE=26, N_FRAME=27, N_EVENT=28, N_ARM=29, D_READY=32, D_ENCODE=33, D_DONE=34, D_SIGNAL=35,
          D_SEOC=36, D_NOTIFY=37, D_PIPELINE=38, D_INIT=39, D_INIT_DONE=40, D_PASS=41, D_PASS_DS=42, D_BLIT=43, D_COMPUTE=44,
          D_OPS=45, D_PASS_TIME=46, D_QUEUE=47, D_PASS_SKIP=48, D_CLOCK=49, D_COMMIT=50,
-         D_PASS_ENDED=51, D_PASS_ID=52, W_ATTACH=64, W_RX=65, W_TICK=66, W_DRAW=67, W_GPU=68,
+         D_PASS_ENDED=51, D_PASS_ID=52, D_STALL=53, D_QUERIES=54, W_ATTACH=64, W_RX=65, W_TICK=66, W_DRAW=67, W_GPU=68,
          W_SHOWN=69, W_RELEASE=70, W_DETACH=71)
 REC = struct.Struct("<QHHI6Q")
 Rec = collections.namedtuple("Rec", "t kind thr a v")
@@ -643,6 +643,52 @@ def splits(s, frames):
     return out
 
 
+def queries(s, lo, hi):
+    """What the looks at event and disjoint queries did (D_STALL, D_QUERIES) and every command buffer by what committed it, of all
+    devices: per device by chunk, so that it needs no frames (a program that presents nothing has none)."""
+    out = dict(stall_flushes=0, not_handed_over=0, handed_over=0, handed_over_and_committed=0, left_not_handed_over=0, most_rescues_of_a_chunk=0,
+               once=set(), locked=set(), commits=collections.Counter())
+    ended, per = collections.Counter(), collections.Counter()
+    signals = 0
+    for d in s.dxmt.values():
+        chunks = collections.Counter()
+        for r in d.get("D_STALL"):
+            if lo <= r.t <= hi:
+                out["stall_flushes"] += 1
+                out["once"].add(bool(r.a & 8))
+                out["handed_over" if r.a & 1 else "not_handed_over"] += 1
+                out["handed_over_and_committed"] += r.a & 3 == 3
+                out["left_not_handed_over"] += bool(r.a & 4)
+                if not r.a & 1:
+                    chunks[(r.v[0], r.v[1])] += 1
+        out["most_rescues_of_a_chunk"] = max([out["most_rescues_of_a_chunk"], *chunks.values()])
+        for r in d.get("D_COMMIT"):
+            if lo <= r.t <= hi:
+                out["commits"][commit_text(r)] += 1
+        for r in d.get("D_QUERIES"):
+            if lo <= r.t <= hi:
+                signals += 1
+                out["once"].add(bool(r.a & 1))
+                out["locked"].add(bool(r.a & 2))
+                for i, name in enumerate(("event", "disjoint", "timestamp", "occlusion")):
+                    ended[name] += r.v[2] >> 16 * i & 0xffff
+                for name, v in (("ends of an event with nothing new", r.v[3] & 0xffffffff), ("rescues left to the next look", r.v[3] >> 32),
+                                ("looks, not there, of the first 64", r.v[4] & 0xffffffff), ("looks, not there, after them", r.v[4] >> 32),
+                                ("of those, nothing to rescue and nothing done", r.v[5] & 0xffffffff), ("looks that found it there", r.v[5] >> 32)):
+                    per[name] += v
+    out.update(once=sorted(out["once"]), locked=sorted(out["locked"]), signals=signals, commits=dict(out["commits"].most_common()),
+               ended=dict(ended), looks=dict(per))
+    print(f"  queries: the switch {'/'.join('once' if o else 'off' for o in out['once']) or 'not told'}; the device's lock "
+          f"{'/'.join('on' if o else 'off' for o in out['locked']) or 'not told'}. {out['stall_flushes']} flushes by a look after the first 64: "
+          f"{out['not_handed_over']} with the marker not handed over (at most {out['most_rescues_of_a_chunk']} for a chunk; {out['left_not_handed_over']} "
+          f"left so), {out['handed_over']} with it handed over ({out['handed_over_and_committed']} of them committed a command buffer for nothing)")
+    if signals:
+        print("    a frame: ended " + ", ".join(f"{v / signals:.2f} {k}" for k, v in ended.items()) + "; " +
+              ", ".join(f"{v / signals:.1f} {k}" for k, v in per.items()))
+    print("    command buffers by what committed them: " + (", ".join(f"{c} {w}" for w, c in out["commits"].items()) or "none"))
+    return out
+
+
 def pass_text(e):
     if e["type"] != "render":
         return f"{e['type']}: {e['ops']} ops" + (f", {e['pixels']} px copied" if e["pixels"] else "")
@@ -855,6 +901,7 @@ def main():
     p.add_argument("--frames", type=int, default=0, help="print that many frames one by one")
     p.add_argument("--passes", action="store_true", help="the encoder list of the commonest frame")
     p.add_argument("--splits", action="store_true", help="what committed the command buffers and cut the main colour target's passes")
+    p.add_argument("--queries", action="store_true", help="what the looks at event queries flushed, and every commit by its reason")
     p.add_argument("--cadence", action="store_true", help="wsd's ticks, drawables and shown frames, per plane")
     p.add_argument("--csv", help="the frames reported, one per line")
     p.add_argument("--json", help="the counts, per report")
@@ -898,6 +945,10 @@ def main():
                 print("  " + " ".join(f"{h[:9]:>9s}" for h in ["value", "wait"] + PARTS))
                 for f in [f for f in frames if "parts" in f][: a.frames]:
                     print("  " + " ".join([f"{f['value']:9d}", f"{f['wait'] / 1e6:9.3f}"] + [f"{x / 1e6:9.3f}" for x in f["parts"]]))
+        if a.queries or a.splits:
+            if not s.frames:
+                print(f"\n== {title}")
+            told[-1]["queries"] = queries(s, lo, hi)
         if a.cadence and s.wsd:
             print(f"\n-- cadence: {title}")
             told[-1]["cadence"] = cadence(s, lo, hi, a.plane)

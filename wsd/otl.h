@@ -96,6 +96,15 @@ enum otl_kind {
                              group, colour 0 as otl_attachment(), its texture, depth's texture (DXMT's pointers) */
   OTL_D_PASS_ID = 52,     /* follows OTL_D_PASS; a: as it; v: key, colour 0's texture, depth's texture (Metal's, of a view the
                              texture it is of), what kept it from joining a later encoder (enum otl_stop) */
+  OTL_D_STALL = 53,       /* GetData(DONOTFLUSH) of an event query not there the 64 times before flushed something, or should have; a: 1 its event had been
+                             handed to the encoder (nothing to rescue) | 2 a chunk was committed | 4 and the event still was
+                             not | 8 OBELISK_DXMT_QUERY_RESCUE=once; v: queue id, chunk, the event, the last event handed over
+                             before, after, frame group */
+  OTL_D_QUERIES = 54,     /* follows OTL_D_SIGNAL: since the one before; a: 1 as OTL_D_STALL's 8 | 2 the device's lock is on; v: queue id,
+                             frame group, queries ended (16 bits each: event, disjoint, timestamp, occlusion), events ended with
+                             nothing new recorded | rescues left to the next look << 32, looks at event and disjoint queries not
+                             there (first 64 | the others << 32), of those others flags DONOTFLUSH and nothing to rescue, so nothing
+                             done | looks that found them there << 32 */
 
   /* wsd (role wsd) */
   OTL_W_ATTACH = 64,      /* a buffer was attached; a: buffer; v: memory identity, width<<32|height, format, client id */

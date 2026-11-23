@@ -456,5 +456,25 @@ class Passes(unittest.TestCase):
         self.assertEqual(e["times_why"], "fewer than two clocks of both")
 
 
+class Queries(unittest.TestCase):
+    def test_the_flushes_of_stalled_looks_are_told_by_whether_anything_was_owed(self):
+        r = Recording()
+        # two with the marker not handed over, of one chunk; one of another that was left; two with it handed over, one of them a commit
+        for t, a, chunk in ((10, 2, 7), (11, 2, 7), (12, 4, 8), (13, 1 | 2, 9), (14, 1, 9), (900, 2, 70)):
+            r.put("dxmt", t * MS, "D_STALL", a | 8, 1, chunk, 50, 40, 51, 1)
+        r.put("dxmt", 15 * MS, "D_COMMIT", 17, 1, 9, 1, 0, 0, 0)
+        for t in (16, 17):
+            r.put("dxmt", t * MS, "D_QUERIES", 1 | 2, 1, t, 3 | 1 << 16 | 4 << 32 | 2 << 48, 1 | 5 << 32, 64 | 30 << 32, 29 | 2 << 32)
+        s = r.finish()
+        with contextlib.redirect_stdout(io.StringIO()):
+            told = otl.queries(s, 5 * MS, 500 * MS)
+        self.assertEqual([told[k] for k in ("stall_flushes", "not_handed_over", "handed_over", "handed_over_and_committed", "left_not_handed_over",
+                                            "most_rescues_of_a_chunk", "signals")], [5, 3, 2, 1, 1, 2, 2])
+        self.assertEqual((told["once"], told["locked"], told["ended"]), ([True], [True], dict(event=6, disjoint=2, timestamp=8, occlusion=4)))
+        self.assertEqual(told["commits"], {otl.WHY[17]: 1})
+        self.assertEqual(told["looks"]["rescues left to the next look"], 10)
+        self.assertEqual(told["looks"]["of those, nothing to rescue and nothing done"], 58)
+
+
 if __name__ == "__main__":
     unittest.main()

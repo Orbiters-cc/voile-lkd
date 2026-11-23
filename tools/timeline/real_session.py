@@ -6,8 +6,10 @@ Usage: real_session.py '<the owner's private instance link>' --plan 45 [--switch
 One start per invocation: the timeline generation is put in place for it and the released one put back after it, whatever
 happened. At the Mac, unlocked, plugged in, idle and cool, hands off for about eight minutes. The options:
   --switch NAME=VALUE  upscale=metalfx: wsd scales a frame smaller than the window with MetalFX Spatial; present=<list> of arrival,
-                       attime, nosync, two: how wsd presents (wsd/wsd.m says what each is). None is wsd as ever. They reach wsd
-                       alone (launch.sh), never the game. In the manifest, the result and the folder's name
+                       attime, nosync, two: how wsd presents (wsd/wsd.m says what each is); queries=once: DXMT's looks at an event query
+                       that is not there flush once, not at each look (dxmt, src/d3d11/d3d11_query.hpp). None is the programs as ever.
+                       They reach wsd, and the last the render server, alone (launch.sh), never the game. In the manifest, the
+                       result and the folder's name
   --cli PATH         the developer's obelisk-cli (feature developer-timeline), signed as the one that holds the Steam session
   --generation DIR   what scripts/build-timeline-generation.sh of the Obelisk fork wrote
   --bench DIR        the folder of bench.py (this one)
@@ -19,7 +21,8 @@ happened. At the Mac, unlocked, plugged in, idle and cool, hands off for about e
 What it does: refuses when the screen is locked, when anything of the engine runs, when the disk is short; holds the display
 awake; puts the timeline generation in the library through the developer's obelisk-cli (verified, atomic, pinned, refused while
 anything of the engine runs); then one start by bench.py (arrival, the game's app brought to the front, 120 s warm, three windows
-of 60 s cut on the trace's own clock, no stack sample, its own session quit by session), at least 90 s after the last start this
+of 60 s cut on the trace's own clock, no stack sample, its own session quit by session; 100 s after the arrival three pictures of the
+game's window alone, picture-1.png to -3.png in the start's folder: compare_pictures.py tells two starts' apart from what moves by itself), at least 90 s after the last start this
 library knows of ended; and in every case, interrupted or failed, puts the
 released generation back through the same program and proves it by every digest. A start that fails ends the series. Nothing of
 the game is attached to, sampled or touched: of the host programs, what macOS says from outside (ps, lsof, pmset, notifyutil).
@@ -92,7 +95,9 @@ def processes():
     return out
 
 
-SWITCHES = {"upscale": ("OBELISK_WSD_UPSCALE", {"metalfx"}), "present": ("OBELISK_WSD_PRESENT", {"arrival", "attime", "nosync", "two"})}
+SWITCHES = {"upscale": ("OBELISK_WSD_UPSCALE", {"metalfx"}), "present": ("OBELISK_WSD_PRESENT", {"arrival", "attime", "nosync", "two"}),
+            "queries": ("OBELISK_DXMT_QUERY_RESCUE", {"once"})}
+PICTURE = os.path.join(HERE, "bin", "window_picture")  # (build-window-picture.sh)
 
 
 def switches(asked):
@@ -173,7 +178,7 @@ class Session:
         free = shutil.disk_usage(HOME).free >> 30
         if free < LEAST_FREE:
             problems.append(f"{free} GiB are free, {LEAST_FREE} are needed")
-        for path in (self.a.cli, os.path.join(self.a.bench, "bench.py"), os.path.join(HERE, "otl.py")):
+        for path in (self.a.cli, os.path.join(self.a.bench, "bench.py"), os.path.join(HERE, "otl.py"), PICTURE):
             if not os.path.isfile(path):
                 problems.append(f"{path} is not there")
         wrong = self.digests("released")
@@ -288,7 +293,8 @@ class Session:
                           "OBELISK_TIMELINE": trace, "OBELISK_TIMELINE_PASSES": str(self.a.passes), "OBELISK_TIMELINE_MB": str(self.a.mb)} | self.a.switches
         command = ["/usr/bin/python3", "-I", os.path.join(self.a.bench, "bench.py"), "--cli", self.a.cli, "--percent", str(percent), "--label",
                    str(percent), "--link", self.a.link, "--warm", str(self.a.warm), "--window", str(self.a.window), "--windows",
-                   str(self.a.windows), "--no-sample", "--out", f"{folder}/bench.json"]
+                   str(self.a.windows), "--no-sample", "--picture", f"{folder}/picture", "--picture-tool", PICTURE, "--picture-at",
+                   str(max(1, min(100, self.a.warm - 20))), "--out", f"{folder}/bench.json"]
         stop = threading.Event()
         watcher = threading.Thread(target=self.conditions, args=(folder, stop), daemon=True)
         watcher.start()
@@ -369,6 +375,9 @@ class Session:
             bench = dict(windows=[], outcome="no result")
         result["outcome"] = bench.get("outcome")
         result["brought_to_front"] = bench.get("observed", {}).get("fronted")
+        result["pictures"] = bench.get("pictures")
+        taken = [p for p in result["pictures"] or [] if p["file"]]
+        say(f"  {len(taken)} pictures of the game's window" + (f" {taken[0]['after_arrival_s']:.1f} s after the arrival" if taken else " (macOS may not let this terminal record windows)"))
         clocks = self.clocks(folder, bench)
         for i, w in enumerate(bench.get("windows", []), 1):
             told = dict(window=i, valid=w["valid"], why=w["invalid_because"], submitted=w["guest_present"]["submitted_per_second_counted"],
@@ -387,6 +396,7 @@ class Session:
                         read = json.load(f)
                     one = read["reports"][0]
                     told["splits"] = one.get("splits")
+                    told["queries"] = one.get("queries")
                     told.update(lost=read["lost"], not_told=read["not_told"], frames=one["frames"], whole=one["whole"], not_whole=one["not_whole"],
                                 cadence=[{k: c[k] for k in ("plane", "window", "region", "received", "replaced", "shown", "shown_per_s", "zero_time",
                                                             "shown_interval_ms", "tick_to_shown_ms", "client_to_shown_ms", "gpu_ms",

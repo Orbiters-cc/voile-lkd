@@ -23,6 +23,9 @@ tools/timeline/real_session.py '<private instance link>'    # the three real sta
 tools/timeline/rehearse.py ...                              # the same without the game, the account or the owner's library
 ```
 
+`real_session.py` takes pictures of the game's window alone, 100 s after the arrival (`window_picture.m`, built by `build-window-picture.sh`); `compare_pictures.py <start>
+<start>` tells what differs between two starts from what moves by itself in each.
+
 ## What it prints
 
 First what is missing: records lost per role and when, how each recorder ended, the session's budget, the presentations and frames
@@ -45,6 +48,8 @@ covered by this queue", with why. Other programs' GPU work is never seen. Then, 
 by the two clocks of the recording; a time outside its command buffer's own GPU time, or left from an earlier encoder, is refused and
 counted). Nominal traffic is not a measurement, and stages overlap: their union is given, never their sum.
 
+`--queries`: what the looks at event queries flushed, whether anything was owed, and every commit by its reason.
+
 `--cadence`: per plane of wsd (a window's base or overlay; a new one is a new plane), what its display link gave and what became of
 what it received. A frame counts as shown only with a positive time, once, redisplays apart.
 
@@ -60,4 +65,5 @@ what it received. A frame counts as shown only with a positive time, once, redis
 
 - `tests/graphics/run-wsd-cadence.sh`, `run-low-power-session.sh`: what wsd shows of frames sent at a rate, full screen.
 - `tests/graphics/run-pass-costs.sh` (`pass_costs.cpp`): Direct3D 11 frames through Wine, Neptune, the render server, DXMT.
+- `tests/graphics/run-query-client.sh` (`query_client.cpp`): queries, one promise at a time, with oracles; a randomised soak. No window.
 - `tests/graphics/pass_bench.m`: what Metal alone takes for a pass by its load and store actions.
