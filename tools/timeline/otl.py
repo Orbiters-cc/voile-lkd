@@ -179,9 +179,9 @@ def attachment_bytes(w, plane=None):
 
 # The boundaries of a presented frame in order, and the parts of the fence wait between them. A part over before the stopwatch
 # began counts nothing; a boundary that is not known, or before the one it follows, leaves the frame without parts.
-MARKS = ["ready", "woken", "flushed", "gpu_start", "gpu_end", "notify", "retired", "proxy", "client"]
-PARTS = ["replay tail", "encode queue", "encode", "commit to GPU start", "GPU execution", "GPU end to notify", "notify to published",
-         "published to proxy", "proxy to guest stamp"]
+MARKS = ["ready", "woken", "flushed", "gpu_start", "gpu_end", "notify", "retire_woken", "proxy", "client"]
+PARTS = ["replay tail", "encode queue", "encode", "commit to GPU start", "GPU execution", "GPU end to notify", "notify to worker awake",
+         "worker awake to proxy", "proxy to guest stamp"]
 POST = ["to wsd", "to tick", "drawable wait", "tick to commit", "commit to GPU end", "GPU end to shown", "client to shown"]
 
 
@@ -614,6 +614,8 @@ def report(s, frames, title):
     row("encode of the frame", [f.get("encode_frame") for f in good])
     row("of it, waiting for pipelines", [f.get("pipeline_frame") for f in good])
     row("ring decode", [f["decode"] for f in good])
+    # (the proxy may see the fence published before the worker's own stamp of it: beside the parts, not one of them)
+    row("worker awake to published", [f["retired"] - f["retire_woken"] for f in good])
     post = [f for f in good if "post" in f]
     if post:
         print("  after the fence:")
