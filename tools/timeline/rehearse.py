@@ -7,7 +7,7 @@ Usage: rehearse.py --cli <developer's obelisk-cli> --generation <folder> --relea
                    --bench <tools/mac-bench> --client <pass_costs.exe> --out <folder> [--mode heavy60] [--plan 58,100,45]
 
 The client covers the screen for less than a minute per start. Refuses while the screen is locked."""
-import argparse, json, os, re, shutil, subprocess, sys
+import argparse, json, os, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,7 +29,10 @@ def main():
     library = os.path.join(home, "Library/Application Support/cc.orbiters.obelisk-cli")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(os.path.join(library, "Voile"))
-    subprocess.run(["/bin/cp", "-Rc", os.path.abspath(a.release), os.path.join(library, "Voile", json.load(open(os.path.join(a.release, "runtime.json")))["version"])], check=True)
+    with open(os.path.join(a.release, "runtime.json")) as f:
+        version = json.load(f)["version"]
+    subprocess.run(["/bin/cp", "-Rc", os.path.abspath(a.release), os.path.join(library, "Voile", version)], check=True)
+    open(os.path.join(library, "Voile", "prereleases"), "w").close()  # (the release is a beta: as `settings prereleases on`)
     install = os.path.join(library, "Games", "rehearsal")
     os.makedirs(install)
     shutil.copy(a.client, os.path.join(install, "pass_costs.exe"))
@@ -49,7 +52,8 @@ def main():
     status = subprocess.run(command, env=env).returncode
     last = json.loads((engine("released").strip() or "{}").splitlines()[-1])
     print("the released generation last:", last.get("event"), last.get("generation"))
-    same = [f for f in json.loads(first.strip().splitlines()[-1])["engine_files"]] == last.get("engine_files")
+    before = json.loads(first.strip().splitlines()[-1]).get("engine_files")
+    same = before is not None and before == last.get("engine_files")
     print("the library's engine files are", "the same as before" if same else "NOT THE SAME AS BEFORE")
     return status or (0 if same else 1)
 

@@ -279,6 +279,28 @@ class Session:
             except OSError as e:
                 say(f"not kept: {os.path.basename(path)} ({e.strerror})")
 
+    def clocks(self, folder, bench):
+        """A time of the bench's own clock (its process's, whatever that counts from) in uptime nanoseconds, the trace's: by the
+        wall clock both it and the conditions noted, at the moment nearest to it."""
+        looks = [(x["at"], x["wall"]) for x in bench.get("observed", {}).get("look", [])]
+        marks = []
+        try:
+            with open(f"{folder}/conditions.jsonl") as f:
+                for line in f:
+                    x = json.loads(line)
+                    marks.append((x["wall"], x["uptime_ns"]))
+        except (OSError, ValueError):
+            pass
+        if not looks or not marks:
+            return None
+
+        def told(at):
+            near = min(looks, key=lambda x: abs(x[0] - at))
+            wall = near[1] + (at - near[0])
+            mark = min(marks, key=lambda x: abs(x[0] - wall))
+            return int(mark[1] + (wall - mark[0]) * 1e9)
+        return told
+
     def report(self, folder, trace, percent, status):
         """One line per window of what is known of it, and whether the series may go on."""
         result = dict(percent=percent, bench_status=status, windows=[])
@@ -293,12 +315,14 @@ class Session:
         except (OSError, ValueError):
             bench = dict(windows=[], outcome="no result")
         result["outcome"] = bench.get("outcome")
+        clocks = self.clocks(folder, bench)
         for i, w in enumerate(bench.get("windows", []), 1):
             told = dict(window=i, valid=w["valid"], why=w["invalid_because"], submitted=w["guest_present"]["submitted_per_second_counted"],
                         fence_wait_ms=w["guest_present"]["fence_wait_ms_median"], shown_per_s=w["wsd_shown"]["per_second"])
-            if len(traces) == 1:
+            if len(traces) == 1 and clocks:
                 base = f"{folder}/window-{i}"
-                text = run(["/usr/bin/python3", "-I", f"{HERE}/otl.py", traces[0], "--from", str(int(w["from"] * 1e9)), "--to", str(int(w["to"] * 1e9)),
+                told["from_ns"], told["to_ns"] = clocks(w["from"]), clocks(w["to"])
+                text = run(["/usr/bin/python3", "-I", f"{HERE}/otl.py", traces[0], "--from", str(told["from_ns"]), "--to", str(told["to_ns"]),
                             "--passes", "--cadence", "--csv", f"{base}.csv", "--json", f"{base}.json"], 600)
                 write(f"{base}.txt", text)
                 try:
@@ -313,12 +337,14 @@ class Session:
             result["windows"].append(told)
         write(f"{folder}/result.json", result)
         for told in result["windows"]:
+            if told.get("frames") == 0:
+                result["no_frames"] = True
             say(f"  window {told['window']}: {'valid' if told['valid'] else 'INVALID ' + '; '.join(told['why'])}; shown {told['shown_per_s']}/s, "
                 f"frames {told.get('frames')}, whole {told.get('whole')}, lost {told.get('lost')}")
         if result["foreign_images"]:
             say(f"  HOST PROGRAMS LOADED WHAT IS NOT THE GENERATION'S: {result['foreign_images']}")
         say(f"  {result['outcome']}; {len(files)} trace files of {', '.join(result['roles']) or 'no role'}")
-        result["go_on"] = status == 0 and not result["foreign_images"] and {"wsd", "vtest", "npt", "dxmt"} <= set(result["roles"])
+        result["go_on"] = status == 0 and not result.get("no_frames") and not result["foreign_images"] and {"wsd", "vtest", "npt", "dxmt"} <= set(result["roles"])
         return result
 
     def main(self):
