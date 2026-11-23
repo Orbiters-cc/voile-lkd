@@ -1,0 +1,56 @@
+### 131451-rate20-percent100-fr0
+-- cadence: all
+  received 300 (20.07/s), replaced unshown 0, drawn 299, no drawable 0, shown 299, zero-time callbacks 0
+  display link: 897 ticks (60.00/s), with a frame 299, empty 598, hidden 0, again 0; between callbacks p50 16.667 p99 16.739 ms; between link times p50 16.666 max 16.798 ms
+  nextDrawable: p50 0.065 p90 0.074 p99 0.526 max 1.105 ms
+  wsd GPU: p50 0.952 p99 1.113 ms; tick to shown: p50 32.768 p90 32.802 ms
+  shown intervals in refreshes of 1/60 s: 1: 1, 2: 2, 3: 293, 5: 2
+### 131508-rate32-percent100-fr0
+-- cadence: all
+  received 480 (32.07/s), replaced unshown 0, drawn 479, no drawable 0, shown 478, zero-time callbacks 0
+  display link: 898 ticks (60.00/s), with a frame 479, empty 419, hidden 0, again 0; between callbacks p50 16.666 p99 16.721 ms; between link times p50 16.666 max 16.797 ms
+  nextDrawable: p50 0.011 p90 0.048 p99 0.079 max 0.980 ms
+  wsd GPU: p50 0.480 p99 1.082 ms; tick to shown: p50 32.806 p90 32.815 ms
+  shown intervals in refreshes of 1/60 s: 1: 61, 2: 414, 3: 2
+### 131524-rate60-percent100-fr0
+-- cadence: all
+  received 900 (60.07/s), replaced unshown 0, drawn 899, no drawable 0, shown 896, zero-time callbacks 1
+  display link: 899 ticks (60.00/s), with a frame 899, empty 0, hidden 0, again 0; between callbacks p50 16.667 p99 16.681 ms; between link times p50 16.666 max 16.796 ms
+  nextDrawable: p50 0.005 p90 0.008 p99 0.012 max 1.156 ms
+  wsd GPU: p50 0.472 p99 0.486 ms; tick to shown: p50 32.811 p90 32.818 ms
+  shown intervals in refreshes of 1/60 s: 1: 895
+### 131541-rate20-percent58-fr0
+-- cadence: all
+  received 300 (20.07/s), replaced unshown 0, drawn 299, no drawable 0, shown 299, zero-time callbacks 0
+  display link: 897 ticks (60.00/s), with a frame 299, empty 598, hidden 0, again 0; between callbacks p50 16.666 p99 16.683 ms; between link times p50 16.666 max 16.798 ms
+  nextDrawable: p50 0.010 p90 0.014 p99 0.027 max 0.878 ms
+  wsd GPU: p50 0.174 p99 0.304 ms; tick to shown: p50 32.810 p90 32.815 ms
+  shown intervals in refreshes of 1/60 s: 1: 1, 2: 6, 3: 287, 5: 4
+### 131557-rate32-percent58-fr0
+-- cadence: all
+  received 480 (32.07/s), replaced unshown 0, drawn 479, no drawable 0, shown 478, zero-time callbacks 0
+  display link: 899 ticks (60.06/s), with a frame 479, empty 420, hidden 0, again 0; between callbacks p50 16.667 p99 16.701 ms; between link times p50 16.666 max 16.797 ms
+  nextDrawable: p50 0.007 p90 0.013 p99 0.057 max 1.791 ms
+  wsd GPU: p50 0.175 p99 0.589 ms; tick to shown: p50 32.812 p90 32.819 ms
+  shown intervals in refreshes of 1/60 s: 1: 60, 2: 416, 3: 1
+### 131614-rate60-percent58-fr0
+-- cadence: all
+  received 900 (60.07/s), replaced unshown 15, drawn 884, no drawable 0, shown 881, zero-time callbacks 1
+  display link: 899 ticks (60.00/s), with a frame 884, empty 15, hidden 0, again 0; between callbacks p50 16.667 p99 16.863 ms; between link times p50 16.666 max 16.797 ms
+  nextDrawable: p50 0.036 p90 0.049 p99 0.072 max 2.837 ms
+  wsd GPU: p50 0.514 p99 0.624 ms; tick to shown: p50 32.771 p90 32.803 ms
+  shown intervals in refreshes of 1/60 s: 1: 865, 2: 15
+### 131630-rate32-percent58-fr60
+-- cadence: all
+  received 480 (32.07/s), replaced unshown 0, drawn 479, no drawable 0, shown 478, zero-time callbacks 0
+  display link: 898 ticks (60.00/s), with a frame 479, empty 419, hidden 0, again 0; between callbacks p50 16.667 p99 16.710 ms; between link times p50 16.666 max 16.797 ms
+  nextDrawable: p50 0.008 p90 0.039 p99 0.067 max 4.742 ms
+  wsd GPU: p50 0.176 p99 0.585 ms; tick to shown: p50 32.810 p90 32.818 ms
+  shown intervals in refreshes of 1/60 s: 0: 1, 1: 60, 2: 415, 3: 1
+CADENCE rate=20.0 size=2940x1912 frame_rate=0 due=300 sent=300 shown=300 replaced=0 zero=0 starved=0 sent_per_s=20.00 shown_per_s=20.00 refreshes 1:1 2:2 3:294 5:2
+CADENCE rate=32.0 size=2940x1912 frame_rate=0 due=480 sent=480 shown=480 replaced=0 zero=0 starved=0 sent_per_s=32.00 shown_per_s=32.00 refreshes 1:62 2:415 3:2
+CADENCE rate=60.0 size=2940x1912 frame_rate=0 due=900 sent=900 shown=899 replaced=0 zero=1 starved=0 sent_per_s=60.00 shown_per_s=60.00 refreshes 1:898
+CADENCE rate=20.0 size=1705x1109 frame_rate=0 due=300 sent=300 shown=300 replaced=0 zero=0 starved=0 sent_per_s=20.00 shown_per_s=20.00 refreshes 1:1 2:6 3:288 5:4
+CADENCE rate=32.0 size=1705x1109 frame_rate=0 due=480 sent=480 shown=480 replaced=0 zero=0 starved=0 sent_per_s=32.00 shown_per_s=31.97 refreshes 1:60 2:418 3:1
+CADENCE rate=60.0 size=1705x1109 frame_rate=0 due=900 sent=900 shown=884 replaced=15 zero=1 starved=0 sent_per_s=60.00 shown_per_s=59.00 refreshes 1:868 2:15
+CADENCE rate=32.0 size=1705x1109 frame_rate=60 due=480 sent=480 shown=480 replaced=0 zero=0 starved=0 sent_per_s=32.00 shown_per_s=32.04 refreshes 0:1 1:60 2:417 3:1

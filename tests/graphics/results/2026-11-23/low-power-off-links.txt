@@ -1,0 +1,6 @@
+PROBE display 60 Hz, low power mode off, thermal state 0
+LINK CADisplayLink (default, wsd) ticks/s  60.00 shown/s  60.00 zero 1 no-drawable 0 longest nextDrawable 2.67 ms refreshes 1:298
+LINK CADisplayLink (asks rate)    ticks/s  60.00 shown/s  60.00 zero 0 no-drawable 0 longest nextDrawable 0.46 ms refreshes 1:299
+LINK CVDisplayLink                ticks/s  60.00 shown/s  60.00 zero 0 no-drawable 0 longest nextDrawable 0.07 ms refreshes 1:298
+LINK CAMetalDisplayLink (default) ticks/s  60.00 shown/s  60.00 zero 0 no-drawable 0 longest nextDrawable 0.00 ms refreshes 1:299
+LINK CAMetalDisplayLink (asks rate) ticks/s  60.00 shown/s  60.00 zero 0 no-drawable 0 longest nextDrawable 0.00 ms refreshes 1:299

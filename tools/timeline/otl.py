@@ -340,7 +340,8 @@ def report(s, frames, title):
              f"{sum(1 for f in good if f.get('shown'))} shown" if good else ""))
     if not good:
         return
-    iv = [f["interval"] for f in good if "interval" in f]
+    inner = [f for f in good[1:] if "interval" in f]  # the first one's interval began before the cut
+    iv = [f["interval"] for f in inner]
     if iv:
         print(f"interval (post-fence stamp to post-fence stamp): mean {mean(iv) / 1e6:.3f} ms, {1e9 / mean(iv):.1f}/s")
 
@@ -356,8 +357,8 @@ def report(s, frames, title):
     print("  beside it:")
     row("GPU busy in the wait", [f["gpu_in_wait"] for f in good], wait)
     row("GPU start to end", [f["gpu_frame"] for f in good])
-    row("GPU busy per interval", [f["gpu_busy"] for f in good if "gpu_busy" in f])
-    row("GPU idle per interval", [f["gpu_gap"] for f in good if "gpu_gap" in f])
+    row("GPU busy per interval", [f["gpu_busy"] for f in inner])
+    row("GPU idle per interval", [f["gpu_gap"] for f in inner])
     row("encode of the frame", [f["encode_frame"] for f in good])
     row("pipelines of the frame", [f["pipeline_frame"] for f in good])
     row("ring decode", [f["decode"] for f in good])

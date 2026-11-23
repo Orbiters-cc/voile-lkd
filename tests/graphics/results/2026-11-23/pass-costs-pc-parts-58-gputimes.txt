@@ -1,0 +1,522 @@
+2026-11-23 13:22:31
+Now drawing from 'AC Power'
+low power mode (the setting in use): 0
+Note: No thermal warning level has been recorded
+Note: No performance warning level has been recorded
+Note: No CPU power status has been recorded
+percent 58 interval 0 timeline 1 modes: trivial copies4 full8-free full8-bound msaa-full8-free msaa-full8-bound msaa-resolve msaa-grab switch8-free switch8-bound upload8 heavy60
+engine/wsd 15b6c005160535c4
+graphics/libexec/virgl_render_server dc59d46575049f69
+graphics/bin/virgl_test_server cb9047d0ce1cfe7f
+graphics/lib/libvirglrenderer.1.dylib 1e8f9d1e070fe6f5
+graphics/dxmt-native.framework/Versions/A/dxmt-native 976e27482783a3b7
+otl-dxmt-27588.bin: dxmt pid 27588, 1432508 records, 0 lost, 3 windows
+otl-npt-27588.bin: npt pid 27588, 351209 records, 0 lost, 3 windows
+otl-vtest-27488.bin: vtest pid 27488, 46841 records, 0 lost, 3 windows
+otl-wsd-27486.bin: wsd pid 27486, 101254 records, 0 lost, 3 windows
+
+== trivial (9774 frames, fps=3909.35 record_ms=0.001 present_ms=0.244): 9774 presented frames, 9774 joined end to end, 9623 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.256 ms, 3910.8/s
+  FENCE WAIT             mean    0.251  p10    0.174  p50    0.237  p90    0.313  p99    0.508 ms  100.0 %
+  replay tail            mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.3 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.003 ms    0.0 %
+  encode                 mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.019 ms    0.2 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.040  p10    0.000  p50    0.022  p90    0.098  p99    0.188 ms   15.9 %
+  GPU execution          mean    0.130  p10    0.101  p50    0.129  p90    0.148  p99    0.296 ms   51.7 %
+  GPU end to notify      mean    0.063  p10    0.052  p50    0.058  p90    0.071  p99    0.150 ms   25.2 %
+  notify to retire       mean    0.005  p10    0.004  p50    0.004  p90    0.006  p99    0.020 ms    2.0 %
+  retire to vtest        mean    0.006  p10    0.005  p50    0.005  p90    0.006  p99    0.024 ms    2.3 %
+  vtest to guest wake    mean    0.006  p10    0.005  p50    0.005  p90    0.007  p99    0.020 ms    2.4 %
+  beside it:
+  GPU busy in the wait   mean    0.146  p10    0.101  p50    0.147  p90    0.175  p99    0.367 ms   58.0 %
+  GPU start to end       mean    0.150  p10    0.127  p50    0.132  p90    0.180  p99    0.374 ms
+  GPU busy per interval  mean    0.146  p10    0.101  p50    0.147  p90    0.175  p99    0.365 ms
+  GPU idle per interval  mean    0.110  p10    0.066  p50    0.090  p90    0.154  p99    0.485 ms
+  encode of the frame    mean    0.020  p10    0.016  p50    0.018  p90    0.022  p99    0.057 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.033  p10    0.024  p50    0.027  p90    0.053  p99    0.095 ms
+  after the fence:
+  to wsd                 mean    0.011  p10    0.009  p50    0.011  p90    0.013  p99    0.022 ms
+  to tick                mean    0.313  p10    0.029  p50    0.114  p90    0.212  p99   14.838 ms
+  drawable wait          mean    0.010  p10    0.005  p50    0.008  p90    0.017  p99    0.027 ms
+  tick to commit         mean    0.029  p10    0.016  p50    0.024  p90    0.050  p99    0.075 ms
+  commit to GPU end      mean    0.434  p10    0.355  p50    0.428  p90    0.505  p99    0.736 ms
+  GPU end to shown       mean   15.670  p10   15.611  p50   15.675  p90   15.760  p99   15.822 ms
+  client to shown        mean   16.468  p10   16.188  p50   16.264  p90   16.367  p99   30.988 ms
+  per frame: 1.0 command buffers, 1 draws, 18 commands, 0 maps, 0 updates, 1 target changes, 1.0 flushes
+  passes of the commonest frame (204 of 204 looked at; 1 shapes), nominal traffic 22.7 MB:
+      1 render: 1 draws | RGBA8 1705x1109 clear/store  (7.6 MB)  [GPU vertex 0.003 fragment 0.038 ms]
+      2 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.082 fragment 0.000 ms]
+
+== copies4 (5813 frames, fps=2324.85 record_ms=0.002 present_ms=0.416): 5813 presented frames, 5813 joined end to end, 5662 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.430 ms, 2326.1/s
+  FENCE WAIT             mean    0.427  p10    0.388  p50    0.412  p90    0.468  p99    0.694 ms  100.0 %
+  replay tail            mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  encode                 mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.022 ms    0.1 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.003  p10    0.000  p50    0.000  p90    0.000  p99    0.167 ms    0.8 %
+  GPU execution          mean    0.330  p10    0.303  p50    0.318  p90    0.351  p99    0.563 ms   77.2 %
+  GPU end to notify      mean    0.078  p10    0.054  p50    0.081  p90    0.096  p99    0.127 ms   18.2 %
+  notify to retire       mean    0.005  p10    0.004  p50    0.004  p90    0.006  p99    0.012 ms    1.1 %
+  retire to vtest        mean    0.005  p10    0.005  p50    0.005  p90    0.006  p99    0.012 ms    1.3 %
+  vtest to guest wake    mean    0.006  p10    0.005  p50    0.005  p90    0.006  p99    0.011 ms    1.3 %
+  beside it:
+  GPU busy in the wait   mean    0.419  p10    0.385  p50    0.411  p90    0.444  p99    0.680 ms   98.1 %
+  GPU start to end       mean    0.533  p10    0.417  p50    0.533  p90    0.622  p99    0.826 ms
+  GPU busy per interval  mean    0.419  p10    0.385  p50    0.411  p90    0.444  p99    0.679 ms
+  GPU idle per interval  mean    0.011  p10    0.000  p50    0.000  p90    0.000  p99    0.312 ms
+  encode of the frame    mean    0.024  p10    0.021  p50    0.023  p90    0.026  p99    0.043 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.032  p10    0.025  p50    0.028  p90    0.047  p99    0.082 ms
+  after the fence:
+  to wsd                 mean    0.011  p10    0.009  p50    0.010  p90    0.013  p99    0.023 ms
+  to tick                mean    0.285  p10    0.059  p50    0.273  p90    0.406  p99    0.508 ms
+  drawable wait          mean    0.026  p10    0.005  p50    0.006  p90    0.011  p99    0.027 ms
+  tick to commit         mean    0.021  p10    0.015  p50    0.018  p90    0.030  p99    0.062 ms
+  commit to GPU end      mean    0.432  p10    0.319  p50    0.432  p90    0.510  p99    0.663 ms
+  GPU end to shown       mean   32.333  p10   32.273  p50   32.356  p90   32.466  p99   32.544 ms
+  client to shown        mean   33.108  p10   32.883  p50   33.093  p90   33.224  p99   33.334 ms
+  per frame: 1.0 command buffers, 1 draws, 22 commands, 0 maps, 0 updates, 1 target changes, 1.0 flushes
+  passes of the commonest frame (201 of 201 looked at; 1 shapes), nominal traffic 83.2 MB:
+      1 render: 1 draws | RGBA8 1705x1109 clear/store  (7.6 MB)  [GPU vertex 0.003 fragment 0.037 ms]
+      2 blit: 5 ops, 9454225 px copied  (75.6 MB)  [GPU vertex 0.302 fragment 0.000 ms]
+
+== msaa-resolve (7506 frames, fps=3002.37 record_ms=0.004 present_ms=0.321): 7506 presented frames, 7506 joined end to end, 7355 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.333 ms, 3005.1/s
+  FENCE WAIT             mean    0.329  p10    0.281  p50    0.295  p90    0.406  p99    0.632 ms  100.0 %
+  replay tail            mean   -0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms   -0.0 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.003 ms    0.0 %
+  encode                 mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.036 ms    0.4 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.016  p10    0.000  p50    0.000  p90    0.061  p99    0.190 ms    4.9 %
+  GPU execution          mean    0.239  p10    0.213  p50    0.229  p90    0.276  p99    0.439 ms   72.6 %
+  GPU end to notify      mean    0.054  p10    0.044  p50    0.051  p90    0.061  p99    0.106 ms   16.4 %
+  notify to retire       mean    0.006  p10    0.003  p50    0.004  p90    0.006  p99    0.024 ms    1.7 %
+  retire to vtest        mean    0.006  p10    0.004  p50    0.005  p90    0.008  p99    0.026 ms    1.9 %
+  vtest to guest wake    mean    0.007  p10    0.004  p50    0.005  p90    0.008  p99    0.029 ms    2.1 %
+  beside it:
+  GPU busy in the wait   mean    0.275  p10    0.225  p50    0.255  p90    0.339  p99    0.516 ms   83.7 %
+  GPU start to end       mean    0.305  p10    0.246  p50    0.267  p90    0.399  p99    0.523 ms
+  GPU busy per interval  mean    0.275  p10    0.225  p50    0.255  p90    0.339  p99    0.516 ms
+  GPU idle per interval  mean    0.057  p10    0.000  p50    0.045  p90    0.091  p99    0.395 ms
+  encode of the frame    mean    0.037  p10    0.027  p50    0.033  p90    0.044  p99    0.123 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.041  p10    0.026  p50    0.033  p90    0.063  p99    0.125 ms
+  after the fence:
+  to wsd                 mean    0.012  p10    0.008  p50    0.011  p90    0.018  p99    0.041 ms
+  to tick                mean    0.346  p10    0.044  p50    0.225  p90    0.418  p99    0.964 ms
+  drawable wait          mean    0.016  p10    0.010  p50    0.015  p90    0.023  p99    0.028 ms
+  tick to commit         mean    0.049  p10    0.034  p50    0.047  p90    0.067  p99    0.091 ms
+  commit to GPU end      mean    0.404  p10    0.316  p50    0.394  p90    0.514  p99    0.590 ms
+  GPU end to shown       mean   32.342  p10   32.227  p50   32.350  p90   32.445  p99   32.473 ms
+  client to shown        mean   33.169  p10   32.863  p50   33.046  p90   33.243  p99   33.783 ms
+  per frame: 1.0 command buffers, 3 draws, 38 commands, 0 maps, 0 updates, 2 target changes, 1.0 flushes
+  passes of the commonest frame (203 of 203 looked at; 1 shapes), nominal traffic 71.9 MB:
+      1 render: 2 draws | RGBA8 1705x1109 2x clear/store+resolve | depth D32FS8 1705x1109 2x clear/store | stencil D32FS8 1705x1109 2x clear/store  (41.6 MB)  [GPU vertex 0.006 fragment 0.112 ms]
+      2 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.025 fragment 0.044 ms]
+      3 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.083 fragment 0.000 ms]
+
+== msaa-grab (4294 frames, fps=1717.24 record_ms=0.009 present_ms=0.548): 4294 presented frames, 4294 joined end to end, 4143 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.582 ms, 1717.2/s
+  FENCE WAIT             mean    0.576  p10    0.447  p50    0.499  p90    0.771  p99    1.399 ms  100.0 %
+  replay tail            mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.004 ms    0.1 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.012 ms    0.1 %
+  encode                 mean    0.005  p10    0.000  p50    0.000  p90    0.000  p99    0.161 ms    0.9 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.029  p10    0.000  p50    0.000  p90    0.096  p99    0.289 ms    5.1 %
+  GPU execution          mean    0.393  p10    0.324  p50    0.393  p90    0.446  p99    0.631 ms   68.2 %
+  GPU end to notify      mean    0.086  p10    0.053  p50    0.067  p90    0.117  p99    0.395 ms   14.9 %
+  notify to retire       mean    0.018  p10    0.004  p50    0.009  p90    0.027  p99    0.164 ms    3.0 %
+  retire to vtest        mean    0.018  p10    0.005  p50    0.010  p90    0.029  p99    0.124 ms    3.1 %
+  vtest to guest wake    mean    0.026  p10    0.005  p50    0.011  p90    0.036  p99    0.133 ms    4.5 %
+  beside it:
+  GPU busy in the wait   mean    0.463  p10    0.332  p50    0.462  p90    0.583  p99    0.852 ms   80.4 %
+  GPU start to end       mean    0.541  p10    0.422  p50    0.543  p90    0.673  p99    0.849 ms
+  GPU busy per interval  mean    0.463  p10    0.332  p50    0.462  p90    0.583  p99    0.852 ms
+  GPU idle per interval  mean    0.119  p10    0.000  p50    0.057  p90    0.257  p99    0.934 ms
+  encode of the frame    mean    0.100  p10    0.039  p50    0.078  p90    0.187  p99    0.363 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.083  p10    0.031  p50    0.068  p90    0.131  p99    0.418 ms
+  after the fence:
+  to wsd                 mean    0.021  p10    0.009  p50    0.018  p90    0.037  p99    0.055 ms
+  to tick                mean    0.386  p10    0.075  p50    0.311  p90    0.613  p99    2.575 ms
+  drawable wait          mean    0.019  p10    0.013  p50    0.018  p90    0.026  p99    0.036 ms
+  tick to commit         mean    0.057  p10    0.041  p50    0.053  p90    0.075  p99    0.105 ms
+  commit to GPU end      mean    0.421  p10    0.302  p50    0.411  p90    0.549  p99    0.757 ms
+  GPU end to shown       mean   32.307  p10   32.163  p50   32.318  p90   32.430  p99   32.490 ms
+  client to shown        mean   33.211  p10   32.903  p50   33.132  p90   33.447  p99   35.391 ms
+  per frame: 1.0 command buffers, 4 draws, 50 commands, 0 maps, 0 updates, 3 target changes, 1.0 flushes
+  passes of the commonest frame (205 of 205 looked at; 1 shapes), nominal traffic 147.5 MB:
+      1 render: 2 draws | RGBA8 1705x1109 2x clear/store+resolve | depth D32FS8 1705x1109 2x clear/store | stencil D32FS8 1705x1109 2x clear/store  (41.6 MB)  [GPU vertex 0.006 fragment 0.110 ms]
+      2 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.005 fragment 0.174 ms]
+      3 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.006 fragment 0.046 ms]
+      4 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.099 fragment 0.000 ms]
+
+== switch8-free (3604 frames, fps=1441.16 record_ms=0.014 present_ms=0.658): 3604 presented frames, 3604 joined end to end, 3453 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.694 ms, 1441.6/s
+  FENCE WAIT             mean    0.677  p10    0.565  p50    0.645  p90    0.820  p99    1.369 ms  100.0 %
+  replay tail            mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.010 ms    0.1 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.008 ms    0.0 %
+  encode                 mean    0.009  p10    0.000  p50    0.000  p90    0.000  p99    0.186 ms    1.3 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.070  p10    0.000  p50    0.060  p90    0.151  p99    0.262 ms   10.3 %
+  GPU execution          mean    0.499  p10    0.459  p50    0.493  p90    0.571  p99    0.752 ms   73.6 %
+  GPU end to notify      mean    0.069  p10    0.051  p50    0.059  p90    0.083  p99    0.286 ms   10.2 %
+  notify to retire       mean    0.010  p10    0.004  p50    0.005  p90    0.015  p99    0.100 ms    1.5 %
+  retire to vtest        mean    0.009  p10    0.004  p50    0.006  p90    0.018  p99    0.062 ms    1.4 %
+  vtest to guest wake    mean    0.010  p10    0.004  p50    0.006  p90    0.019  p99    0.056 ms    1.5 %
+  beside it:
+  GPU busy in the wait   mean    0.516  p10    0.461  p50    0.500  p90    0.624  p99    0.887 ms   76.2 %
+  GPU start to end       mean    0.525  p10    0.469  p50    0.502  p90    0.607  p99    0.900 ms
+  GPU busy per interval  mean    0.516  p10    0.461  p50    0.500  p90    0.624  p99    0.887 ms
+  GPU idle per interval  mean    0.178  p10    0.073  p50    0.140  p90    0.262  p99    0.803 ms
+  encode of the frame    mean    0.129  p10    0.092  p50    0.117  p90    0.163  p99    0.379 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.060  p10    0.034  p50    0.046  p90    0.100  p99    0.226 ms
+  after the fence:
+  to wsd                 mean    0.013  p10    0.008  p50    0.011  p90    0.021  p99    0.032 ms
+  to tick                mean    0.622  p10    0.079  p50    0.443  p90    0.726  p99   12.044 ms
+  drawable wait          mean    0.014  p10    0.008  p50    0.014  p90    0.020  p99    0.036 ms
+  tick to commit         mean    0.041  p10    0.026  p50    0.041  p90    0.056  p99    0.079 ms
+  commit to GPU end      mean    0.815  p10    0.643  p50    0.833  p90    1.011  p99    1.092 ms
+  GPU end to shown       mean   31.940  p10   31.751  p50   31.918  p90   32.098  p99   32.495 ms
+  client to shown        mean   33.445  p10   32.901  p50   33.272  p90   33.552  p99   44.910 ms
+  per frame: 1.0 command buffers, 18 draws, 198 commands, 0 maps, 0 updates, 18 target changes, 1.0 flushes
+  passes of the commonest frame (201 of 201 looked at; 1 shapes), nominal traffic 49.4 MB:
+      1 render: 1 draws | RGBA8 256x256 clear/store  (0.3 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+      2 render: 1 draws | RGBA8 256x256 clear/store  (0.3 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      3 render: 1 draws | RGBA8 256x256 clear/store  (0.3 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      4 render: 1 draws | RGBA8 256x256 clear/store  (0.3 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+      5 render: 1 draws | RGBA8 256x256 clear/store  (0.3 MB)  [GPU vertex 0.002 fragment 0.003 ms]
+      6 render: 1 draws | RGBA8 256x256 clear/store  (0.3 MB)  [GPU vertex 0.002 fragment 0.003 ms]
+      7 render: 1 draws | RGBA8 256x256 clear/store  (0.3 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      8 render: 1 draws | RGBA8 256x256 clear/store  (0.3 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      9 render: 9 draws | RGBA8 1705x1109 clear/store | depth D32FS8 1705x1109 clear/store | stencil D32FS8 1705x1109 clear/store  (17.0 MB)  [GPU vertex 0.006 fragment 0.040 ms]
+     10 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.006 fragment 0.055 ms]
+     11 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.133 fragment 0.000 ms]
+
+== switch8-bound (2573 frames, fps=1028.87 record_ms=0.014 present_ms=0.949): 2573 presented frames, 2573 joined end to end, 2422 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.972 ms, 1028.8/s
+  FENCE WAIT             mean    0.963  p10    0.842  p50    0.926  p90    1.097  p99    1.544 ms  100.0 %
+  replay tail            mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.004 ms    0.0 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.004 ms    0.0 %
+  encode                 mean    0.009  p10    0.000  p50    0.000  p90    0.000  p99    0.188 ms    0.9 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.036  p10    0.000  p50    0.000  p90    0.125  p99    0.215 ms    3.8 %
+  GPU execution          mean    0.805  p10    0.712  p50    0.788  p90    0.932  p99    1.077 ms   83.6 %
+  GPU end to notify      mean    0.089  p10    0.057  p50    0.074  p90    0.181  p99    0.265 ms    9.3 %
+  notify to retire       mean    0.008  p10    0.004  p50    0.005  p90    0.008  p99    0.038 ms    0.8 %
+  retire to vtest        mean    0.008  p10    0.005  p50    0.006  p90    0.009  p99    0.038 ms    0.8 %
+  vtest to guest wake    mean    0.008  p10    0.005  p50    0.006  p90    0.009  p99    0.041 ms    0.8 %
+  beside it:
+  GPU busy in the wait   mean    0.868  p10    0.724  p50    0.870  p90    1.034  p99    1.182 ms   90.2 %
+  GPU start to end       mean    0.979  p10    0.732  p50    1.017  p90    1.167  p99    1.304 ms
+  GPU busy per interval  mean    0.868  p10    0.724  p50    0.870  p90    1.034  p99    1.182 ms
+  GPU idle per interval  mean    0.104  p10    0.000  p50    0.000  p90    0.288  p99    0.663 ms
+  encode of the frame    mean    0.170  p10    0.145  p50    0.162  p90    0.194  p99    0.347 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.054  p10    0.036  p50    0.043  p90    0.087  p99    0.148 ms
+  after the fence:
+  to wsd                 mean    0.012  p10    0.009  p50    0.011  p90    0.016  p99    0.029 ms
+  to tick                mean    0.536  p10    0.094  p50    0.561  p90    0.908  p99    1.149 ms
+  drawable wait          mean    0.013  p10    0.010  p50    0.012  p90    0.019  p99    0.028 ms
+  tick to commit         mean    0.039  p10    0.030  p50    0.037  p90    0.049  p99    0.070 ms
+  commit to GPU end      mean    1.087  p10    0.776  p50    1.086  p90    1.435  p99    1.807 ms
+  GPU end to shown       mean   31.670  p10   31.331  p50   31.687  p90   31.980  p99   32.270 ms
+  client to shown        mean   33.358  p10   32.917  p50   33.378  p90   33.729  p99   33.973 ms
+  per frame: 1.0 command buffers, 18 draws, 206 commands, 0 maps, 0 updates, 18 target changes, 1.0 flushes
+  passes of the commonest frame (215 of 215 looked at; 1 shapes), nominal traffic 323.7 MB:
+      1 render: 1 draws | RGBA8 1705x1109 clear/store | depth D32FS8 1705x1109 clear/store | stencil D32FS8 1705x1109 clear/store  (17.0 MB)  [GPU vertex 0.006 fragment 0.038 ms]
+      2 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.005 ms]
+      3 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.006 ms]
+      4 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      5 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.003 fragment 0.007 ms]
+      6 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      7 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.003 fragment 0.006 ms]
+      8 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.004 fragment 0.003 ms]
+      9 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     10 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     11 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.006 ms]
+     12 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+     13 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     14 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.003 ms]
+     15 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.005 ms]
+     16 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     17 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     18 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.005 fragment 0.044 ms]
+     19 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.087 fragment 0.000 ms]
+
+== full8-free (3237 frames, fps=1294.67 record_ms=0.020 present_ms=0.738): 3237 presented frames, 3237 joined end to end, 3086 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.772 ms, 1294.9/s
+  FENCE WAIT             mean    0.768  p10    0.543  p50    0.721  p90    0.985  p99    1.600 ms  100.0 %
+  replay tail            mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.1 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.003 ms    0.0 %
+  encode                 mean    0.006  p10    0.000  p50    0.000  p90    0.000  p99    0.207 ms    0.7 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.013  p10    0.000  p50    0.000  p90    0.020  p99    0.231 ms    1.7 %
+  GPU execution          mean    0.636  p10    0.445  p50    0.619  p90    0.837  p99    1.042 ms   82.8 %
+  GPU end to notify      mean    0.075  p10    0.056  p50    0.068  p90    0.097  p99    0.173 ms    9.8 %
+  notify to retire       mean    0.012  p10    0.005  p50    0.007  p90    0.016  p99    0.069 ms    1.5 %
+  retire to vtest        mean    0.011  p10    0.006  p50    0.009  p90    0.016  p99    0.049 ms    1.5 %
+  vtest to guest wake    mean    0.014  p10    0.006  p50    0.009  p90    0.018  p99    0.064 ms    1.8 %
+  beside it:
+  GPU busy in the wait   mean    0.721  p10    0.482  p50    0.699  p90    0.957  p99    1.173 ms   93.8 %
+  GPU start to end       mean    0.884  p10    0.788  p50    0.864  p90    1.004  p99    1.202 ms
+  GPU busy per interval  mean    0.720  p10    0.482  p50    0.699  p90    0.957  p99    1.173 ms
+  GPU idle per interval  mean    0.052  p10    0.000  p50    0.000  p90    0.125  p99    0.623 ms
+  encode of the frame    mean    0.172  p10    0.102  p50    0.173  p90    0.228  p99    0.371 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.076  p10    0.041  p50    0.066  p90    0.112  p99    0.279 ms
+  after the fence:
+  to wsd                 mean    0.019  p10    0.010  p50    0.018  p90    0.029  p99    0.050 ms
+  to tick                mean    0.459  p10    0.095  p50    0.357  p90    0.809  p99    2.381 ms
+  drawable wait          mean    0.017  p10    0.011  p50    0.016  p90    0.021  p99    0.032 ms
+  tick to commit         mean    0.051  p10    0.038  p50    0.050  p90    0.066  p99    0.085 ms
+  commit to GPU end      mean    0.649  p10    0.372  p50    0.633  p90    0.944  p99    1.062 ms
+  GPU end to shown       mean   32.089  p10   31.793  p50   32.093  p90   32.368  p99   32.442 ms
+  client to shown        mean   33.284  p10   32.919  p50   33.179  p90   33.630  p99   35.210 ms
+  per frame: 1.0 command buffers, 18 draws, 200 commands, 0 maps, 0 updates, 18 target changes, 1.0 flushes
+  passes of the commonest frame (203 of 203 looked at; 1 shapes), nominal traffic 51.5 MB:
+      1 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+      2 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      3 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      4 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      5 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      6 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      7 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      8 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      9 render: 9 draws | RGBA8 1705x1109 clear/store | depth D32FS8 1705x1109 clear/store | stencil D32FS8 1705x1109 clear/store  (17.0 MB)  [GPU vertex 0.026 fragment 0.305 ms]
+     10 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.006 fragment 0.043 ms]
+     11 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.084 fragment 0.006 ms]
+
+== full8-bound (2179 frames, fps=871.39 record_ms=0.034 present_ms=1.094): 2179 presented frames, 2179 joined end to end, 2028 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 1.148 ms, 871.5/s
+  FENCE WAIT             mean    1.143  p10    0.969  p50    1.088  p90    1.309  p99    2.070 ms  100.0 %
+  replay tail            mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.006 ms    0.0 %
+  encode                 mean    0.015  p10    0.000  p50    0.000  p90    0.000  p99    0.399 ms    1.3 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.022  p10    0.000  p50    0.000  p90    0.056  p99    0.351 ms    1.9 %
+  GPU execution          mean    0.955  p10    0.842  p50    0.950  p90    1.080  p99    1.279 ms   83.6 %
+  GPU end to notify      mean    0.089  p10    0.062  p50    0.075  p90    0.111  p99    0.389 ms    7.7 %
+  notify to retire       mean    0.020  p10    0.007  p50    0.012  p90    0.029  p99    0.175 ms    1.8 %
+  retire to vtest        mean    0.020  p10    0.009  p50    0.014  p90    0.034  p99    0.091 ms    1.7 %
+  vtest to guest wake    mean    0.022  p10    0.009  p50    0.015  p90    0.037  p99    0.095 ms    1.9 %
+  beside it:
+  GPU busy in the wait   mean    1.034  p10    0.885  p50    1.021  p90    1.208  p99    1.443 ms   90.4 %
+  GPU start to end       mean    1.085  p10    0.942  p50    1.060  p90    1.259  p99    1.461 ms
+  GPU busy per interval  mean    1.034  p10    0.885  p50    1.021  p90    1.207  p99    1.443 ms
+  GPU idle per interval  mean    0.114  p10    0.000  p50    0.055  p90    0.205  p99    0.951 ms
+  encode of the frame    mean    0.357  p10    0.249  p50    0.345  p90    0.474  p99    0.612 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.114  p10    0.065  p50    0.102  p90    0.152  p99    0.473 ms
+  after the fence:
+  to wsd                 mean    0.027  p10    0.017  p50    0.025  p90    0.040  p99    0.056 ms
+  to tick                mean    0.620  p10    0.065  p50    0.511  p90    1.134  p99    1.388 ms
+  drawable wait          mean    0.019  p10    0.016  p50    0.018  p90    0.022  p99    0.031 ms
+  tick to commit         mean    0.054  p10    0.046  p50    0.053  p90    0.064  p99    0.078 ms
+  commit to GPU end      mean    0.965  p10    0.701  p50    0.953  p90    1.322  p99    1.665 ms
+  GPU end to shown       mean   31.765  p10   31.421  p50   31.774  p90   32.030  p99   32.401 ms
+  client to shown        mean   33.449  p10   32.901  p50   33.339  p90   33.962  p99   34.217 ms
+  per frame: 1.0 command buffers, 18 draws, 222 commands, 0 maps, 0 updates, 18 target changes, 1.0 flushes
+  passes of the commonest frame (218 of 218 looked at; 1 shapes), nominal traffic 323.7 MB:
+      1 render: 1 draws | RGBA8 1705x1109 clear/store | depth D32FS8 1705x1109 clear/store | stencil D32FS8 1705x1109 clear/store  (17.0 MB)  [GPU vertex 0.006 fragment 0.038 ms]
+      2 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.008 ms]
+      3 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.005 fragment 0.105 ms]
+      4 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      5 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.005 fragment 0.082 ms]
+      6 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+      7 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.005 fragment 0.084 ms]
+      8 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      9 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.005 fragment 0.082 ms]
+     10 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+     11 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.005 fragment 0.083 ms]
+     12 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+     13 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.005 fragment 0.084 ms]
+     14 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     15 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.005 fragment 0.085 ms]
+     16 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+     17 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.005 fragment 0.083 ms]
+     18 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.005 fragment 0.039 ms]
+     19 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.087 fragment 0.000 ms]
+
+== msaa-full8-free (2735 frames, fps=1093.67 record_ms=0.030 present_ms=0.865): 2735 presented frames, 2735 joined end to end, 2584 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.914 ms, 1093.8/s
+  FENCE WAIT             mean    0.909  p10    0.645  p50    0.861  p90    1.181  p99    1.868 ms  100.0 %
+  replay tail            mean   -0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms   -0.1 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  encode                 mean    0.008  p10    0.000  p50    0.000  p90    0.000  p99    0.248 ms    0.9 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.019  p10    0.000  p50    0.000  p90    0.063  p99    0.246 ms    2.1 %
+  GPU execution          mean    0.745  p10    0.534  p50    0.742  p90    0.971  p99    1.196 ms   82.0 %
+  GPU end to notify      mean    0.081  p10    0.058  p50    0.068  p90    0.092  p99    0.245 ms    8.9 %
+  notify to retire       mean    0.019  p10    0.007  p50    0.011  p90    0.025  p99    0.097 ms    2.1 %
+  retire to vtest        mean    0.018  p10    0.008  p50    0.013  p90    0.030  p99    0.072 ms    2.0 %
+  vtest to guest wake    mean    0.020  p10    0.009  p50    0.014  p90    0.033  p99    0.091 ms    2.2 %
+  beside it:
+  GPU busy in the wait   mean    0.830  p10    0.542  p50    0.832  p90    1.103  p99    1.365 ms   91.3 %
+  GPU start to end       mean    1.017  p10    0.916  p50    1.007  p90    1.146  p99    1.315 ms
+  GPU busy per interval  mean    0.830  p10    0.542  p50    0.832  p90    1.103  p99    1.365 ms
+  GPU idle per interval  mean    0.084  p10    0.000  p50    0.012  p90    0.170  p99    0.790 ms
+  encode of the frame    mean    0.248  p10    0.182  p50    0.236  p90    0.323  p99    0.510 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.116  p10    0.065  p50    0.107  p90    0.153  p99    0.356 ms
+  after the fence:
+  to wsd                 mean    0.028  p10    0.018  p50    0.025  p90    0.043  p99    0.075 ms
+  to tick                mean    0.546  p10    0.062  p50    0.406  p90    0.906  p99    4.626 ms
+  drawable wait          mean    0.019  p10    0.015  p50    0.018  p90    0.022  p99    0.028 ms
+  tick to commit         mean    0.055  p10    0.046  p50    0.054  p90    0.065  p99    0.096 ms
+  commit to GPU end      mean    0.617  p10    0.335  p50    0.583  p90    0.942  p99    1.117 ms
+  GPU end to shown       mean   32.112  p10   31.782  p50   32.139  p90   32.391  p99   32.446 ms
+  client to shown        mean   33.377  p10   32.888  p50   33.247  p90   33.744  p99   37.471 ms
+  per frame: 1.0 command buffers, 18 draws, 201 commands, 0 maps, 0 updates, 18 target changes, 1.0 flushes
+  passes of the commonest frame (211 of 211 looked at; 1 shapes), nominal traffic 76.0 MB:
+      1 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      2 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      3 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.003 ms]
+      4 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      5 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      6 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      7 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      8 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.003 ms]
+      9 render: 9 draws | RGBA8 1705x1109 2x clear/store+resolve | depth D32FS8 1705x1109 2x clear/store | stencil D32FS8 1705x1109 2x clear/store  (41.6 MB)  [GPU vertex 0.026 fragment 0.546 ms]
+     10 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.006 fragment 0.042 ms]
+     11 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.081 fragment 0.085 ms]
+
+== msaa-full8-bound (1327 frames, fps=530.66 record_ms=0.074 present_ms=1.671): 1327 presented frames, 1327 joined end to end, 1176 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 1.885 ms, 530.6/s
+  FENCE WAIT             mean    1.852  p10    1.548  p50    1.642  p90    2.345  p99    5.434 ms  100.0 %
+  replay tail            mean    0.011  p10    0.000  p50    0.000  p90    0.000  p99    0.136 ms    0.6 %
+  encode queue           mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.032 ms    0.1 %
+  encode                 mean    0.022  p10    0.000  p50    0.000  p90    0.000  p99    0.613 ms    1.2 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.033  p10    0.000  p50    0.000  p90    0.000  p99    0.696 ms    1.8 %
+  GPU execution          mean    1.450  p10    1.326  p50    1.458  p90    1.655  p99    1.874 ms   78.3 %
+  GPU end to notify      mean    0.168  p10    0.068  p50    0.087  p90    0.274  p99    1.675 ms    9.0 %
+  notify to retire       mean    0.067  p10    0.010  p50    0.024  p90    0.120  p99    0.818 ms    3.6 %
+  retire to vtest        mean    0.048  p10    0.010  p50    0.027  p90    0.078  p99    0.470 ms    2.6 %
+  vtest to guest wake    mean    0.052  p10    0.013  p50    0.036  p90    0.073  p99    0.564 ms    2.8 %
+  beside it:
+  GPU busy in the wait   mean    1.653  p10    1.455  p50    1.619  p90    1.926  p99    2.754 ms   89.3 %
+  GPU start to end       mean    2.024  p10    1.653  p50    1.997  p90    2.397  p99    2.986 ms
+  GPU busy per interval  mean    1.654  p10    1.456  p50    1.619  p90    1.926  p99    2.754 ms
+  GPU idle per interval  mean    0.230  p10    0.000  p50    0.000  p90    0.527  p99    4.451 ms
+  encode of the frame    mean    0.541  p10    0.327  p50    0.502  p90    0.769  p99    1.158 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.209  p10    0.090  p50    0.160  p90    0.299  p99    1.193 ms
+  after the fence:
+  to wsd                 mean    0.058  p10    0.026  p50    0.058  p90    0.081  p99    0.130 ms
+  to tick                mean    1.233  p10    0.214  p50    1.034  p90    1.892  p99    7.913 ms
+  drawable wait          mean    0.026  p10    0.019  p50    0.024  p90    0.034  p99    0.052 ms
+  tick to commit         mean    0.084  p10    0.057  p50    0.077  p90    0.118  p99    0.221 ms
+  commit to GPU end      mean    0.640  p10    0.380  p50    0.570  p90    0.987  p99    1.298 ms
+  GPU end to shown       mean   32.043  p10   31.692  p50   32.122  p90   32.311  p99   32.395 ms
+  client to shown        mean   34.083  p10   33.078  p50   33.892  p90   34.706  p99   40.748 ms
+  per frame: 1.0 command buffers, 18 draws, 231 commands, 0 maps, 0 updates, 18 target changes, 1.0 flushes
+  passes of the commonest frame (222 of 222 looked at; 1 shapes), nominal traffic 681.1 MB:
+      1 render: 1 draws | RGBA8 1705x1109 2x clear/store+resolve | depth D32FS8 1705x1109 2x clear/store | stencil D32FS8 1705x1109 2x clear/store  (41.6 MB)  [GPU vertex 0.006 fragment 0.115 ms]
+      2 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.005 ms]
+      3 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.006 fragment 0.172 ms]
+      4 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+      5 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.006 fragment 0.161 ms]
+      6 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+      7 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.006 fragment 0.158 ms]
+      8 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+      9 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.006 fragment 0.162 ms]
+     10 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+     11 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.006 fragment 0.163 ms]
+     12 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+     13 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.006 fragment 0.157 ms]
+     14 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+     15 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.006 fragment 0.155 ms]
+     16 render: 1 draws | RGBA8 256x256 load/store  (0.5 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+     17 render: 1 draws | RGBA8 1705x1109 2x load/store+resolve | depth D32FS8 1705x1109 2x load/store | stencil D32FS8 1705x1109 2x load/store  (75.6 MB)  [GPU vertex 0.006 fragment 0.155 ms]
+     18 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.006 fragment 0.046 ms]
+     19 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.090 fragment 0.000 ms]
+
+== upload8 (2982 frames, fps=1192.79 record_ms=0.014 present_ms=0.816): 2982 presented frames, 2982 joined end to end, 2831 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 0.838 ms, 1192.8/s
+  FENCE WAIT             mean    0.828  p10    0.761  p50    0.806  p90    0.915  p99    1.331 ms  100.0 %
+  replay tail            mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.003 ms    0.0 %
+  encode queue           mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.006 ms    0.0 %
+  encode                 mean    0.007  p10    0.000  p50    0.000  p90    0.000  p99    0.152 ms    0.9 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.113  p10    0.058  p50    0.109  p90    0.171  p99    0.254 ms   13.7 %
+  GPU execution          mean    0.621  p10    0.584  p50    0.615  p90    0.660  p99    0.855 ms   75.0 %
+  GPU end to notify      mean    0.065  p10    0.052  p50    0.060  p90    0.077  p99    0.145 ms    7.8 %
+  notify to retire       mean    0.006  p10    0.004  p50    0.005  p90    0.008  p99    0.030 ms    0.8 %
+  retire to vtest        mean    0.007  p10    0.005  p50    0.006  p90    0.008  p99    0.025 ms    0.8 %
+  vtest to guest wake    mean    0.008  p10    0.005  p50    0.006  p90    0.009  p99    0.036 ms    1.0 %
+  beside it:
+  GPU busy in the wait   mean    0.629  p10    0.584  p50    0.616  p90    0.701  p99    0.956 ms   75.9 %
+  GPU start to end       mean    0.637  p10    0.587  p50    0.618  p90    0.697  p99    1.016 ms
+  GPU busy per interval  mean    0.629  p10    0.584  p50    0.616  p90    0.700  p99    0.955 ms
+  GPU idle per interval  mean    0.210  p10    0.142  p50    0.191  p90    0.274  p99    0.698 ms
+  encode of the frame    mean    0.137  p10    0.119  p50    0.130  p90    0.157  p99    0.259 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.050  p10    0.037  p50    0.043  p90    0.070  p99    0.141 ms
+  after the fence:
+  to wsd                 mean    0.013  p10    0.009  p50    0.012  p90    0.017  p99    0.035 ms
+  to tick                mean    0.555  p10    0.097  p50    0.502  p90    0.841  p99    1.077 ms
+  drawable wait          mean    0.014  p10    0.011  p50    0.013  p90    0.018  p99    0.028 ms
+  tick to commit         mean    0.041  p10    0.033  p50    0.039  p90    0.053  p99    0.074 ms
+  commit to GPU end      mean    1.062  p10    0.871  p50    1.055  p90    1.266  p99    1.368 ms
+  GPU end to shown       mean   31.692  p10   31.492  p50   31.705  p90   31.871  p99   32.166 ms
+  client to shown        mean   33.377  p10   32.920  p50   33.328  p90   33.652  p99   33.899 ms
+  per frame: 1.0 command buffers, 10 draws, 102 commands, 0 maps, 0 updates, 2 target changes, 1.0 flushes
+  passes of the commonest frame (213 of 213 looked at; 1 shapes), nominal traffic 285.5 MB:
+      1 blit: 1 ops  (0.0 MB)  [GPU vertex 0.003 fragment 0.115 ms]
+      2 render: 2 draws | RGBA8 1705x1109 clear/store | depth D32FS8 1705x1109 clear/store | stencil D32FS8 1705x1109 clear/store  (17.0 MB)  [GPU vertex 0.005 fragment 0.038 ms]
+      3 blit: 1 ops  (0.0 MB)  [GPU vertex 0.003 fragment 0.172 ms]
+      4 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      5 blit: 1 ops  (0.0 MB)  [GPU vertex 0.003 fragment 0.170 ms]
+      6 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      7 blit: 1 ops  (0.0 MB)  [GPU vertex 0.003 fragment 0.160 ms]
+      8 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+      9 blit: 1 ops  (0.0 MB)  [GPU vertex 0.003 fragment 0.155 ms]
+     10 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     11 blit: 1 ops  (0.0 MB)  [GPU vertex 0.003 fragment 0.155 ms]
+     12 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     13 blit: 1 ops  (0.0 MB)  [GPU vertex 0.003 fragment 0.154 ms]
+     14 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.003 fragment 0.004 ms]
+     15 blit: 1 ops  (0.0 MB)  [GPU vertex 0.003 fragment 0.154 ms]
+     16 render: 1 draws | RGBA8 1705x1109 load/store | depth D32FS8 1705x1109 load/store | stencil D32FS8 1705x1109 load/store  (34.0 MB)  [GPU vertex 0.002 fragment 0.004 ms]
+     17 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.005 fragment 0.043 ms]
+     18 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.081 fragment 0.046 ms]
+
+== heavy60 (696 frames, fps=278.10 record_ms=0.112 present_ms=3.419): 696 presented frames, 696 joined end to end, 545 replaced in wsd, 151 shown
+interval (post-fence stamp to post-fence stamp): mean 3.599 ms, 277.9/s
+  FENCE WAIT             mean    3.589  p10    3.248  p50    3.527  p90    3.991  p99    5.042 ms  100.0 %
+  replay tail            mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.011 ms    0.0 %
+  encode queue           mean    0.001  p10    0.000  p50    0.000  p90    0.000  p99    0.011 ms    0.0 %
+  encode                 mean    0.012  p10    0.000  p50    0.000  p90    0.000  p99    0.259 ms    0.3 %
+  pipeline wait          mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms    0.0 %
+  queue to GPU start     mean    0.019  p10    0.000  p50    0.000  p90    0.000  p99    0.322 ms    0.5 %
+  GPU execution          mean    3.331  p10    3.070  p50    3.302  p90    3.730  p99    3.880 ms   92.8 %
+  GPU end to notify      mean    0.119  p10    0.078  p50    0.101  p90    0.134  p99    0.578 ms    3.3 %
+  notify to retire       mean    0.033  p10    0.011  p50    0.020  p90    0.043  p99    0.222 ms    0.9 %
+  retire to vtest        mean    0.035  p10    0.011  p50    0.024  p90    0.053  p99    0.262 ms    1.0 %
+  vtest to guest wake    mean    0.040  p10    0.012  p50    0.035  p90    0.069  p99    0.143 ms    1.1 %
+  beside it:
+  GPU busy in the wait   mean    3.538  p10    3.237  p50    3.507  p90    3.921  p99    4.503 ms   98.6 %
+  GPU start to end       mean    5.962  p10    5.274  p50    6.071  p90    6.697  p99    7.591 ms
+  GPU busy per interval  mean    3.537  p10    3.237  p50    3.506  p90    3.915  p99    4.473 ms
+  GPU idle per interval  mean    0.062  p10    0.000  p50    0.000  p90    0.180  p99    0.847 ms
+  encode of the frame    mean    0.190  p10    0.088  p50    0.201  p90    0.279  p99    0.451 ms
+  pipelines of the frame mean    0.000  p10    0.000  p50    0.000  p90    0.000  p99    0.000 ms
+  ring decode            mean    0.202  p10    0.104  p50    0.185  p90    0.271  p99    0.710 ms
+  after the fence:
+  to wsd                 mean    0.052  p10    0.024  p50    0.051  p90    0.079  p99    0.117 ms
+  to tick                mean    1.916  p10    0.444  p50    1.895  p90    3.227  p99    3.985 ms
+  drawable wait          mean    0.022  p10    0.016  p50    0.021  p90    0.028  p99    0.042 ms
+  tick to commit         mean    0.075  p10    0.050  p50    0.072  p90    0.115  p99    0.143 ms
+  commit to GPU end      mean    2.243  p10    0.472  p50    2.229  p90    3.719  p99    4.086 ms
+  GPU end to shown       mean   30.454  p10   28.958  p50   30.464  p90   32.218  p99   32.457 ms
+  client to shown        mean   34.763  p10   33.296  p50   34.755  p90   36.085  p99   36.818 ms
+  per frame: 1.0 command buffers, 61 draws, 506 commands, 0 maps, 0 updates, 2 target changes, 1.0 flushes
+  passes of the commonest frame (232 of 232 looked at; 1 shapes), nominal traffic 71.9 MB:
+      1 render: 60 draws | RGBA8 1705x1109 2x clear/store+resolve | depth D32FS8 1705x1109 2x clear/store | stencil D32FS8 1705x1109 2x clear/store  (41.6 MB)  [GPU vertex 0.168 fragment 3.326 ms]
+      2 render: 1 draws | RGBA8 1705x1109 load/store  (15.1 MB)  [GPU vertex 0.006 fragment 0.141 ms]
+      3 blit: 1 ops, 1890845 px copied  (15.1 MB)  [GPU vertex 0.089 fragment 0.173 ms]
