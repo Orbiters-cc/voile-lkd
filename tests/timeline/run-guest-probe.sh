@@ -31,15 +31,18 @@ one released-off released "$LAUNCH"
 one timeline-off timeline "$LAUNCH"
 one timeline-on timeline "$LAUNCH" OBELISK_TIMELINE="$D/on" OBELISK_TIMELINE_MB=64 OBELISK_TIMELINE_PASSES=8
 one timeline-half timeline "$LAUNCH" OBELISK_TIMELINE_MB=64 OBELISK_TIMELINE_PASSES=8
+one switches timeline "$LAUNCH" OBELISK_WSD_UPSCALE=metalfx OBELISK_WSD_PRESENT=arrival
 status=0
-for name in ${RELEASED:+released-script} timeline-off timeline-on timeline-half; do
+for name in ${RELEASED:+released-script} timeline-off timeline-on timeline-half switches; do
     if diff "$D/out/released-off.txt" "$D/out/$name.txt" > "$D/out/$name.diff"; then
         echo "identical: $name ($(wc -l < "$D/out/$name.txt" | tr -d ' ') lines: $(cut -d' ' -f1 "$D/out/$name.txt" | sort | uniq -c | awk '{printf "%s%s %s", s, $1, $2; s=", "}'))"
     else
         echo "DIFFERENT: $name"; cat "$D/out/$name.diff"; status=1
     fi
 done
-grep -l OBELISK_TIMELINE "$D"/out/*.txt && { echo "THE GAME SEES THE TIMELINE'S VARIABLES"; status=1; }
+grep -lE "OBELISK_(TIMELINE|WSD)" "$D"/out/*.txt && { echo "THE GAME SEES THE TIMELINE'S VARIABLES"; status=1; }
+grep -q "wsd: switches: upscale metalfx (MetalFX), present arrival" "$D/out/switches.log" || { echo "the window server had no switches"; status=1; }
+grep -l "wsd: switches" "$D/out/released-off.log" "$D/out/timeline-off.log" "$D/out/timeline-on.log" && { echo "a window server had switches nobody gave"; status=1; }
 echo "recorded with the recorder on: $(ls "$D"/on/*/ 2>/dev/null | tr '\n' ' ')"
 ls "$D"/on/*/otl-wsd-*.bin >/dev/null 2>&1 || { echo "the recorder was not on"; status=1; }
 exit $status
