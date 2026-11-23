@@ -4,7 +4,8 @@
  * Every Wine program sends its own icon as it attaches, a game's helpers too: on 2026-11-23 VRChat's yt-dlp.exe,
  * started by a world's video player, took the Dock from the game. Two synthetic clients of one wsd, each with its own
  * icon (A 64x64, B 32x32), interleave what a game and its helpers do: icons before and after windows, windows shown
- * and hidden, an overlay plane (a swapchain) created, removed and created again, a second icon, a disconnection.
+ * and hidden, an overlay plane (a swapchain) created, removed and created again, a second icon, a disconnection, and the
+ * last client with an icon leaving while one without stays (the bundle's icon comes back).
  * After each step the icon wsd shows is read from its log ("application icon shown: client <pid>'s <w>x<h>").
  *
  * Build: clang -O2 -Wall -o wsd_icon wsd_icon.c
@@ -167,6 +168,7 @@ static unsigned shown_now(void)
     char line[512];
     unsigned side = 0;
     while (fgets(line, sizeof line, f)) {
+        if (strstr(line, "application icon reset to the bundle's")) { side = 0; continue; }
         char *p = strstr(line, "application icon shown: client ");
         if (!p) continue;
         p = strstr(p, "'s ");
@@ -221,7 +223,14 @@ int main(int argc, char **argv)
     expect("B hides its window: B's stays", 32, a, b);
     close(b);
     expect("B disconnects: A's latest", 48, a, -1);
+    /* fourth verification, finding 15: when no client with an icon remains, the departed one's goes too */
+    int c = client();
+    connect_to(c, argv[1]);
+    window(c, 1);
+    expect("C, without an icon, shows a window: A's stays", 48, a, c);
     close(a);
+    expect("A disconnects, C has none: the bundle's own icon", 0, c, -1);
+    close(c);
     printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
 }
