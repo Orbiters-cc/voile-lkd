@@ -35,4 +35,4 @@ Any of, separated by commas:
 - `attime`: presented with `presentDrawable:atTime:` for the next refresh the display link names.
 - `nosync`: `displaySyncEnabled` off. `two`: two drawables instead of three. For measurements.
 
-What each gives: `tests/timeline/results/2026-11-24.md`.
+What each gives: `tests/timeline/results/2026-11-23-switches.md`.
