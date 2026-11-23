@@ -24,6 +24,8 @@ def record(session, phase, pid, **more):
 
 
 def play(words):
+    # (a game's supervisor lives on when whoever started it is told to stop: so does what stands in for it here)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     percent = int(words[words.index("--render-percent") + 1]) if "--render-percent" in words else 100
     link = words[-1]
     session = str(uuid.uuid4())
@@ -32,7 +34,7 @@ def play(words):
     for folder in (logs, vrchat):
         os.makedirs(folder, exist_ok=True)
     child = subprocess.Popen([CONFIG["cli"], "engine", "rehearse", CONFIG["install"], f"{CONFIG['install']}/pass_costs.exe", str(percent),
-                              f"{logs}/wine-438100.log", "--", str(CONFIG["seconds"]), "0", CONFIG["mode"]], stdout=subprocess.PIPE, text=True)
+                              f"{logs}/wine-438100.log", "--", str(CONFIG["seconds"]), "0", CONFIG["mode"]], stdout=subprocess.PIPE, text=True, start_new_session=True)
     tell(event="starting", app_id=438100, session_id=session)
     pid = None
     for line in child.stdout:

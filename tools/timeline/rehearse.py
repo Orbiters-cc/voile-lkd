@@ -49,7 +49,13 @@ def main():
     command = ["/usr/bin/python3", "-I", os.path.join(HERE, "real_session.py"), "vrchat://launch?ref=orbiters.cc&id=wrld_00000000-0000-0000-0000-000000000000:12345~private(usr_rehearsal)~region(eu)",
                "--rehearse", "--cli", stub, "--generation", os.path.abspath(a.generation), "--bench", os.path.abspath(a.bench), "--out", os.path.join(out, "evidence"),
                "--plan", a.plan, "--warm", "4", "--window", str(a.window), "--windows", str(a.windows), "--between", "5", "--passes", a.passes]
-    status = subprocess.run(command, env=env).returncode
+    runner = subprocess.Popen(command, env=env)
+    while True:
+        try:
+            status = runner.wait()
+            break
+        except KeyboardInterrupt:
+            pass  # (the runner's to handle)
     last = json.loads((engine("released").strip() or "{}").splitlines()[-1])
     print("the released generation last:", last.get("event"), last.get("generation"))
     before = json.loads(first.strip().splitlines()[-1]).get("engine_files")

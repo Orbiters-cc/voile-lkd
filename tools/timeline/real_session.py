@@ -41,7 +41,19 @@ def run(cmd, timeout=15, env=None):
 
 
 def say(text):
-    print(f"{datetime.datetime.now():%H:%M:%S} {text}", flush=True)
+    """Told, when anyone still listens: a terminal that is gone stops nothing, the revert least of all."""
+    try:
+        print(f"{datetime.datetime.now():%H:%M:%S} {text}", flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+signalled = []  # what this program was told to stop with
+
+
+def interrupted(number, _):
+    signalled.append(number)
+    raise KeyboardInterrupt
 
 
 def sha(path):
@@ -159,9 +171,9 @@ class Session:
             say(f"not yet: {json.dumps(events[-1:])[:300]} {wrong}")
             time.sleep(15 if not self.a.rehearse else 2)
         write(f"{self.out}/revert.json", events)
-        print("\nTHE RELEASED ENGINE FILES ARE NOT BACK. Close VRChat, then run:\n"
-              f"  OBELISK_DEVELOPER_ENGINE=released OBELISK_DEVELOPER_ENGINE_FILES='{self.a.generation}' '{self.a.cli}' engine generation\n"
-              "or: obelisk-cli engine repair", file=sys.stderr)
+        say("THE RELEASED ENGINE FILES ARE NOT BACK. Close VRChat, then run:\n"
+            f"  OBELISK_DEVELOPER_ENGINE=released OBELISK_DEVELOPER_ENGINE_FILES='{self.a.generation}' '{self.a.cli}' engine generation\n"
+            "or: obelisk-cli engine repair")
         return False
 
     def images(self, pid, name):
@@ -240,24 +252,25 @@ class Session:
         stop = threading.Event()
         watcher = threading.Thread(target=self.conditions, args=(folder, stop), daemon=True)
         watcher.start()
-        status, interrupted = None, None
+        status, cut = None, None
         with open(os.open(f"{folder}/bench.log", os.O_WRONLY | os.O_CREAT, 0o600), "w") as log:
             bench = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
             while status is None:
                 try:
                     status = bench.wait()
                 except KeyboardInterrupt as e:
-                    if interrupted:
-                        raise
-                    interrupted = e  # (it got the same Ctrl-C: it quits its own session, and that is waited for)
-                    say("interrupted: the bench quits its session")
+                    if cut is None:
+                        # It quits its own session, whoever was told to stop, and that is waited for (it has deadlines).
+                        cut = e
+                        say("interrupted: the bench quits its session")
+                        if signalled[-1:] != [signal.SIGINT]:
+                            bench.send_signal(signal.SIGINT)
         stop.set()
         watcher.join(40)
         self.keep(folder)
-        report = self.report(folder, trace, percent, status)
-        if interrupted:
-            raise interrupted
-        return report
+        if cut is not None:
+            raise cut
+        return self.report(folder, trace, percent, status)
 
     def keep(self, folder):
         """The session's own logs, as they are now."""
@@ -353,7 +366,9 @@ class Session:
             print("Not started:\n  " + "\n  ".join(problems), file=sys.stderr)
             return 1
         os.makedirs(self.out, mode=0o700)
-        awake = subprocess.Popen(["/usr/bin/caffeinate", "-dimsu"])
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(number, interrupted)
+        awake = subprocess.Popen(["/usr/bin/caffeinate", "-dimsu", "-w", str(os.getpid())], stdout=subprocess.DEVNULL)  # (gone with this program)
         results = []
         try:
             write(f"{self.out}/manifest.json", dict(
@@ -387,7 +402,8 @@ class Session:
         except KeyboardInterrupt:
             say("interrupted")
         finally:
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(number, signal.SIG_IGN)
             back = self.revert() if self.installed else True
             awake.terminate()
             write(f"{self.out}/results.json", results)
