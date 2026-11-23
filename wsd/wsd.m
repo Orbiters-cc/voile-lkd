@@ -549,11 +549,53 @@ static void audio_clock_leave(WsdAudio *a) {
 @property IOPMAssertionID displayAssertion; /* SCREEN_SAVER 0 holds the display on, kIOPMNullAssertionID otherwise */
 @property BOOL dead;
 @property BOOL greeted; /* said HELLO: it is told the keyboard layout, and each change of it */
+@property(strong) NSImage *icon;  /* the last APP_ICON it sent, shown only by apply_app_icon() */
+@property uint32_t iconWidth, iconHeight;
+@property uint64_t iconSeq;       /* when it first sent one (order of arrival) */
+@property uint64_t shownSeq;      /* when one of its windows was first shown, 0 never */
 - (void)send:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
 - (void)sendKeymap;
 - (void)close;
 @end
 static void set_display_mode(WsdClient *client, uint32_t width, uint32_t height);
+
+/* The Dock and Cmd-Tab icon is one for the whole server, and every Wine program sends its own as it attaches (a
+ * game's helpers too: VRChat's yt-dlp.exe took the Dock on 2026-11-23). It shows the game's: the client whose window
+ * first got an overlay plane (a Direct3D swapchain) owns it until it disconnects, through swapchain rebuilds and
+ * hidden windows. Before there is a game, the client whose window was shown first; before any window, the icon shown
+ * stays, or the first one sent. A client without a window never takes it from one with a window. */
+static __weak WsdClient *g_icon_owner;   /* the game */
+static __weak WsdClient *g_icon_shown;
+static uint64_t g_icon_seq;
+static NSImage *g_icon_image;            /* the image set last */
+static void apply_app_icon(const char *why) {
+  WsdClient *pick = nil;
+  WsdClient *owner = g_icon_owner;
+  if (owner && !owner.dead && owner.icon) pick = owner;
+  if (!pick)
+    for (WsdClient *c in g_clients)
+      if (!c.dead && c.icon && c.shownSeq && (!pick || c.shownSeq < pick.shownSeq)) pick = c;
+  WsdClient *shown = g_icon_shown;
+  if (!pick && shown && !shown.dead && shown.icon) pick = shown;
+  if (!pick)
+    for (WsdClient *c in g_clients)
+      if (!c.dead && c.icon && (!pick || c.iconSeq < pick.iconSeq)) pick = c;
+  if (!pick) return;
+  if (pick == shown && g_icon_image == pick.icon) return;
+  g_icon_image = pick.icon;
+  NSApp.applicationIconImage = pick.icon;
+  g_icon_shown = pick;
+  LOG("application icon shown: client %d's %ux%u (%s%s)", pick.pid, pick.iconWidth, pick.iconHeight, why,
+      pick == owner ? ", the game's" : "");
+}
+
+/* A client's window got an overlay plane: the first such client is the game. */
+static void app_icon_game(WsdClient *c) {
+  WsdClient *owner = g_icon_owner;
+  if (owner && !owner.dead) return;
+  g_icon_owner = c;
+  apply_app_icon("its window presents");
+}
 
 /* The cursor is hidden while the client asks for it, unless one of its windows stopped showing frames. */
 static void sync_cursor(void) {
@@ -1509,6 +1551,8 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   close(self.fd);
   LOG("client %d disconnected", self.pid);
   [g_clients removeObject:self];
+  if (g_icon_owner == self) g_icon_owner = nil;
+  apply_app_icon("a client left");
   if (g_mode_owner == self) set_display_mode(nil, 0, 0); /* the game that switched the display is gone */
   if (g_terminate_pending && g_clients.count == 0) {
     g_terminate_pending = NO;
@@ -1690,9 +1734,13 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   CGColorSpaceRelease(srgb);
   CGDataProviderRelease(provider);
   if (!image) { [self error:WSD_APP_ICON code:-EINVAL]; return; }
-  NSApp.applicationIconImage = [[NSImage alloc] initWithCGImage:image size:NSZeroSize];
+  self.icon = [[NSImage alloc] initWithCGImage:image size:NSZeroSize];
+  self.iconWidth = a->width;
+  self.iconHeight = a->height;
+  if (!self.iconSeq) self.iconSeq = ++g_icon_seq;
   CGImageRelease(image);
   LOG("client %d: application icon %ux%u", self.pid, a->width, a->height);
+  apply_app_icon("an icon arrived");
 }
 
 - (void)attachBuffer:(const struct wsd_buffer_attach *)a {
@@ -1840,6 +1888,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
       }
       if (m->value == 1) [NSApp activate];
       [w orderInFront:m->value == 1];
+      if (!self.shownSeq) { self.shownSeq = ++g_icon_seq; apply_app_icon("a window was shown"); }
       [w sendResize];
       [w logState:"show"];
       __weak WsdWindow *ww = w;
@@ -2075,6 +2124,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     WsdBuffer *b = self.buffers[@(m->present.buffer_id)];
     if (!b) { [self error:type code:-ENOENT]; break; }
     WsdWindow *o = [w overlayAt:NSMakeRect(m->x, m->y, m->width, m->height)];
+    app_icon_game(self);
     if (o.pendingBuffer) {
       [o releaseBuffer:o.pendingBuffer serial:o.pendingSerial shown:NO];
       o.replaced++;
