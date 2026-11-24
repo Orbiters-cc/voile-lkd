@@ -113,6 +113,8 @@ the GPU's union of work a frame and the gaps between ready, encode and GPU start
 than 0.01 below the worse within-start mean, or its share of pixels more than 32 levels off is more than 1 point above it, or anything fixed (UI, geometry,
 textures, black areas) is missing in two of its three. A repeatable defect of a static scene is a rejection whatever the numbers are; a
 difference with no static region to compare is inconclusive.
+And by eye, in all three starts: a texture that is black, or a mesh that is missing, for a frame when it first appears (arrival, avatars loading). The released stack has that (immutable resources: the results of
+2026-11-24), the switch can make it more frequent, and the pictures are too late to show it.
 
 **What counts as a result**
 - **Provisional keep**: B beats **both** As in W2 and in W3: distinct shown rate up by at least 2 % and by more than the two As differ from
