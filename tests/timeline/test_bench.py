@@ -545,7 +545,7 @@ class WholeRun(unittest.TestCase):
             self.assertEqual((note["session"], bool(note["program"]["pid"]), bool(note["program"]["born"])), ("s-1", True, True))
             self.assertEqual(os.stat(f"{d}/note").st_mode & 0o777, 0o600)
             # whoever held the slot for it is gone: nothing is started, and nothing is noted
-            status, res, _ = self.run_with(args=("--slot-held", "--note", f"{d}/other", "--caller", "1"))
+            status, res, _ = self.run_with(args=("--slot-held", "--note", f"{d}/other", "--caller", str(os.getppid() + 1)))
             self.assertEqual((status, res, self.argv, os.path.exists(f"{d}/other")), (6, None, [], False))
 
     def test_told_to_stop_it_ends_its_session_once_it_knows_it(self):
