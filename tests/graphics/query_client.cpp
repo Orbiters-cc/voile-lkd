@@ -972,6 +972,8 @@ static void immutables_of() {
     uploads_of(locked, D3D11_USAGE_IMMUTABLE);
     told(locked ? "streamed, the device's lock on" : "streamed", 1);
   }
+  ID3D11Multithread *mt = nullptr; /* (as the host's: another thread updates what it makes) */
+  if (immutable_as_host) { HR(g.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt)); mt->SetMultithreadProtected(TRUE); }
   ID3D11Query *e = g.query(D3D11_QUERY_EVENT);
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> ahead{0};
@@ -1107,22 +1109,18 @@ static void immutables_of() {
   }
   stop = true;
   uploader.join();
+  if (mt) { mt->SetMultithreadProtected(FALSE); mt->Release(); }
   e->Release();
 }
 
 static void immutables() {
   immutables_of();
   if (!native) return;
-  ID3D11Multithread *mt; /* (another thread updates what it makes: the host's lock is on) */
-  HR(g.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt));
-  mt->SetMultithreadProtected(TRUE);
   g.clear(0, {{0, 0, 0, 255}});
   immutable_as_host = true;
   note("as Neptune's host makes them");
   immutables_of();
   immutable_as_host = false;
-  mt->SetMultithreadProtected(FALSE);
-  mt->Release();
 }
 
 /* An occlusion query whose draws are the last of their pass, and what is drawn after it on the same targets: exact counts. Its list executed once, twice,

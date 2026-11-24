@@ -68,8 +68,8 @@ DXMT's too (`src/dxmt/dxmt_init_order.hpp`), given the same way, apart from the 
 
 - A resource that is **immutable and made without its data** (none is, in Direct3D; every one Neptune's guest makes is, and its data are the update that follows) is not taken for one the GPU only
   reads: what it is written by is put in order with what reads it, as any other resource's, for the GPU and for the optimiser. Unset, a draw of the same frame may see what was there before.
-- A render pass whose last draws were counted by an **occlusion query** ends with the counting off. DXMT puts two passes of the same targets together by putting their commands together; unset, the first one's last
-  query goes on counting the second one's draws, until one of them begins to be counted itself.
+- Where two render passes of the same targets are put together (their commands are, one after the other), the counting of the first one's last draws by an **occlusion query** is turned off between them. Unset, that
+  query goes on counting the second one's draws, until one of them begins to be counted itself: a pass begins with the counting off, and does not say so.
 
 What it costs: the draws that read such a resource look its last write up, as they do for every other resource. Measured: `tests/timeline/results/2026-11-24-query-rescue.md`.
 
