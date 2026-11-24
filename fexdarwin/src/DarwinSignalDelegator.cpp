@@ -126,6 +126,59 @@ bool RestartReplaysPop(FEXCore::Core::InternalThreadState* Thread, uint64_t Host
   }
   return I < 14 && Code[I] == 0x8f && ((Code[I + 1] >> 3) & 7) == 0;
 }
+// A REP MOVS or STOS that faults after a part of it: x86 has RCX, RSI and RDI where it stopped, and goes on from there. FEXCore
+// translates the whole of it to one operation (MemCpy, MemSet of FEXCore's MemoryOps.cpp) that writes them at its end, so a
+// restart would begin again: a copy to a lower address over itself then reads what it has already written. x1 is the host
+// address of the destination's next element (TMP2), and no element at or after it has been copied.
+void CommitRepProgress(FEXCore::Core::InternalThreadState* Thread, ucontext_t* Uc) {
+  // The host access that faulted, with its base: x1 (the destination), or x2 (the source of a copy).
+  const uint32_t Insn = GuardedLoadPatch::InstructionAt(DarwinCtx::GetPc(Uc));
+  const uint32_t Rn = (Insn >> 5) & 31;
+  const bool Pair = (Insn & 0xff800000) == 0xac800000;   // LDP/STP Q, post-index
+  const bool Single = (Insn & 0x3f200c00) == 0x38000400; // LDR/STR of 1, 2, 4 or 8 bytes, post-index
+  const bool Ordered = (Insn & 0x3fbffc00) == 0x089ffc00 || (Insn & 0x3ffffc00) == 0x38bfc000; // STLR, LDAR, LDAPR
+  if (!(Pair || Single || Ordered) || (Rn != 1 && Rn != 2)) return;
+
+  // The guest instruction. Its page may be one that the host cannot read (a guarded page) or that is gone by now.
+  auto& State = Thread->CurrentFrame->State;
+  uint8_t Code[16] {}; // the zeros after it are no REP MOVS or STOS
+  const uint64_t InPage = std::min<uint64_t>(sizeof(Code) - 1, 0x1000 - (State.rip & 0xfff));
+  mach_vm_size_t Got = 0;
+  if ((mach_vm_read_overwrite(mach_task_self(), reinterpret_cast<uint64_t>(FEXCore::G2H(State.rip)), InPage,
+                              reinterpret_cast<uint64_t>(Code), &Got) != KERN_SUCCESS || Got != InPage) &&
+      !(LkdEnabled() && fexdarwin_lkd_guard_read(State.rip, Code, InPage) == 1)) {
+    return;
+  }
+  bool Rep = false, Operand16 = false, Rex64 = false;
+  size_t I = 0;
+  for (; I < 13; ++I) {
+    const uint8_t B = Code[I];
+    if (B == 0xf2 || B == 0xf3) Rep = true;
+    else if (B == 0x66) Operand16 = true;
+    else if (!(B == 0x26 || B == 0x2e || B == 0x36 || B == 0x3e || B == 0x64 || B == 0x65)) break;
+  }
+  if (!Rep) return; // (an address-size prefix ends the loop and is no string instruction below)
+  if (State.cs_idx == GUEST_USER_CS && (Code[I] & 0xf0) == 0x40) {
+    Rex64 = Code[I] & 8;
+    ++I;
+  }
+  const uint8_t Op = Code[I];
+  const bool Movs = Op == 0xa4 || Op == 0xa5;
+  if (!Movs && (Rn != 1 || (Op != 0xaa && Op != 0xab))) return;
+  const uint64_t Size = !(Op & 1) ? 1 : Rex64 ? 8 : Operand16 ? 2 : 4;
+
+  const bool Backward = State.flags[FEXCore::X86State::RFLAG_DF_RAW_LOC] & 0x80;
+  uint64_t Next = FEXCore::H2G(reinterpret_cast<void*>(DarwinCtx::GetReg(Uc, 1)));
+  if (Pair && Backward) Next += 32 - Size; // 32 bytes at a time, from the lowest of them
+  auto& Rcx = State.gregs[FEXCore::X86State::REG_RCX];
+  auto& Rsi = State.gregs[FEXCore::X86State::REG_RSI];
+  auto& Rdi = State.gregs[FEXCore::X86State::REG_RDI];
+  const uint64_t Done = Backward ? Rdi - Next : Next - Rdi;
+  if (Done % Size || Done / Size > Rcx) return; // not what this was written for
+  Rcx -= Done / Size;
+  Rdi = Next;
+  if (Movs) Rsi += Backward ? -Done : Done;
+}
 } // namespace
 
 void DarwinSignalDelegator::Install() {
@@ -180,8 +233,18 @@ void DarwinSignalDelegator::UnregisterThread(GuestThread* T) {
 }
 
 void DarwinSignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, ucontext_t* Uc, uint32_t IgnoreMask) {
+  bool CarryNotInverted;
+  const uint64_t Rip = G->CTX->RestoreRIPFromHostPC(Thread, DarwinCtx::GetPc(Uc), &CarryNotInverted);
+  SpillSRAAt(Thread, Uc, IgnoreMask, Rip, CarryNotInverted);
+  if (!IgnoreMask) {
+    CommitRepProgress(Thread, Uc);
+  }
+}
+
+void DarwinSignalDelegator::SpillSRAAt(FEXCore::Core::InternalThreadState* Thread, ucontext_t* Uc, uint32_t IgnoreMask, uint64_t Rip,
+                                       bool CarryNotInverted) {
   auto& State = Thread->CurrentFrame->State;
-  State.rip = G->CTX->RestoreRIPFromHostPC(Thread, DarwinCtx::GetPc(Uc));
+  State.rip = Rip;
   for (size_t i = 0; i < Config.SRAGPRCount; i++) {
     const uint8_t Idx = Config.SRAGPRMapping[i];
     if (IgnoreMask & (1U << Idx)) {
@@ -199,7 +262,9 @@ void DarwinSignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread,
       memcpy(&State.xmm.sse.data[i][0], &Fpr, sizeof(Fpr));
     }
   }
-  const uint32_t EFlags = G->CTX->ReconstructCompactedEFLAGS(Thread, true, DarwinCtx::GPRs(Uc), DarwinCtx::GetPState(Uc));
+  // FEXCore takes the carry of PSTATE for the opposite of the guest's, which it is not everywhere inside a block.
+  const uint64_t PState = DarwinCtx::GetPState(Uc) ^ (CarryNotInverted ? 1ULL << 29 : 0);
+  const uint32_t EFlags = G->CTX->ReconstructCompactedEFLAGS(Thread, true, DarwinCtx::GPRs(Uc), PState);
   G->CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
 }
 
@@ -227,16 +292,17 @@ bool DarwinSignalDelegator::RedirectFromJit(GuestThread* T, ucontext_t* Uc, uint
   if (Frame->State.DeferredSignalRefCount.Load() != 0 || Frame->InSyscallInfo != 0) {
     return false;
   }
-  // Only at the first host instruction of a guest instruction: anywhere else the translation of an x86 instruction may be
-  // half done (a register already written, flags not yet), and FEX's RIP reconstruction ("as close as FEX can get")
-  // would restart the instruction after the handler and apply it twice. The caller retries until the thread is at a
-  // boundary (the kick retry thread resends the host signal every millisecond).
+  // Only at the first host instruction of a guest instruction, and only where the state there is exactly x86's before it:
+  // anywhere else the translation of an x86 instruction may be half done (a register already written, flags not yet), merged
+  // with its neighbour's or still to be written to the context, and FEX's RIP reconstruction ("as close as FEX can get")
+  // would restart the instruction after the handler and apply it twice, or without what came before it. The caller retries
+  // until the thread is at a boundary (the kick retry thread resends the host signal every millisecond).
   uint64_t BoundaryRip;
-  if (!G->CTX->IsHostPCAtGuestInstructionBoundary(Th, DarwinCtx::GetPc(Uc), &BoundaryRip)) {
+  bool CarryNotInverted;
+  if (!G->CTX->IsHostPCAtGuestInstructionBoundary(Th, DarwinCtx::GetPc(Uc), &BoundaryRip, &CarryNotInverted)) {
     return false;
   }
-  SpillSRA(Th, Uc, 0);
-  Frame->State.rip = BoundaryRip;
+  SpillSRAAt(Th, Uc, 0, BoundaryRip, CarryNotInverted);
   // The interrupted block is abandoned: restart from the dispatcher's own stack position, like a synchronous fault.
   DarwinCtx::SetSp(Uc, Frame->ReturningStackLocation);
   DarwinCtx::SetReg(Uc, 0, reinterpret_cast<uint64_t>(T));

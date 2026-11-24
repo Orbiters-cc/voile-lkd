@@ -17,6 +17,8 @@ public:
   // Copies the statically allocated registers and flags out of a host signal context into the thread state, so the guest
   // state in Thread->CurrentFrame->State is exact at the faulting instruction (port of SignalDelegator::SpillSRA).
   void SpillSRA(FEXCore::Core::InternalThreadState* Thread, ucontext_t* Uc, uint32_t IgnoreMask);
+  // The same at a guest instruction whose address and whose form of the carry flag are known.
+  void SpillSRAAt(FEXCore::Core::InternalThreadState* Thread, ucontext_t* Uc, uint32_t IgnoreMask, uint64_t Rip, bool CarryNotInverted);
 
   // Invalidate the translations of [Start, Start + Len) in every thread, then run After while the locks are held.
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Len,

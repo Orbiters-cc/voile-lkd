@@ -1,0 +1,318 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Tue, 24 Nov 2026 22:31:42 +0100
+Subject: [PATCH] OpcodeDispatcher: what a restarted instruction needs is kept
+ until its store is done
+
+A store of the translation can fault, and the guest restart the instruction at its address. pop [mem] had moved
+the stack pointer, adc/sbb/rcl/rcr/inc/dec [mem] had replaced the carry.
+---
+ .../Interface/Core/OpcodeDispatcher.cpp       | 129 ++++++++++++++++--
+ 1 file changed, 114 insertions(+), 15 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 84fa3687b..f9823c536 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -262,6 +262,12 @@ void OpDispatchBuilder::ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
+     Before = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
+   }
+ 
++  const bool StoreFirst = DestIsMem(Op) && !DestIsLockedMem(Op) && !DestRAX;
++  if (StoreFirst) {
++    // Darwin port: the store can fault and the instruction be started again, with the carry it adds (BeginGuestInstruction).
++    StoreResultGPR(Op, Add(OpSize, Before, IncrementByCarry(OpSize, Src)));
++  }
++
+   Ref Result;
+   if (!DestIsLockedMem(Op) && Op->Src[SrcIndex].IsLiteral() && Op->Src[SrcIndex].Literal() == 0 && Size >= OpSize::i32Bit) {
+     HandleNZCV_RMW();
+@@ -276,7 +282,7 @@ void OpDispatchBuilder::ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
+ 
+   if (DestRAX) {
+     StoreGPRResultWithZExtSemantics(X86State::REG_RAX, Result, OpSizeFromDst(Op));
+-  } else if (!DestIsLockedMem(Op)) {
++  } else if (!DestIsLockedMem(Op) && !StoreFirst) {
+     StoreResultGPR(Op, Result);
+   }
+ }
+@@ -303,11 +309,17 @@ void OpDispatchBuilder::SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
+     Before = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
+   }
+ 
++  const bool StoreFirst = DestIsMem(Op) && !DestIsLockedMem(Op) && !DestRAX;
++  if (StoreFirst) {
++    // Darwin port: as in ADC.
++    StoreResultGPR(Op, Sub(OpSize, Before, IncrementByCarry(OpSize, Src)));
++  }
++
+   Result = CalculateFlags_SBB(Size, Before, Src);
+ 
+   if (DestRAX) {
+     StoreGPRResultWithZExtSemantics(X86State::REG_RAX, Result, OpSizeFromDst(Op));
+-  } else if (!DestIsLockedMem(Op)) {
++  } else if (!DestIsLockedMem(Op) && !StoreFirst) {
+     StoreResultGPR(Op, Result);
+   }
+ }
+@@ -413,6 +425,20 @@ void OpDispatchBuilder::PUSHSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
+ }
+ 
+ void OpDispatchBuilder::POPOp(OpcodeArgs) {
++  if (DestIsMem(Op)) {
++    // Darwin port: the stack pointer moves after the store, which can fault and be started again (BeginGuestInstruction).
++    // The address is computed with the stack pointer moved, as x86 does.
++    const auto Size = OpSizeFromSrc(Op);
++    Ref SP = LoadGPRRegister(X86State::REG_RSP);
++    Ref Value = _LoadMem(RegClass::GPR, Size, SP, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
++    StoreGPRRegister(X86State::REG_RSP, Add(GetGPROpSize(), SP, IR::OpSizeToSize(Size)));
++    StoreResultGPR(Op, Value);
++    // Computed again: the allocator puts a value into the register it is stored to where it is made, which is before the
++    // store above.
++    StoreGPRRegister(X86State::REG_RSP, Add(GetGPROpSize(), SP, IR::OpSizeToSize(Size)));
++    return;
++  }
++
+   Ref Value = Pop(OpSizeFromSrc(Op));
+   StoreResultGPR(Op, Value);
+ }
+@@ -2040,7 +2066,10 @@ void OpDispatchBuilder::RCROp1Bit(OpcodeArgs) {
+   Ref Res;
+ 
+   // Our new CF will be bit 0 of the source. Set upfront to avoid a move.
+-  SetCFDirect(Dest, 0, true);
++  // Darwin port: but after a store, which can fault and is started again with the old one (BeginGuestInstruction).
++  if (!DestIsMem(Op)) {
++    SetCFDirect(Dest, 0, true);
++  }
+ 
+   uint32_t Shift = 1;
+ 
+@@ -2057,6 +2086,10 @@ void OpDispatchBuilder::RCROp1Bit(OpcodeArgs) {
+ 
+   StoreResultGPR(Op, Res);
+ 
++  if (DestIsMem(Op)) {
++    SetCFDirect(Dest, 0, true);
++  }
++
+   // OF is the top two MSBs XOR'd together
+   // Only when Shift == 1, it is undefined otherwise
+   SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(_XorShift(OpSize::i64Bit, Res, Res, ShiftType::LSR, 1), Size - 2, true);
+@@ -2071,7 +2104,10 @@ void OpDispatchBuilder::RCROp8x1Bit(OpcodeArgs) {
+   auto CF = GetRFLAG(FEXCore::X86State::RFLAG_CF_RAW_LOC);
+ 
+   // Our new CF will be bit (Shift - 1) of the source
+-  SetCFDirect(Dest, 0, true);
++  // Darwin port: after a store, as in RCROp1Bit.
++  if (!DestIsMem(Op)) {
++    SetCFDirect(Dest, 0, true);
++  }
+ 
+   // Rotate and insert CF in the upper bit
+   Ref Res = _Bfe(OpSize::i32Bit, 7, 1, Dest);
+@@ -2079,6 +2115,10 @@ void OpDispatchBuilder::RCROp8x1Bit(OpcodeArgs) {
+ 
+   StoreResultGPR(Op, Res);
+ 
++  if (DestIsMem(Op)) {
++    SetCFDirect(Dest, 0, true);
++  }
++
+   // OF is the top two MSBs XOR'd together
+   SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(_XorShift(OpSize::i32Bit, Res, Res, ShiftType::LSR, 1), SizeBit - 2, true);
+ }
+@@ -2119,11 +2159,19 @@ void OpDispatchBuilder::RCROp(OpcodeArgs, bool UseRCX) {
+       }
+ 
+       // Our new CF will be bit (Shift - 1) of the source.
+-      SetCFDirect(Dest, Const - 1, true);
++      // Darwin port: after a store, as in RCROp1Bit.
++      if (!DestIsMem(Op)) {
++        SetCFDirect(Dest, Const - 1, true);
++      }
+ 
+       // Since shift != 0 we can inject the CF
+       Res = _Orlshl(OpSize, Res, CF, Size - Const);
+ 
++      if (DestIsMem(Op)) {
++        StoreResultGPR(Op, Res);
++        SetCFDirect(Dest, Const - 1, true);
++      }
++
+       // OF is the top two MSBs XOR'd together
+       // Only when Shift == 1, it is undefined otherwise
+       if (Const == 1) {
+@@ -2131,7 +2179,9 @@ void OpDispatchBuilder::RCROp(OpcodeArgs, bool UseRCX) {
+         SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(Xor, Size - 2, true);
+       }
+ 
+-      StoreResultGPR(Op, Res);
++      if (!DestIsMem(Op)) {
++        StoreResultGPR(Op, Res);
++      }
+       return;
+     }
+   }
+@@ -2165,17 +2215,27 @@ void OpDispatchBuilder::RCROp(OpcodeArgs, bool UseRCX) {
+       // Our new CF will be bit (Shift - 1) of the source. this is hoisted up to
+       // avoid the need to copy the source. Again, the Lshr absorbs the masking.
+       auto NewCF = _Lshr(OpSize, Dest, Sub(OpSize, Src, 1));
+-      SetCFDirect(NewCF, 0, true);
++      // Darwin port: after a store, as in RCROp1Bit.
++      if (!DestIsMem(Op)) {
++        SetCFDirect(NewCF, 0, true);
++      }
+ 
+       // Since shift != 0 we can inject the CF
+       Res = _Or(OpSize, Res, _Lshl(OpSize, CF, NegSrc));
+ 
++      if (DestIsMem(Op)) {
++        StoreResultGPR(Op, Res);
++        SetCFDirect(NewCF, 0, true);
++      }
++
+       // OF is the top two MSBs XOR'd together
+       // Only when Shift == 1, it is undefined otherwise
+       auto Xor = _XorShift(OpSize, Res, Res, ShiftType::LSR, 1);
+       SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(Xor, Size - 2, true);
+ 
+-      StoreResultGPR(Op, Res);
++      if (!DestIsMem(Op)) {
++        StoreResultGPR(Op, Res);
++      }
+     },
+     OpSizeFromSrc(Op) == OpSize::i32Bit ? std::make_optional(&OpDispatchBuilder::ZeroShiftResult) : std::nullopt);
+ }
+@@ -2302,6 +2362,11 @@ void OpDispatchBuilder::RCLOp1Bit(OpcodeArgs) {
+   // TODO: Use `adc Res, xzr, Dest, lsl 1` to save an instruction
+   Ref Res = _Orlshl(OpSize, CF, Dest, 1);
+ 
++  // Darwin port: a store can fault and is started again with the old carry (BeginGuestInstruction).
++  if (DestIsMem(Op)) {
++    StoreResultGPR(Op, Res);
++  }
++
+   // Our new CF will be the top bit of the source
+   SetCFDirect(Dest, Size - 1, true);
+ 
+@@ -2309,7 +2374,9 @@ void OpDispatchBuilder::RCLOp1Bit(OpcodeArgs) {
+   // Top two MSBs is CF and top bit of result
+   SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(_Xor(OpSize, Res, Dest), Size - 1, true);
+ 
+-  StoreResultGPR(Op, Res);
++  if (!DestIsMem(Op)) {
++    StoreResultGPR(Op, Res);
++  }
+ }
+ 
+ void OpDispatchBuilder::RCLOp(OpcodeArgs, bool UseRCX) {
+@@ -2348,11 +2415,19 @@ void OpDispatchBuilder::RCLOp(OpcodeArgs, bool UseRCX) {
+       }
+ 
+       // Our new CF will be bit (Shift - 1) of the source
+-      SetCFDirect(Dest, Size - Const, true);
++      // Darwin port: after a store, as in RCLOp1Bit.
++      if (!DestIsMem(Op)) {
++        SetCFDirect(Dest, Size - Const, true);
++      }
+ 
+       // Since Shift != 0 we can inject the CF
+       Res = _Orlshl(OpSize, Res, CF, Const - 1);
+ 
++      if (DestIsMem(Op)) {
++        StoreResultGPR(Op, Res);
++        SetCFDirect(Dest, Size - Const, true);
++      }
++
+       // OF is the top two MSBs XOR'd together
+       // Only when Shift == 1, it is undefined otherwise
+       if (Const == 1) {
+@@ -2360,7 +2435,9 @@ void OpDispatchBuilder::RCLOp(OpcodeArgs, bool UseRCX) {
+         SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(NewOF, Size - 1, true);
+       }
+ 
+-      StoreResultGPR(Op, Res);
++      if (!DestIsMem(Op)) {
++        StoreResultGPR(Op, Res);
++      }
+       return;
+     }
+   }
+@@ -2388,13 +2465,21 @@ void OpDispatchBuilder::RCLOp(OpcodeArgs, bool UseRCX) {
+ 
+       // Our new CF will be bit (Shift - 1) of the source
+       auto NewCF = _Lshr(OpSize, Dest, NegSrc);
+-      SetCFDirect(NewCF, 0, true);
++      // Darwin port: after a store, as in RCLOp1Bit.
++      if (!DestIsMem(Op)) {
++        SetCFDirect(NewCF, 0, true);
++      }
+ 
+       // Since Shift != 0 we can inject the CF. Shift absorbs the masking.
+       Ref CFShl = Sub(OpSize, Src, 1);
+       auto TmpCF = _Lshl(OpSize, CF, CFShl);
+       Res = _Or(OpSize, Res, TmpCF);
+ 
++      if (DestIsMem(Op)) {
++        StoreResultGPR(Op, Res);
++        SetCFDirect(NewCF, 0, true);
++      }
++
+       // OF is the top two MSBs XOR'd together
+       // Only when Shift == 1, it is undefined otherwise
+       //
+@@ -2403,7 +2488,9 @@ void OpDispatchBuilder::RCLOp(OpcodeArgs, bool UseRCX) {
+       auto NewOF = _XorShift(OpSize, Res, NewCF, ShiftType::LSL, Size - 1);
+       SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(NewOF, Size - 1, true);
+ 
+-      StoreResultGPR(Op, Res);
++      if (!DestIsMem(Op)) {
++        StoreResultGPR(Op, Res);
++      }
+     },
+     OpSizeFromSrc(Op) == OpSize::i32Bit ? std::make_optional(&OpDispatchBuilder::ZeroShiftResult) : std::nullopt);
+ }
+@@ -3264,6 +3351,12 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
+ 
+   CalculateDeferredFlags();
+ 
++  const bool StoreFirst = DestIsMem(Op) && !IsLocked;
++  if (StoreFirst) {
++    // Darwin port: the store can fault and the instruction be started again, with the carry it keeps (BeginGuestInstruction).
++    StoreResultGPR(Op, Add(std::max(OpSize::i32Bit, OpSizeFromSrc(Op)), Dest, 1));
++  }
++
+   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
+     // Addition producing upper garbage
+     Result = Add(OpSize::i32Bit, Dest, 1);
+@@ -3281,7 +3374,7 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
+     Result = CalculateFlags_ADD(OpSizeFromSrc(Op), Dest, Constant(1), false);
+   }
+ 
+-  if (!IsLocked) {
++  if (!IsLocked && !StoreFirst) {
+     StoreResultGPR(Op, Result);
+   }
+ }
+@@ -3305,6 +3398,12 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
+ 
+   CalculateDeferredFlags();
+ 
++  const bool StoreFirst = DestIsMem(Op) && !IsLocked;
++  if (StoreFirst) {
++    // Darwin port: the store can fault and the instruction be started again, with the carry it keeps (BeginGuestInstruction).
++    StoreResultGPR(Op, Sub(std::max(OpSize::i32Bit, OpSizeFromSrc(Op)), Dest, 1));
++  }
++
+   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
+     // Subtraction producing upper garbage
+     Result = Sub(OpSize::i32Bit, Dest, 1);
+@@ -3322,7 +3421,7 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
+     Result = CalculateFlags_SUB(OpSizeFromSrc(Op), Dest, Constant(1), false);
+   }
+ 
+-  if (!IsLocked) {
++  if (!IsLocked && !StoreFirst) {
+     StoreResultGPR(Op, Result);
+   }
+ }

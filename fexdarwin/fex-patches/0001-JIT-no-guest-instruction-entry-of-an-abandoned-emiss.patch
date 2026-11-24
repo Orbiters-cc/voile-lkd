@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Tue, 24 Nov 2026 21:56:27 +0100
+Subject: [PATCH] JIT: no guest instruction entry of an abandoned emission in
+ the RIP table
+
+---
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 87ef19f69..425789154 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -910,6 +910,11 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+ 
+   CodeData.EntryPoints.clear();
+ 
++  // Darwin port: what an abandoned attempt recorded about its own code. Its instruction entries lie elsewhere than this
++  // attempt's (with far branches everything after the first branch moves), and the RIP table is read as exact boundaries.
++  DebugData->GuestOpcodes.clear();
++  DebugData->Subblocks.clear();
++
+   // Fairly excessive buffer range to make sure we don't overflow
+   // One page baseline, plus SSANodeMultipler bytes, plus another page for guard page.
+   const uint32_t DesiredBufferRange =

@@ -1,0 +1,787 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Tue, 24 Nov 2026 22:31:42 +0100
+Subject: [PATCH] Exact guest instruction boundaries
+
+A thread that a signal stops, or whose fault the guest resolves, starts again at a guest instruction from the
+static registers and the context alone. Not every entry of the RIP table was such a point:
+ - the register allocator merges operations of neighbouring instructions (push/push, pop/pop, pop/ret, moves);
+ - the host carry is the guest's or its opposite, whichever the last instruction left;
+ - the high halves of the AVX registers, the MMX registers, the direction flag and the x87 stack are written to
+   the context at the end of a block.
+Each entry now says whether it is Exact and what form the carry has; an entry over which the allocator moves an
+effect is not Exact, and a merge is only made where nothing that can fault would be reported there. What is
+pending is written before every instruction that can fault, the x87 stack before every instruction.
+---
+ FEXCore/Source/Interface/Context/Context.h    |   5 +-
+ FEXCore/Source/Interface/Core/CPUBackend.h    |   3 +-
+ FEXCore/Source/Interface/Core/Core.cpp        | 105 +++++++++------
+ FEXCore/Source/Interface/Core/JIT/DebugData.h |   1 +
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |  12 +-
+ FEXCore/Source/Interface/Core/JIT/MiscOps.cpp |   2 +-
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  42 +++++-
+ .../Interface/Core/X86Tables/BaseTables.cpp   |   2 +-
+ .../Core/X86Tables/SecondaryTables.cpp        |   4 +-
+ FEXCore/Source/Interface/IR/IR.h              |  13 ++
+ FEXCore/Source/Interface/IR/IR.json           |   6 +-
+ .../IR/Passes/RegisterAllocationPass.cpp      | 127 +++++++++++++++++-
+ .../IR/Passes/x87StackOptimizationPass.cpp    |  31 ++++-
+ FEXCore/include/FEXCore/Core/Context.h        |  17 ++-
+ 14 files changed, 302 insertions(+), 68 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index b3a190471..da8af49cb 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -151,8 +151,9 @@ public:
+   bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) override;
+   uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) override;
+ 
+-  uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
+-  bool IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t* RIP) override;
++  uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, bool* CarryNotInverted = nullptr) override;
++  bool IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t* RIP,
++                                          bool* CarryNotInverted = nullptr) override;
+   uint32_t ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) override;
+   void SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) override;
+ 
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 1d19bc123..02fac996f 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -86,7 +86,8 @@ namespace CPU {
+       // Number of RIP entries for this JIT Code section.
+       uint32_t NumberOfRIPEntries;
+ 
+-      // Offset after this block to the start of the RIP entries.
++      // Offset after this block to the start of the RIP entries. Darwin port: their flags, two bits each, are right after
++      // this object.
+       uint32_t OffsetToRIPEntries;
+ 
+       // Shared-code modification spin-loop futex.
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index e56538c48..320cc7c03 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -149,36 +149,54 @@ uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thr
+   return InlineTail ? InlineTail->RIP : 0;
+ }
+ 
+-uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
++// Darwin port: walks the RIP entries of the block the thread is in. F(HostPC, RIP, Flags) of each one, until it returns false.
++template<typename Fn>
++static void ForEachRIPEntry(const GetFrameBlockInfoResult& Info, uint64_t BlockBegin, Fn&& F) {
++  auto [InlineHeader, InlineTail] = Info;
++  const auto Tail = reinterpret_cast<const uint8_t*>(InlineTail);
++  const uint8_t* Flags = Tail + sizeof(*InlineTail);
++  const uint8_t* RIPEntry = Tail + InlineTail->OffsetToRIPEntries;
++  uint64_t EntryHostPC = BlockBegin;
++  uint64_t EntryGuestRIP = InlineTail->RIP;
++
++  for (uint32_t i = 0; i < InlineTail->NumberOfRIPEntries; ++i) {
++    auto Offset = FEXCore::Utils::vl64pair::Decode(RIPEntry);
++    RIPEntry += Offset.Size;
++    EntryHostPC += Offset.IntegerARMPC;
++    EntryGuestRIP += Offset.IntegerX86RIP;
++    if (!F(EntryHostPC, EntryGuestRIP, (Flags[i / 4] >> ((i & 3) * 2)) & IR::GuestOpcodeFlags::TableMask)) {
++      return;
++    }
++  }
++}
++
++uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, bool* CarryNotInverted) {
+   const auto Frame = Thread->CurrentFrame;
+   const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
+-  auto [InlineHeader, InlineTail] = GetFrameBlockInfo(Thread->CurrentFrame);
++  const auto Info = GetFrameBlockInfo(Frame);
++  if (CarryNotInverted) {
++    *CarryNotInverted = false;
++  }
+ 
+-  if (InlineHeader) {
++  if (Info.InlineHeader) {
+     // Check if the host PC is currently within a code block.
+     // If it is then RIP can be reconstructed from the beginning of the code block.
+     // This is currently as close as FEX can get RIP reconstructions.
+-    if (HostPC >= reinterpret_cast<uint64_t>(BlockBegin) && HostPC < reinterpret_cast<uint64_t>(BlockBegin + InlineTail->Size)) {
+-
+-      auto RIPEntry =
+-        reinterpret_cast<const uint8_t*>(Frame->State.InlineJITBlockHeader + InlineHeader->OffsetToBlockTail + InlineTail->OffsetToRIPEntries);
+-
++    if (HostPC >= BlockBegin && HostPC < BlockBegin + Info.InlineTail->Size) {
+       // Reconstruct RIP from JIT entries for this block.
+-      uint64_t StartingHostPC = BlockBegin;
+-      uint64_t StartingGuestRIP = InlineTail->RIP;
+-
+-      for (uint32_t i = 0; i < InlineTail->NumberOfRIPEntries; ++i) {
+-        auto Offset = FEXCore::Utils::vl64pair::Decode(RIPEntry);
+-        RIPEntry += Offset.Size;
+-        if (HostPC >= (StartingHostPC + Offset.IntegerARMPC)) {
+-          // We are beyond this entry, keep going forward.
+-          StartingHostPC += Offset.IntegerARMPC;
+-          StartingGuestRIP += Offset.IntegerX86RIP;
+-        } else {
++      uint64_t StartingGuestRIP = Info.InlineTail->RIP;
++      ForEachRIPEntry(Info, BlockBegin, [&](uint64_t EntryHostPC, uint64_t EntryGuestRIP, unsigned Flags) {
++        if (HostPC < EntryHostPC) {
+           // Passed where the Host PC is at. Break now.
+-          break;
++          return false;
+         }
+-      }
++        // We are beyond this entry, keep going forward.
++        StartingGuestRIP = EntryGuestRIP;
++        if (CarryNotInverted) {
++          *CarryNotInverted = (Flags & IR::GuestOpcodeFlags::CarryNotInverted) != 0;
++        }
++        return true;
++      });
+       return StartingGuestRIP;
+     }
+   }
+@@ -187,30 +205,27 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
+   return Frame->State.rip;
+ }
+ 
+-bool ContextImpl::IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t* RIP) {
++bool ContextImpl::IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t* RIP,
++                                                     bool* CarryNotInverted) {
+   const auto Frame = Thread->CurrentFrame;
+   const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
+-  auto [InlineHeader, InlineTail] = GetFrameBlockInfo(Frame);
+-  if (!InlineHeader || HostPC < BlockBegin || HostPC >= BlockBegin + InlineTail->Size) {
++  const auto Info = GetFrameBlockInfo(Frame);
++  if (!Info.InlineHeader || HostPC < BlockBegin || HostPC >= BlockBegin + Info.InlineTail->Size) {
+     return false;
+   }
+-  auto RIPEntry = reinterpret_cast<const uint8_t*>(Frame->State.InlineJITBlockHeader + InlineHeader->OffsetToBlockTail + InlineTail->OffsetToRIPEntries);
+-  uint64_t EntryHostPC = BlockBegin;
+-  uint64_t EntryGuestRIP = InlineTail->RIP;
+-  for (uint32_t i = 0; i < InlineTail->NumberOfRIPEntries; ++i) {
+-    auto Offset = FEXCore::Utils::vl64pair::Decode(RIPEntry);
+-    RIPEntry += Offset.Size;
+-    EntryHostPC += Offset.IntegerARMPC;
+-    EntryGuestRIP += Offset.IntegerX86RIP;
+-    if (EntryHostPC == HostPC) {
++  bool Found = false;
++  ForEachRIPEntry(Info, BlockBegin, [&](uint64_t EntryHostPC, uint64_t EntryGuestRIP, unsigned Flags) {
++    if (EntryHostPC == HostPC && (Flags & IR::GuestOpcodeFlags::Exact)) {
+       *RIP = EntryGuestRIP;
+-      return true;
+-    }
+-    if (EntryHostPC > HostPC) {
+-      break;
++      if (CarryNotInverted) {
++        *CarryNotInverted = (Flags & IR::GuestOpcodeFlags::CarryNotInverted) != 0;
++      }
++      Found = true;
++      return false;
+     }
+-  }
+-  return false;
++    return EntryHostPC <= HostPC;
++  });
++  return Found;
+ }
+ 
+ uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs,
+@@ -640,6 +655,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
+ 
+       // Reset any block-specific state
++      Thread->OpDispatcher->EndGuestInstruction();
+       Thread->OpDispatcher->StartNewBlock();
+ 
+       const uint64_t InstsInBlock = Block.NumInstructions;
+@@ -683,10 +699,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+         // It is potentially correctness bearing in that sense, but that is a
+         // side effect here and (if that behaviour is required) we should handle
+         // that more explicitly later.
++        Thread->OpDispatcher->EndGuestInstruction();
+         Thread->OpDispatcher->FlushRegisterCache(true);
+ 
+-        if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
+-          Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
++        const bool CanFault = Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo);
++        if (ExtendedDebugInfo || CanFault) {
++          Thread->OpDispatcher->BeginGuestInstruction(InstAddress - GuestRIP, CanFault);
+         }
+ 
+         const bool ValidateInst = Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection ||
+@@ -735,6 +753,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           Thread->OpDispatcher->SetFalseJumpTarget(InvalidateCodeCond, NextOpBlock);
+           Thread->OpDispatcher->SetCurrentCodeBlock(NextOpBlock);
+           Thread->OpDispatcher->StartNewBlock();
++
++          // Darwin port: the instruction begins here too. Stopped here, its bytes are checked again.
++          if (ExtendedDebugInfo || CanFault) {
++            Thread->OpDispatcher->BeginGuestInstruction(InstAddress - GuestRIP, CanFault);
++          }
+         }
+ 
+         if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/DebugData.h b/FEXCore/Source/Interface/Core/JIT/DebugData.h
+index ffbd9f765..9df551488 100644
+--- a/FEXCore/Source/Interface/Core/JIT/DebugData.h
++++ b/FEXCore/Source/Interface/Core/JIT/DebugData.h
+@@ -19,6 +19,7 @@ struct DebugDataSubblock {
+ struct DebugDataGuestOpcode {
+   uint64_t GuestEntryOffset;
+   ptrdiff_t HostEntryOffset;
++  uint8_t Flags; // IR::GuestOpcodeFlags
+ };
+ 
+ /**
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 425789154..8b05104f0 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -1002,7 +1002,8 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+ 
+         BindOrRestart(&IsReturnTarget->second);
+         CodeData.EntryPoints.emplace(BlockStartRIP, GetCursorAddress<uint8_t*>());
+-        DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
++        DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin,
++                                           IR::GuestOpcodeFlags::Exact});
+ 
+         EmitEntryPoint(JITCodeHeaderLabel, CheckTF);
+       }
+@@ -1104,7 +1105,9 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+   //   FEXCore::Utils::vl64 GuestRIPOffset;
+   // };
+ 
+-  const auto JITRIPEntriesBegin = JITBlockTailLocation + sizeof(JITBlockTail);
++  // Darwin port: the entries' flags come first, two bits each (IR::GuestOpcodeFlags::Exact and CarryNotInverted).
++  const auto JITRIPFlagsBegin = JITBlockTailLocation + sizeof(JITBlockTail);
++  const auto JITRIPEntriesBegin = JITRIPFlagsBegin + (DebugData->GuestOpcodes.size() + 3) / 4;
+   auto JITRIPEntriesLocation = JITRIPEntriesBegin;
+ 
+   {
+@@ -1123,6 +1126,11 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+ 
+       CurrentPCOffset = GuestOpcode.HostEntryOffset;
+       CurrentRIPOffset = GuestOpcode.GuestEntryOffset;
++
++      if ((i & 3) == 0) {
++        JITRIPFlagsBegin[i / 4] = 0;
++      }
++      JITRIPFlagsBegin[i / 4] |= (GuestOpcode.Flags & IR::GuestOpcodeFlags::TableMask) << ((i & 3) * 2);
+     }
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 178c27591..7a5e7ae3a 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -47,7 +47,7 @@ DEF_OP(WFET) {
+ DEF_OP(GuestOpcode) {
+   auto Op = IROp->C<IR::IROp_GuestOpcode>();
+   // metadata
+-  DebugData->GuestOpcodes.push_back({Op->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
++  DebugData->GuestOpcodes.push_back({Op->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin, Op->Flags});
+ }
+ 
+ DEF_OP(Fence) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index e557fe3c6..88a9f0a52 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -170,6 +170,8 @@ public:
+ 
+     // Need to clear any named constants that were cached.
+     ClearCachedNamedConstants();
++
++    ContinueGuestInstruction();
+   }
+ 
+   IRPair<IROp_Jump> Jump() {
+@@ -1212,7 +1214,8 @@ public:
+     _StoreContext(Size, Class, Value, Offset);
+   }
+ 
+-  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false) {
++  // With Pending, everything left is written but nothing is forgotten (WritePendingContext).
++  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false, bool Pending = false) {
+     if (!SRAOnly) {
+       ForgetHostBases();
+     }
+@@ -1252,7 +1255,7 @@ public:
+     // less aggressive. We should get rid of this once RA can take it.
+     uint64_t Mask = ~0ULL;
+ 
+-    if (SRAOnly) {
++    if (SRAOnly && !Pending) {
+       const uint64_t GPRMask = ((1ull << (AFIndex - GPR0Index + 1)) - 1) << GPR0Index;
+       const uint64_t FPRMask = ((1ull << (FPR15Index - FPR0Index + 1)) - 1) << FPR0Index;
+ 
+@@ -1318,6 +1321,37 @@ public:
+     RegCache.Partial &= ~Mask;
+   }
+ 
++  // Darwin port: what FlushRegisterCache(true) leaves pending (the high halves of the AVX registers, the MMX registers, the
++  // direction flag) is written to the context, and stays cached.
++  void WritePendingContext() {
++    const uint64_t Cached = RegCache.Cached, Partial = RegCache.Partial;
++    FlushRegisterCache(true, false, true);
++    RegCache.Cached = Cached;
++    RegCache.Partial = Partial;
++  }
++
++  // Darwin port: the marker of a guest instruction, after the flush of the static registers. A thread may be stopped by a
++  // signal or a fault and start again at the instruction, from the static registers and the context alone
++  // (Context::IsHostPCAtGuestInstructionBoundary, Context::RestoreRIPFromHostPC).
++  void BeginGuestInstruction(uint32_t EntryOffset, bool CanFault) {
++    if (CanFault) {
++      WritePendingContext();
++    }
++    CurrentGuestInstruction = EntryOffset;
++    _GuestOpcode(EntryOffset, (RegCache.Written == 0 ? GuestOpcodeFlags::Exact : 0) | (CFInverted ? 0 : GuestOpcodeFlags::CarryNotInverted));
++  }
++
++  // Darwin port: the same instruction goes on where the form of the carry has changed, so that a fault in the rest of it finds
++  // the one there.
++  void ContinueGuestInstruction() {
++    if (CurrentGuestInstruction) {
++      _GuestOpcode(*CurrentGuestInstruction, CFInverted ? 0 : GuestOpcodeFlags::CarryNotInverted);
++    }
++  }
++  void EndGuestInstruction() {
++    CurrentGuestInstruction.reset();
++  }
++
+   IR::OpSize GetGPROpSize() const {
+     return Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
+   }
+@@ -1405,6 +1439,9 @@ private:
+   // INVERTED).
+   bool CFInverted {};
+ 
++  // Darwin port: the guest instruction being translated (BeginGuestInstruction).
++  std::optional<uint32_t> CurrentGuestInstruction {};
++
+   // FEX convention for CF at the end of blocks: INVERTED.
+   const bool CFInvertedABI {true};
+ 
+@@ -1866,6 +1903,7 @@ private:
+       }
+ 
+       CFInverted ^= true;
++      ContinueGuestInstruction();
+     }
+ 
+     LOGMAN_THROW_A_FMT(CFInverted == RequiredInvert, "post condition");
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/BaseTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/BaseTables.cpp
+index 265b575d5..8d4534a1e 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/BaseTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/BaseTables.cpp
+@@ -327,7 +327,7 @@ const std::array<X86InstInfo, MAX_PRIMARY_TABLE_SIZE> BaseOps = []() consteval {
+ 
+     // These three are all X87 instructions
+     {0x9B, 1, X86InstInfo{"FWAIT",  TYPE_INST, FLAGS_NONE,                              0}},
+-    {0x9C, 1, X86InstInfo{"PUSHF",  TYPE_INST, GenFlagsSameSize(SIZE_64BITDEF),         0}},
++    {0x9C, 1, X86InstInfo{"PUSHF",  TYPE_INST, GenFlagsSameSize(SIZE_64BITDEF) | FLAGS_DEBUG_MEM_ACCESS,         0}},
+     {0x9D, 1, X86InstInfo{"POPF",   TYPE_INST, GenFlagsSameSize(SIZE_64BITDEF) | FLAGS_BLOCK_END,         0}},
+ 
+     {0x9E, 1, X86InstInfo{"SAHF",   TYPE_INST, FLAGS_NONE,                              0}},
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+index ae690654c..8cab1c46f 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+@@ -286,7 +286,7 @@ constexpr std::array<X86InstInfo, MAX_SECOND_TABLE_SIZE> SecondBaseOps = []() co
+     {0xF4, 1, X86InstInfo{"PMULUDQ",  TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xF5, 1, X86InstInfo{"PMADDWD",  TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xF6, 1, X86InstInfo{"PSADBW",   TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+-    {0xF7, 1, X86InstInfo{"MASKMOVQ", TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_SF_MOD_REG_ONLY | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
++    {0xF7, 1, X86InstInfo{"MASKMOVQ", TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_DEBUG_MEM_ACCESS | FLAGS_MODRM | FLAGS_SF_MOD_REG_ONLY | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xF8, 1, X86InstInfo{"PSUBB",    TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xF9, 1, X86InstInfo{"PSUBW",    TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+     {0xFA, 1, X86InstInfo{"PSUBD",    TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                      0}},
+@@ -624,7 +624,7 @@ constexpr std::array<X86InstInfo, MAX_OPSIZE_MOD_TABLE_SIZE> OpSizeModOps = []()
+     {0xF4, 1, X86InstInfo{"PMULUDQ",    TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                         0}},
+     {0xF5, 1, X86InstInfo{"PMADDWD",    TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                         0}},
+     {0xF6, 1, X86InstInfo{"PSADBW",     TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                         0}},
+-    {0xF7, 1, X86InstInfo{"MASKMOVDQU", TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_SF_MOD_REG_ONLY | FLAGS_XMM_FLAGS,                         0}},
++    {0xF7, 1, X86InstInfo{"MASKMOVDQU", TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_DEBUG_MEM_ACCESS | FLAGS_MODRM | FLAGS_SF_MOD_REG_ONLY | FLAGS_XMM_FLAGS,                         0}},
+     {0xF8, 1, X86InstInfo{"PSUBB",      TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                         0}},
+     {0xF9, 1, X86InstInfo{"PSUBW",      TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                         0}},
+     {0xFA, 1, X86InstInfo{"PSUBD",      TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                         0}},
+diff --git a/FEXCore/Source/Interface/IR/IR.h b/FEXCore/Source/Interface/IR/IR.h
+index 6bbc5d00b..60c5dbb09 100644
+--- a/FEXCore/Source/Interface/IR/IR.h
++++ b/FEXCore/Source/Interface/IR/IR.h
+@@ -18,6 +18,19 @@
+ #include <type_traits>
+ 
+ namespace FEXCore::IR {
++
++// Darwin port: what a GuestOpcode says of the point where a guest instruction begins.
++namespace GuestOpcodeFlags {
++  enum : uint8_t {
++    // All effects of the instructions before it have happened there, in the static registers and the context, and none of its
++    // own: a thread stopped there can start again at the instruction. Passes that move effects over it take this away.
++    Exact = 1 << 0,
++    // The host's carry is the guest's, not its opposite (OpDispatchBuilder::CFInverted is not set).
++    CarryNotInverted = 1 << 1,
++    // What the RIP table keeps.
++    TableMask = Exact | CarryNotInverted,
++  };
++} // namespace GuestOpcodeFlags
+ // Darwin port: bit 7 of the OffsetScale of LoadMem, StoreMem, LoadMemTSO and StoreMemTSO marks an Addr that is already a host
+ // address (OpDispatchBuilder::HostBase): the backend does not add the guest base to it. It is on the memory operation, not
+ // on the address value, because the register allocator replaces a spilled value by a fill that no longer says what it was.
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index ceee69a8c..fd91c414c 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -190,8 +190,10 @@
+         "JITDispatchOverride": "NoOp"
+       },
+ 
+-      "GuestOpcode u32:$GuestEntryOffset": {
+-        "Desc": ["Marks the beginning of a guest opcode"],
++      "GuestOpcode u32:$GuestEntryOffset, u8:$Flags": {
++        "Desc": ["Marks the beginning of a guest opcode",
++                 "Darwin port: Flags is IR::GuestOpcodeFlags"
++                ],
+         "HasSideEffects": true
+       },
+ 
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index 0f0a9c8ed..4e13c1c3b 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -63,7 +63,9 @@ public:
+     : CPUID {CPUID} {}
+   void Run(IREmitter* IREmit) override;
+   void AddRegisters(IR::RegClass Class, uint32_t RegisterCount) override;
+-  bool TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp);
++  bool TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp, bool SameInstruction);
++  bool RestCannotFault(Ref Node);
++  void MarkInexactBetween(Ref LastNode, Ref CodeNode);
+ 
+ private:
+   RegisterClassData Classes[IR::NumClasses];
+@@ -480,7 +482,106 @@ static bool IsZero(const IROp_Header* IROp) {
+   return IROp->Op == OP_CONSTANT && IROp->C<IROp_Constant>()->Constant == 0;
+ }
+ 
+-bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp) {
++// Darwin port: whether Op touches no guest memory and raises nothing.
++static bool CannotFault(IROps Op) {
++  switch (Op) {
++  // Marked as having side effects for the flags, the registers or the context they write, or as a block's end. The memory an
++  // ExitFunction reads is the translator's own.
++  case OP_GUESTOPCODE:
++  case OP_INLINECONSTANT:
++  case OP_INLINEENTRYPOINTOFFSET:
++  case OP_INVALIDATEFLAGS:
++  case OP_STOREREGISTER:
++  case OP_STOREPF:
++  case OP_STOREAF:
++  case OP_STORECONTEXT:
++  case OP_STORECONTEXTPAIR:
++  case OP_LOADCONTEXTPAIR:
++  case OP_STORECONTEXTINDEXED:
++  case OP_SPILLREGISTER:
++  case OP_FILLREGISTER:
++  case OP_STORENZCV:
++  case OP_RMWHANDLE:
++  case OP_ADDWITHFLAGS:
++  case OP_ADDNZCV:
++  case OP_SUBWITHFLAGS:
++  case OP_SUBNZCV:
++  case OP_ADCWITHFLAGS:
++  case OP_ADCNZCV:
++  case OP_ADCZEROWITHFLAGS:
++  case OP_SBBWITHFLAGS:
++  case OP_SBBNZCV:
++  case OP_ANDWITHFLAGS:
++  case OP_TESTNZ:
++  case OP_TESTZ:
++  case OP_SETSMALLNZV:
++  case OP_CARRYINVERT:
++  case OP_RMIFNZCV:
++  case OP_CONDADDNZCV:
++  case OP_CONDSUBNZCV:
++  case OP_SHIFTFLAGS:
++  case OP_ROTATEFLAGS:
++  case OP_AXFLAG:
++  case OP_FCMP:
++  case OP_EXITFUNCTION:
++  case OP_ENDBLOCK: return true;
++  // Read guest memory, which is no side effect.
++  case OP_VBROADCASTFROMMEM:
++  case OP_LOADMEMX87SVEOPTPREDICATE: return false;
++  default: return !IR::HasSideEffects(Op);
++  }
++}
++
++// Darwin port: whether nothing after Node can fault in the guest instruction it is in.
++bool ConstrainedRAPass::RestCannotFault(Ref Node) {
++  const IROp_Header* Header {};
++  Ref Begin = Node;
++  do {
++    Begin = IR->GetNode(Begin->Header.Previous);
++    Header = IR->GetOp<IROp_Header>(Begin);
++    if (Header->Op == OP_BEGINBLOCK) {
++      return false;
++    }
++  } while (Header->Op != OP_GUESTOPCODE);
++  const auto Instruction = Header->C<IROp_GuestOpcode>()->GuestEntryOffset;
++
++  while (true) {
++    Node = IR->GetNode(Node->Header.Next);
++    Header = IR->GetOp<IROp_Header>(Node);
++    if (!CannotFault(Header->Op)) {
++      return false;
++    }
++    if (Header->Op == OP_ENDBLOCK || (Header->Op == OP_GUESTOPCODE && Header->C<IROp_GuestOpcode>()->GuestEntryOffset != Instruction)) {
++      return true;
++    }
++  }
++}
++
++// Darwin port: the guest instructions that begin after LastNode, up to CodeNode, begin no more where the state is theirs.
++void ConstrainedRAPass::MarkInexactBetween(Ref LastNode, Ref CodeNode) {
++  for (Ref Node = IR->GetNode(CodeNode->Header.Previous); Node != LastNode; Node = IR->GetNode(Node->Header.Previous)) {
++    auto Header = IR->GetOp<IROp_Header>(Node);
++    if (Header->Op == OP_GUESTOPCODE) {
++      Header->CW<IROp_GuestOpcode>()->Flags &= ~GuestOpcodeFlags::Exact;
++    }
++  }
++}
++
++// Darwin port: SameInstruction is false when a guest instruction begins between the two operations. A guest instruction is a
++// point where an asynchronous signal may be delivered, and from which the thread starts again after it
++// (Context::IsHostPCAtGuestInstructionBoundary), and the point where a fault in it is reported, from which the thread may
++// start again too. A merge that moves an effect over it makes it no such point: the `ret` of `pop rbx; ret`, merged into the
++// pop before it, returned twice when a signal came between the two.
++//
++//  - Two pushes or pops become one operation at the place of the first, so the second instruction begins with its stack effect
++//    done. It loses its Exact flag. A fault in the merged operation is reported at the first instruction with neither effect
++//    done (Push, Pop and their pairs access memory before they write a register). Nothing after it in the second instruction
++//    may fault, which would be reported there.
++//  - A move merged into the next operation, which overwrites its result, happens late: the second instruction begins without
++//    it and loses its Exact flag. If the first one is the move alone, its own entry is at the same place and is still true.
++//    The operation may not fault, which would be reported there. Nothing is left undone after it.
++//  - The rest moves no effect and keeps the first instruction's.
++bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp, bool SameInstruction) {
+   auto LastOp = IR->GetOp<IROp_Header>(LastNode);
+ 
+   if (IROp->Op == OP_PUSH && LastOp->Op == OP_PUSH) {
+@@ -490,8 +591,10 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+ 
+     if (LastOp->Size == IROp->Size && LastPush->ValueSize == Push->ValueSize && SP == PhysicalRegister(LastNode) &&
+         SP == PhysicalRegister(IROp->Args[1]) && SP == PhysicalRegister(LastOp->Args[1]) && SP != PhysicalRegister(IROp->Args[0]) &&
+-        SP != PhysicalRegister(LastOp->Args[0]) && Push->ValueSize >= OpSize::i32Bit) {
++        SP != PhysicalRegister(LastOp->Args[0]) && Push->ValueSize >= OpSize::i32Bit &&
++        (SameInstruction || RestCannotFault(CodeNode))) {
+ 
++      MarkInexactBetween(LastNode, CodeNode);
+       IREmit->SetWriteCursorBefore(LastNode);
+       IREmit->_PushTwo(IROp->Size, Push->ValueSize, IROp->Args[0], LastOp->Args[0], IROp->Args[1]);
+       IREmit->RemovePostRA(CodeNode);
+@@ -500,7 +603,9 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+   } else if (IROp->Op == OP_POP) {
+     auto SP = PhysicalRegister(IROp->Args[0]);
+ 
+-    if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0])) {
++    if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0]) &&
++        (SameInstruction || RestCannotFault(CodeNode))) {
++      MarkInexactBetween(LastNode, CodeNode);
+       IREmit->SetWriteCursorBefore(LastNode);
+       IREmit->_PopTwo(IROp->Size, IROp->Args[0], LastOp->Args[1], IROp->Args[1]);
+       IREmit->RemovePostRA(CodeNode);
+@@ -512,7 +617,8 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+     if (!Op->Upper.IsInvalid() && PhysicalRegister(Op->Upper) == PhysicalRegister(LastNode)) {
+       if (IROp->Op == OP_DIV ? IsSignext(LastOp, Op->Lower, IROp->Size) : IsZero(LastOp)) {
+         Op->Upper.SetInvalid();
+-        return PhysicalRegister(LastNode) == PhysicalRegister(Op->OutRemainder);
++        // cqo; idiv: the instruction before keeps its effect on rdx.
++        return SameInstruction && PhysicalRegister(LastNode) == PhysicalRegister(Op->OutRemainder);
+       }
+     }
+   } else if (IROp->Op == OP_XGETBV && PhysicalRegister(IROp->Args[0]) == PhysicalRegister(LastNode) && LastOp->Op == OP_CONSTANT) {
+@@ -535,7 +641,9 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+   // arm64 is 3-address code, we can optimize these out.
+   //
+   // Note we rely on the short-circuiting here.
+-  if (PhysicalRegister(LastNode) == PhysicalRegister(CodeNode) && KillMove(LastOp, IROp, LastNode, CodeNode)) {
++  if ((SameInstruction || CannotFault(IROp->Op)) && PhysicalRegister(LastNode) == PhysicalRegister(CodeNode) &&
++      KillMove(LastOp, IROp, LastNode, CodeNode)) {
++    MarkInexactBetween(LastNode, CodeNode);
+     LOGMAN_THROW_A_FMT(!PhysicalRegister(CodeNode).IsInvalid(), "invariant");
+ 
+     int NumArgs = IR::GetRAArgs(IROp->Op);
+@@ -638,6 +746,9 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+     // Last nontrivial instruction, for merging as we go.
+     Ref LastNode = nullptr;
+ 
++    // Darwin port: whether a guest instruction began after LastNode.
++    bool SameInstruction = true;
++
+     // Forward pass: Assign registers, spilling & optimizing as we go.
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+       bool AnySpilledBeforeThisInstruction = AnySpilled;
+@@ -646,6 +757,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+       // Since we'd be doing this check anyway for merging, do the check now so
+       // we can skip the rest of the logic too.
+       if (IROp->Op == OP_GUESTOPCODE || IROp->Op == OP_INLINECONSTANT) {
++        SameInstruction &= IROp->Op != OP_GUESTOPCODE;
+         continue;
+       }
+ 
+@@ -745,12 +857,13 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+       if (IsTrivial(CodeNode, IROp)) {
+         // Delete instructions that only exist for RA
+         IREmit->RemovePostRA(CodeNode);
+-      } else if (LastNode && TryPostRAMerge(LastNode, CodeNode, IROp)) {
++      } else if (LastNode && TryPostRAMerge(LastNode, CodeNode, IROp, SameInstruction)) {
+         // Merge adjacent instructions
+         IREmit->RemovePostRA(LastNode);
+         LastNode = nullptr;
+       } else {
+         LastNode = CodeNode;
++        SameInstruction = true;
+       }
+     }
+ 
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index dc4569d12..a4d00b7f5 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -10,6 +10,7 @@
+ #include "FEXCore/Core/HostFeatures.h"
+ #include "Interface/Core/Addressing.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -67,6 +68,9 @@ public:
+ 
+   FixedSizeStack() = default;
+ 
++  // Darwin port: whether it has changed since the context last held it (X87StackOptimization::IsPending).
++  bool Dirty = false;
++
+   void push(const T& Value) {
+     rotate();
+     buffer.front() = {StackSlot::VALID, Value};
+@@ -74,6 +78,7 @@ public:
+ 
+   // Rotate the elements with the direction controlled by Right
+   void rotate(bool Right = true) {
++    Dirty = true;
+     if (Right) {
+       std::rotate(buffer.begin(), buffer.end() - 1, buffer.end());
+       TopOffset++;
+@@ -93,6 +98,7 @@ public:
+   }
+ 
+   void setTop(const T& Value, size_t Offset = 0) {
++    Dirty = true;
+     buffer[Offset] = {StackSlot::VALID, Value};
+   }
+ 
+@@ -103,6 +109,7 @@ public:
+   void clear() {
+     buffer.fill({StackSlot::UNUSED, T::Invalid});
+     TopOffset = 0;
++    Dirty = false;
+   }
+ 
+   void dump() const {
+@@ -120,6 +127,7 @@ public:
+   }
+ 
+   void setTagInvalid(size_t Index) {
++    Dirty = true;
+     buffer[Index].Type = StackSlot::INVALID;
+   }
+ 
+@@ -278,6 +286,8 @@ private:
+   // Returns a new value for Top, that's synchronized between the simulated stack
+   // and the actual FPU stack.
+   Ref SynchronizeStackValues();
++  // Darwin port: whether the context does not hold the x87 state of this point.
++  bool IsPending() const;
+   // Moves us from the fast to the slow path if ShouldMigrate is true.
+   void MigrateToSlowPathIf(bool ShouldMigrate);
+   // Top Cache Management
+@@ -362,6 +372,11 @@ private:
+ 
+ inline const X87StackOptimization::StackMemberInfo X87StackOptimization::StackMemberInfo::Invalid {nullptr};
+ 
++inline bool X87StackOptimization::IsPending() const {
++  return FlushTopPending || FlushValidPending || std::any_of(FlushValuesPending.begin(), FlushValuesPending.end(), [](bool P) { return P; }) ||
++         (!SlowPath && StackData.Dirty);
++}
++
+ inline void X87StackOptimization::InvalidateCaches() {
+   InvalidateCachedRegs();
+   ConstantPool.fill(nullptr);
+@@ -705,6 +720,7 @@ Ref X87StackOptimization::SynchronizeStackValues() {
+     SetTopWithCache_Slow(NewTop);
+   }
+   StackData.TopOffset = 0;
++  StackData.Dirty = false;
+ 
+   // Before leaving we need to write the current values in the stack to
+   // context so that the values are correct. Copy SourceDataNode in the
+@@ -756,6 +772,15 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+     IREmit->SetCurrentCodeBlock(BlockNode);
+     for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
++      // Darwin port: a thread may start again at a guest instruction from what the context holds (GuestOpcodeFlags::Exact).
++      // Written before every one, whether it can fault or not: most of the time of x87 code is spent in the helpers, where no
++      // signal is delivered, and a thread that has few places where one is waits long for it.
++      if (IROp->Op == OP_GUESTOPCODE && IsPending()) {
++        IREmit->SetWriteCursorBefore(CodeNode);
++        SynchronizeStackValues();
++        FlushCachedRegs();
++      }
++
+       if (!LoweredX87(IROp->Op)) {
+         continue;
+       }
+@@ -1239,8 +1264,10 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+     auto [LastCodeNode, LastIROp] = Last();
+     LOGMAN_THROW_A_FMT(IsBlockExit(LastIROp->Op), "must be exit");
+     IREmit->SetWriteCursorBefore(LastCodeNode);
+-    SynchronizeStackValues();
+-    FlushCachedRegs();
++    if (IsPending()) {
++      SynchronizeStackValues();
++      FlushCachedRegs();
++    }
+   }
+ }
+ 
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index dd4dfe7d8..648546bf8 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -85,11 +85,18 @@ public:
+ 
+   ///< State reconstruction helpers
+   ///< Reconstructs the guest RIP from the passed in thread context and related Host PC.
+-  FEX_DEFAULT_VISIBILITY virtual uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) = 0;
+-  // Darwin port: true when HostPC is exactly the first host instruction of the translation of a guest instruction (after the
+-  // register-cache flush), i.e. the guest state held in the host registers and the context is that of an x86 instruction
+-  // boundary and *RIP is the address of that instruction. Only then may an asynchronous signal interrupt translated code.
+-  FEX_DEFAULT_VISIBILITY virtual bool IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t* RIP) = 0;
++  // Darwin port: *CarryNotInverted says whether PSTATE holds the guest's carry as it is there. FEX keeps it inverted between
++  // blocks, which ReconstructCompactedEFLAGS expects, but not between every two instructions of one.
++  FEX_DEFAULT_VISIBILITY virtual uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC,
++                                                               bool* CarryNotInverted = nullptr) = 0;
++  // Darwin port: true when HostPC is the first host instruction of the translation of a guest instruction, and the guest state
++  // held in the host registers and the context there is exactly the one x86 has before that instruction (but for flags that
++  // are never read): everything the instructions before it do has been done and nothing of its own. *RIP is the address of
++  // that instruction. Only then may an asynchronous signal interrupt translated code, since the thread starts again at *RIP
++  // after it. Instructions whose effects were merged with a neighbour's, and those before which something is still to be
++  // written to the context, are no such points (IR::GuestOpcodeFlags::Exact).
++  FEX_DEFAULT_VISIBILITY virtual bool IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC,
++                                                                         uint64_t* RIP, bool* CarryNotInverted = nullptr) = 0;
+   /**
+    * @brief Reconstructs a compacted EFLAGS from FEX's internal EFLAG representation.
+    *
