@@ -338,6 +338,12 @@ class Scored(unittest.TestCase):
         slow = [dict(shown_interval_ms=dict(p95=33.4, p99=80.0), client_to_shown_ms=dict(p95=45.0))]
         self.assertEqual(self.series(self.BETTER | dict(cadence=slow))["verdict"], "REJECT")
         self.assertEqual(self.series(self.BETTER | dict(queries_of_every_queue=queries(True, handed_over_and_committed=3)))["verdict"], "REJECT")
+        # the window server had a drawable more in flight for the whole of the start: not a rejection, and no keep either
+        state = lambda tick, client: [dict(shown_interval_ms=dict(p95=33.4, p99=50.0), client_to_shown_ms=dict(p95=client), tick_to_shown_ms=dict(p50=tick))]
+        told = self.series(self.BETTER | dict(cadence=state(49.5, 62.0)), a=dict(cadence=state(32.8, 45.0)))
+        self.assertEqual(told["verdict"], "INCONCLUSIVE")
+        self.assertTrue(any("tick to shown" in w for w in told["why"]))
+        self.assertEqual(self.series(self.BETTER | dict(cadence=state(32.9, 62.5)), a=dict(cadence=state(32.8, 45.0)))["verdict"], "REJECT", "the part before the tick")
         a_little = [dict(shown_interval_ms=dict(p95=34.0, p99=51.0), client_to_shown_ms=dict(p95=45.0))]
         told = self.series(self.BETTER | dict(cadence=a_little))
         self.assertEqual(told["verdict"], "KEEP")

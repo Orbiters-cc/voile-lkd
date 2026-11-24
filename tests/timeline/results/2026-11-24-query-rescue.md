@@ -1,4 +1,83 @@
-# DXMT: a look at an event query flushes once, not at each look (`OBELISK_DXMT_QUERY_RESCUE=once`): 2026-11-24, second round, 11:00 to 13:30 (no VRChat start)
+# DXMT: a look at an event query flushes once, not at each look (`OBELISK_DXMT_QUERY_RESCUE=once`): 2026-11-24, third round, 13:40 to 16:30 (no VRChat start)
+
+After the second independent review (GO WITH CHANGES for one real A/B/A, NO-GO for shipping). DXMT `a05c004` (second round `aa13aa3`), Neptune `0979d4f` (`otl.h` alone), voile-lkd and
+Obelisk as this file's history says. wsd, the render server and the proxy's library are byte for byte the second round's; DXMT alone is new: `6b66e0f10cc63d03` -> `9e16d38352285044`. MacBook Air M3, macOS 27, AC.
+Pressure 0 to 2 (told where it matters): correctness was asked here, not speed.
+
+## What the review found, and what is now
+
+| | now |
+|---|---|
+| an owed rescue disappears when the application takes `SetMultithreadProtected` back, and the rescue thread may be in the context without exclusion | **with the switch the device's lock is on from before its context is made until the device is gone** (`D3D11MultithreadOnce`); what the application set is kept beside it, for what it is told and for what `Enter` holds. What is owed stays owed until its chunk was handed to the encoder, or the context ends (told: `OTL_D_OWED`). Setting it waits for nobody |
+| the runner's launch | as Home's: `--no-saved-arguments` before `--`, the default profile on a computer of one profile with the link, refused with why on one of several (or whose settings cannot be read); N4N0's slot for a start held from before the start is decided until the released generation is back; its wait after an early end respected |
+| the scorer | distinct new serials with a positive presented time inside the half-open window over its stamped length; the game's plane and its queues alone; gaps at both ends; windows of no frame or one |
+| two mechanism checks that can pass vacuously | by each commit's target and watermarks; a rescue's chunk must have been handed over by it and be its `End`'s; debts followed to the end; looks of 0.5 and 5 ms counted; never-polled, ended-again and polled-and-never-found Ends told apart |
+| `go_on` | the README's gates (`judge()`); series of three, A B A, what is the same for all checked, `--nothing-wrong-seen` from the person at the Mac |
+| immutable resources (shipping) | `OBELISK_DXMT_INIT_ORDER=1`, off unless set, apart from the other switch |
+| occlusion counts over joined passes (shipping) | the same switch |
+
+**Claimed too strongly in the second round**: that a look's bound is *by construction*. It waits for nobody who holds a lock or the GPU; leaf locks, the allocator, the commit's own queueing and
+scheduling remain, and no bound of wall-clock time follows. The timed wrapper measures the base call alone. A thread that keeps the device's lock while it waits for what only another looks at is never rescued.
+A command buffer that fails may leave its event unsignalled. **Not fixed**: a device let go of before its last chunk was encoded ends libdxmt-native (the teardown cases wait 15 ms for it), so an immediate last release with
+uploads owed and encoding in flight is not tested.
+
+## The protection
+
+`query_client owed`, with the review's change: three rounds of a full queue, the protection taken back in the second while the rescue is owed: `aa13aa3` with the switch S_OK / **S_FALSE** / S_OK (fails), now S_OK three times.
+And `protection` (native): what is set is what is told, by the device's and the context's; what `Enter` holds and does not; 3 x 40 events owed to another thread's lock while the protection is taken back by this
+thread, by the one that holds it, and on and off in a loop: each there with nobody looking for 30 ms; 6,000 Ends beside two lookers and a thread that sets the protection and enters and leaves all along; six full queues with it
+taken back (here, from another thread, twice, off and on) before the fence is let go of: each there without another look, and setting it took at most 0.06 ms; 24 devices let go of while it goes on and off. `aa13aa3` with the switch
+does not get through it (the watchdog). Unset, the protection's own checks alone (the released lock is taken from whoever is in it).
+
+ThreadSanitizer, libdxmt-native and the client: `protection owed list-events host-threads two-threads teardown covered pacing uploads`, `bench rings`, with the switch (and with both): **0 reports**, the recorder off and on. That it
+looks: unset 26 (the queries' own state, as released). `immutables` and `occlusion-join` with `queries=once`: 30 without `OBELISK_DXMT_INIT_ORDER`, 32 with it, of the same places (the reference counts' missing acquire as a texture view goes, the occlusion queries' own read-backs: released).
+
+What differs from Direct3D, or from the switch unset: what another thread had entered when the protection was taken back it keeps until its own `Leave` (unset: it is taken from it).
+
+## Immutable resources, and occlusion counts over joined passes
+
+`query_client immutables occlusion-join`, through the render server, five rounds of each combination (the first two are the review's own test: `uploads`' streaming with its small textures immutable, the device's lock off and on).
+Pixels that differ, of some 29,000 drawn a row; every event there, every other check good:
+
+| | both unset | `queries=once` | `order=1` | both |
+|---|---|---|---|---|
+| streamed | 960, 3300, 1440, 3300, 480 | 2380, 2380, 5120, 4320, 2400 | **0** x5 | **0** x5 |
+| streamed, the device's lock on | 440, 0, 1920, 3300, 1910 | 5240, 2840, 5230, 4760, 2380 | **0** x5 | **0** x5 |
+| first used in a pass that draws (7 mips) | 0 x5 | 1140, 720, 1500, 240, 120 | **0** x5 | **0** x5 |
+| a target derived from the first use, kept (drawn from 8 frames later) | 0 x5 (120 once in another run) | 1380, 3676, 4500, 0, 360 | **0** x5 | **0** x5 |
+| vertex buffers (immutable, to 1 MiB) | 0 x5 | 0 x5 | **0** x5 | **0** x5 |
+| made on another thread, drawn as soon as they are | 0, 0, 180, 0, 0 | 4184, 5746, 4740, 0, 144 (15,850 in another run) | **0** x5 | **0** x5 |
+| used again, later | 0 in every arm | 0 | 0 | 0 |
+| **occlusion counts wrong, of 560** (a list whose counted draws end a pass that is put together with another) | **200** x5 | **200** x5 | **0** x5 | **0** x5 |
+
+The wrong pixels stay in what was derived from them: not a defect of one frame. And natively, made as Neptune's host makes them (without data, then updated): unset 480 + 180 pixels of textures and 660 to 1,260 of vertex buffers updated in two parts; `order=1` 0.
+Every wrong count is of the same size: the draws of the pass that followed (1,640 samples).
+
+**A first form of the second fix was worse, and is not here**: the counting turned off at the end of every counted pass. It made the other, older defect of occlusion (a query whose draws are on two targets misses a part: `soak <seed> <n> wide`)
+three and a half times as frequent: 75 wrong of ten runs of 100,000, against 21. Turned off at the join alone: 34, and 28 unset in the same ten seeds (one run of ten either way is +-5). **That older defect is not fixed, with any switch.** It is not the visibility
+results' neighbours in a cache line (each pass's results 512 bytes apart: 11 of 300,000, 9 without).
+
+What `order=1` costs was not measured as frames: each draw that reads such a resource looks up its last write, as it does for any other.
+
+## Checks (both generations' files as above; the final build)
+
+- `query_client cases`, twice natively: unset 239 and 238 checks of as many, `queries=once` 330 and 330, `order=1` 242, both 332, 0 failed (a check that is KNOWN in an arm is not one of it: 17/18, 2, 14, 0). Through the render server: 202, 201, 205, 205, 0 failed; the 35 pictures' hashes the same in the four.
+- The recordings of all cases through the render server, 0 records lost: with the switch 650 commits by a look or the rescue thread, at most one a chunk, **0** for a marker that was handed over by their watermarks, 0 left, and none that says of itself what its watermarks do not; unset 4,797, 4,155 of them for nothing.
+  Natively `protection owed teardown covered host-threads`: 170 markers owed (161 for the lock, 9 for a full queue), 170 times handed over, the longest after 30.3 ms (while the lock is held 30 ms), 0 left owed; 1,899 tries of the rescue thread that could not.
+- Soaks: natively 8 seeds of 40,000 in each of the four arms: 0 wrong, 0 hung. Through the render server 120,000: unset and `once` 0 wrong; both 1 wrong, **a timestamp 0.9 ms before one ended earlier**, a kind not seen before. Repeated, six seeds in the four arms, 2.9 million Ends:
+  0 wrong in any. So it is not known whose it is; DXMT's timestamp queries have no synchronisation of their own between a look and the finishing thread (ThreadSanitizer, both arms), and nothing here touches them.
+  400,000 of seed 101: unset 1 wrong (an occlusion query in a list: 0 of 1,207, the older kind), `once` 0. `pending`: all. The long soaks of 1.4 million were not repeated.
+- `check-off-arm.py`: all the same. The reader 49 of 49, the bench 30 of 30, the runner and the scorer 21 of 21, the recorder, the samples (0 reports of ThreadSanitizer), the guest probe identical in its 8 comparisons, `game-runtime` 1100 of 1100 (one of them failed in a first run beside another and passed in three
+  after it), `obelisk-cli` 63 of 63.
+- **The runner with the owned client in the game's place, on the screen** (a temporary home and library; the Mac unlocked, nobody at it), `rehearse.py --aba`, 45 %: a series of three starts, each whole, valid and authorized by the one before it (100 % of the frames
+  whole, the game's plane and queue told, three pictures each, B 0 commits for nothing, the As 14 to 89 a window), the released generation back after each by every digest. Two series before it were ended by their own gates, as they should be: a window without its last second of
+  HUD lines (8 s windows are too short for the bench), and **thermal pressure 2 in B alone** (no wait for the Mac to cool between; the real runner refuses to start on a warm Mac). And without a window: several profiles, a switch out of turn, a series that had ended: refused, nothing started, nothing put in place;
+  the start's arguments, the switch's variable, N4N0's slot held during it and left empty after it.
+  It also showed that **wsd has one drawable more on its way for a whole start, or not, by the start**: 32.8 or 49.5 ms from its tick to the screen (7 starts: A 32.8, 32.8, 49.5, 49.5; B 49.5, 32.8, 32.8), which is none of the switch's. The scorer takes a difference of client stamp to shown that is that for inconclusive.
+- The owner's library: every one of the released 10,238 entries is there and nothing else but two lock files; the runner's checks there: none but the Mac's heat at that moment. Guest groups identical in both generations; four host files differ, DXMT alone from the round before.
+- The new reader on the real trace of 2026-11-23 at 45 %: the game's plane is told (100 % of the frames joined), 99.97 % whole, nothing not recorded.
+
+# The second round, 11:00 to 13:30 (no VRChat start)
 
 After an independent review (verdict: no-go as built) of the first round, below. DXMT `aa13aa3` (first round: `ed73857`), Neptune `f78698a`, voile-lkd `bad17a2`; wsd, the
 render server and the proxy's library byte for byte as in the first round's generation, DXMT alone is new: `59629c4e674dff21` -> `6b66e0f10cc63d03`. MacBook Air M3, macOS 27, AC.

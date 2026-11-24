@@ -27,7 +27,7 @@ def numbers(w):
                 ends=(ended.get("event", 0) + ended.get("disjoint", 0)) / signals if signals else None,
                 redundant=(w.get("queries_of_every_queue") or q).get("handed_over_and_committed"),
                 shown_p95=(c.get("shown_interval_ms") or {}).get("p95"), shown_p99=(c.get("shown_interval_ms") or {}).get("p99"),
-                client_p95=(c.get("client_to_shown_ms") or {}).get("p95"), largest_gap=c.get("largest_gap_ms"), holds=c.get("holds_of_3_refreshes_or_more"),
+                client_p95=(c.get("client_to_shown_ms") or {}).get("p95"), tick_p50=(c.get("tick_to_shown_ms") or {}).get("p50"), largest_gap=c.get("largest_gap_ms"), holds=c.get("holds_of_3_refreshes_or_more"),
                 pressure=max((p for p in (w.get("conditions") or {}).get("pressure", []) if p is not None), default=None),
                 warmup=(w.get("from_s") or 0) - (w.get("arrived_after_s") or 0), list_ends=(q.get("one_by_one") or {}).get("in_lists"))
 
@@ -70,7 +70,12 @@ def score(results):
                      f"production interval {shorter:+.2f} ms shorter than the shorter A's")
         for k, name in (("shown_p95", "shown p95"), ("shown_p99", "shown p99"), ("client_p95", "client stamp to shown p95")):
             over = b[k] - max(a1[k], a2[k]) - abs(a1[k] - a2[k])
-            if over > REFRESH_MS:
+            if k == "client_p95" and over > REFRESH_MS and abs((b["tick_p50"] or 0) - max(a1["tick_p50"] or 0, a2["tick_p50"] or 0)) > REFRESH_MS / 2:
+                # the window server's own: from its tick to the screen one drawable more for a whole start, or not, by the start
+                # (2026-11-24: 32.8 or 49.5 ms, with the switch and without). Nothing of DXMT's; nothing that can be compared either.
+                inconclusive.append(f"W{n}: {name} {b[k]:.1f} ms, the As {a1[k]:.1f} and {a2[k]:.1f}, but the window server's own part of it (tick to shown) is "
+                                    f"{b['tick_p50']:.1f} ms, the As' {a1['tick_p50']:.1f} and {a2['tick_p50']:.1f}")
+            elif over > REFRESH_MS:
                 reject.append(f"W{n}: {name} {b[k]:.1f} ms, the As {a1[k]:.1f} and {a2[k]:.1f}")
             elif b[k] > max(a1[k], a2[k]):
                 notes.append(f"W{n}: {name} is worse: {b[k]:.1f} ms, the As {a1[k]:.1f} and {a2[k]:.1f}")

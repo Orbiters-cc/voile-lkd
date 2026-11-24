@@ -5,10 +5,12 @@ are temporary, and the owned Direct3D 11 client (tests/graphics/pass_costs.cpp) 
 
 Usage: rehearse.py --cli <developer's obelisk-cli> --generation <folder> --release <Voile release folder, as Voile ships it>
                    --client <pass_costs.exe> --out <folder> [--bench <folder of bench.py>] [--mode heavy60] [--plan 58,100,45]
-                   [--switch NAME=VALUE ...]
+                   [--switch NAME=VALUE ...] [--aba]
+
+--aba: a whole series instead, three invocations of the runner as the owner makes them: without a switch, with --switch (queries=once), without.
 
 The client covers the screen for less than a minute per start. Refuses while the screen is locked."""
-import argparse, json, os, shutil, subprocess, sys
+import argparse, json, os, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,6 +28,7 @@ def main():
     p.add_argument("--window", type=int, default=8)
     p.add_argument("--passes", default="8")
     p.add_argument("--keep", action="store_true")
+    p.add_argument("--aba", action="store_true")
     a = p.parse_args()
     out = os.path.abspath(a.out)
     home = os.path.join(out, "home")
@@ -52,15 +55,25 @@ def main():
     command = ["/usr/bin/python3", "-I", os.path.join(HERE, "real_session.py"), "vrchat://launch?ref=orbiters.cc&id=wrld_00000000-0000-0000-0000-000000000000:12345~private(usr_rehearsal)~region(eu)",
                "--rehearse", "--cli", stub, "--generation", os.path.abspath(a.generation), "--bench", os.path.abspath(a.bench), "--out", os.path.join(out, "evidence"),
                "--plan", a.plan, "--warm", "4", "--window", str(a.window), "--windows", str(a.windows), "--between", "5", "--passes", a.passes]
-    for switch in a.switch:
-        command += ["--switch", switch]
-    runner = subprocess.Popen(command, env=env)
-    while True:
-        try:
-            status = runner.wait()
+    asked = [["--series", "rehearsal"] + (["--nothing-wrong-seen"] if n else []) + (["--switch", (a.switch or ["queries=once"])[0]] if n == 1 else []) for n in range(3)] if a.aba else \
+        [[x for switch in a.switch for x in ("--switch", switch)]]
+    status = 0
+    for n, more in enumerate(asked):
+        if n:  # (the real runner refuses to start on a Mac that is warm: it is waited for here)
+            time.sleep(30)
+            for _ in range(60):
+                if subprocess.run(["/usr/bin/notifyutil", "-g", "com.apple.system.thermalpressurelevel"], capture_output=True, text=True).stdout.split()[-1:] == ["0"]:
+                    break
+                time.sleep(10)
+        runner = subprocess.Popen(command + more, env=env)
+        while True:
+            try:
+                status = runner.wait() or status
+                break
+            except KeyboardInterrupt:
+                pass  # (the runner's to handle)
+        if status:
             break
-        except KeyboardInterrupt:
-            pass  # (the runner's to handle)
     last = json.loads((engine("released").strip() or "{}").splitlines()[-1])
     print("the released generation last:", last.get("event"), last.get("generation"))
     before = json.loads(first.strip().splitlines()[-1]).get("engine_files")

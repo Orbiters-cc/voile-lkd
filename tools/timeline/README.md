@@ -153,7 +153,8 @@ steady timing and no more.
   **Said separately: whether B sustained 40** distinct shown frames a second in both windows. (To ship it takes independent repeats in another
   order, not the three windows of one start counted as three: one B in the middle cannot be told from a cache of its own, another clock at the same pressure, or any drift that is not a line.)
 - **Reject**: any failure of correctness, progress or the mechanism; shown rate more than 3 % below both As in W2 and W3; or shown p95/p99, or client stamp to
-  shown p95, more than one refresh (16.7 ms) worse than both As beyond the As' own difference. A smaller worsening is said, not accepted in silence.
+  shown p95, more than one refresh (16.7 ms) worse than both As beyond the As' own difference. A smaller worsening is said, not accepted in silence. (Found in the rehearsals of 2026-11-24: for a whole start
+  wsd may have one drawable more on its way, 32.8 or 49.5 ms from its tick to the screen, with the switch and without. Where that part alone is half a refresh off, client stamp to shown is **inconclusive**: no rejection, and no keep.)
 - **Inconclusive, leave it off**: everything between: mixed results, W2 and W3 disagreeing, effects below those bands, A without redundant commits, unmatched work or heat, a second
   A that could not be made.
 
