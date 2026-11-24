@@ -50,11 +50,16 @@ And an event or disjoint query ended in a **command list** is signalled where it
 executed (early: before the list's work, and at once where the immediate context has nothing new). A list's timestamps are sampled as it begins in both.
 `GetData` with flags 0, `Flush`, the immediate context's `End`s, occlusion queries and readbacks are as they were.
 
-What a look may wait for: nothing. A query's End and looks see it whole under a leaf lock of its own. The one commit is made under the device's lock, taken only when it is
-free, after the decision is made again under it; never when the queue is full (the commit would wait for the GPU); and never when resources' initial data are pending
-or being uploaded (the uploads have a queue of two command buffers, which a commit takes one of). What could not be done for one of the three is owed: a thread of the
-context's (`dxmt-rescue-thread`, asleep while nothing is) commits the uploads, the only step that can wait, without any lock but the initializer's, and then the chunk,
-under the same rules, whether or not anybody looks again. Without the device's lock (no `SetMultithreadProtected`; the render server asks for it of every device) that thread
-commits uploads alone, and the next look the chunk. Measured: `tests/timeline/results/2026-11-24-query-rescue.md`.
+What a look waits for: for nobody who holds a lock or the GPU. A query's End and looks see it whole under a leaf lock of its own. The one commit is made under the device's lock, taken only when it is
+free, after the decision is made again under it, and never when the queue is full (the commit would wait for the GPU). Uploads that are pending hold nothing up: the chunk is
+committed at once with the id of what it waits for on the GPU. What could not be done for the lock or a full queue, and the uploads, are owed: a thread of the
+context's (`dxmt-rescue-thread`, asleep while nothing is) commits the uploads, the only step that can wait, without any lock but the initializer's, and the chunk,
+under the same rules, whether or not anybody looks again. **What is owed stays owed until its chunk was handed to the encoder, or the context ends.** It is no bound of wall-clock time
+(leaf locks, allocations and scheduling remain), and a thread that keeps the device's lock while it waits for what only another thread looks at is never rescued.
+
+**The device's lock is on for as long as the device is there** (`D3D11MultithreadOnce`), from before its context is made, whatever the application sets with `ID3D11Multithread::SetMultithreadProtected`: whoever
+records is in it, and nothing takes it from the rescue thread or from a call. `GetMultithreadProtected` and `SetMultithreadProtected` say what the application set; `Enter` holds the lock while it is set, and nothing
+while it is not; `Leave` lets go of what its own thread entered; setting it to FALSE lets go of what the thread that sets it has entered, and waits for nobody. (What another thread has entered by then it keeps until its own `Leave`:
+unset, the lock is taken from it.) Measured: `tests/timeline/results/2026-11-24-query-rescue.md`.
 
 `tests/graphics/query_client.cpp` (`run-query-client.sh`) is what it was proven with; `otl.py --queries` tells what the looks of a recording flushed.
