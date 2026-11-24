@@ -1,6 +1,6 @@
 # The window server's developer switches
 
-Two variables of `wsd`'s environment, both unset in every release and for every player. Unset, `wsd` does exactly what it did without
+Two variables of `wsd`'s environment (and, below, two of the render server's), all unset in every release and for every player. Unset, `wsd` does exactly what it did without
 them: the same drawables, the same shader, the same calls, nothing more loaded (MetalFX is never linked). `launch.sh` of the developer's
 obelisk-cli (Obelisk, branch `perf-timeline`, feature `developer-timeline`) takes them out of the environment, whoever set them, and
 gives them to `wsd` alone; no other engine file and nothing of the emulated game knows them.
@@ -62,4 +62,17 @@ records is in it, and nothing takes it from the rescue thread or from a call. `G
 while it is not; `Leave` lets go of what its own thread entered; setting it to FALSE lets go of what the thread that sets it has entered, and waits for nobody. (What another thread has entered by then it keeps until its own `Leave`:
 unset, the lock is taken from it.) Measured: `tests/timeline/results/2026-11-24-query-rescue.md`.
 
-`tests/graphics/query_client.cpp` (`run-query-client.sh`) is what it was proven with; `otl.py --queries` tells what the looks of a recording flushed.
+## `OBELISK_DXMT_INIT_ORDER=1` (the render server's)
+
+DXMT's too (`src/dxmt/dxmt_init_order.hpp`), given the same way, apart from the other: the A/B/A of `queries=once` is made without it. Unset, every flag, command and encoder is as released.
+
+- A resource that is **immutable and made without its data** (none is, in Direct3D; every one Neptune's guest makes is, and its data are the update that follows) is not taken for one the GPU only
+  reads: what it is written by is put in order with what reads it, as any other resource's, for the GPU and for the optimiser. Unset, a draw of the same frame may see what was there before.
+- A render pass whose last draws were counted by an **occlusion query** ends with the counting off. DXMT puts two passes of the same targets together by putting their commands together; unset, the first one's last
+  query goes on counting the second one's draws, until one of them begins to be counted itself.
+
+What it costs: the draws that read such a resource look its last write up, as they do for every other resource. Measured: `tests/timeline/results/2026-11-24-query-rescue.md`.
+
+## What they were proven with
+
+`tests/graphics/query_client.cpp` (`run-query-client.sh`) is what the render server's two were proven with; `otl.py --queries` tells what the looks of a recording flushed.

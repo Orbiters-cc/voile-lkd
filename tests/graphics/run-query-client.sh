@@ -3,7 +3,7 @@
 # DXMT), in a TEMPORARY runtime and prefix: never the owner's library.
 #
 # Usage: run-query-client.sh <runtime> <home> <launch.sh> <out-folder> <limit, seconds> cases|soak|pending [...]   (as run-pass-costs.sh)
-#   TIMELINE=1  with the host timeline, read by case; OBELISK_DXMT_QUERY_RESCUE=once: with the switch
+#   TIMELINE=1  with the host timeline, read by case; OBELISK_DXMT_QUERY_RESCUE=once, OBELISK_DXMT_INIT_ORDER=1: with the switch
 set -u
 W=$(cd "$(dirname "$0")" && pwd)
 RUNTIME=$1 HOMEDIR=$2 LAUNCH=$3 OUT=$4 LIMIT=$5
@@ -15,7 +15,7 @@ cp "$W/bin/query_client.exe" "$INSTALL/"
   date "+%Y-%m-%d %H:%M:%S"
   pmset -g therm
   "$W/others-busy.sh"
-  echo "OBELISK_DXMT_QUERY_RESCUE=${OBELISK_DXMT_QUERY_RESCUE-} timeline ${TIMELINE-0}: $*"
+  echo "OBELISK_DXMT_QUERY_RESCUE=${OBELISK_DXMT_QUERY_RESCUE-} OBELISK_DXMT_INIT_ORDER=${OBELISK_DXMT_INIT_ORDER-} timeline ${TIMELINE-0}: $*"
   for f in engine/wsd graphics/libexec/virgl_render_server graphics/lib/libvirglrenderer.1.dylib graphics/dxmt-native.framework/Versions/A/dxmt-native; do
     echo "$f $(shasum -a 256 "$RUNTIME/$f" | cut -c1-16)"
   done

@@ -13,8 +13,9 @@ One start per invocation: the timeline generation is put in place for it and the
 happened. At the Mac, unlocked, plugged in, idle and cool, hands off for about eight minutes. The options:
   --switch NAME=VALUE  upscale=metalfx: wsd scales a frame smaller than the window with MetalFX Spatial; present=<list> of arrival,
                        attime, nosync, two: how wsd presents (wsd/wsd.m says what each is); queries=once: DXMT's looks at an event query
-                       that is not there flush once, not at each look (dxmt, src/d3d11/d3d11_query.hpp). None is the programs as ever.
-                       They reach wsd, and the last the render server, alone (launch.sh), never the game. In the manifest, the
+                       that is not there flush once, not at each look (dxmt, src/d3d11/d3d11_query.hpp); order=1: DXMT orders an immutable resource's
+                       data, and ends an occlusion query's counting with its pass (src/dxmt/dxmt_init_order.hpp). None is the programs as ever.
+                       They reach wsd, and the last two the render server, alone (launch.sh), never the game. In the manifest, the
                        result and the folder's name
   --series NAME      the series (letters, digits, - and _): the folder in --out
   --nothing-wrong-seen   no warning, crash, hang or lost picture was seen in the series' starts so far
@@ -110,7 +111,7 @@ def processes():
 
 
 SWITCHES = {"upscale": ("OBELISK_WSD_UPSCALE", {"metalfx"}), "present": ("OBELISK_WSD_PRESENT", {"arrival", "attime", "nosync", "two"}),
-            "queries": ("OBELISK_DXMT_QUERY_RESCUE", {"once"})}
+            "queries": ("OBELISK_DXMT_QUERY_RESCUE", {"once"}), "order": ("OBELISK_DXMT_INIT_ORDER", {"1"})}
 PICTURE = os.path.join(HERE, "bin", "window_picture")  # (build-window-picture.sh)
 
 

@@ -4,13 +4,14 @@
  * (build-query-client.sh): Windows x86-64, run through the engine's Wine, Neptune and the render server (run-query-client.sh),
  * and a Mac program on libdxmt-native itself, whose every look is the application's own (so that they can be counted).
  *
- * Usage: query_client [-d <dxmt-native>] [-once] cases [case ...]
+ * Usage: query_client [-d <dxmt-native>] [-once] [-order] cases [case ...]
  *        query_client [-d <dxmt-native>] [-once] soak <seed> <generations> [wide]
  *        query_client [-d <dxmt-native>] [-once] bench <gated|busy|rings|lists> <frames>   (frames as fast as they come: BENCH lines)
  *        query_client [-d <dxmt-native>] pending        (ends the process with queries pending)
  *
  * The pictures are solid rectangles: what each must be is also drawn by the CPU, and compared byte for byte.
- * -once: the switch is on (the Mac program sees it in its environment): what only it promises is checked, and is otherwise told (KNOWN).
+ * -once, -order: the switch (OBELISK_DXMT_QUERY_RESCUE=once, OBELISK_DXMT_INIT_ORDER=1) is on (the Mac program sees it in its environment): what
+ * only it promises is checked, and is otherwise told (KNOWN).
  * Lines: MODE <case> frames=1 begin=<ns> end=<ns> (tools/timeline/otl.py --modes cuts a recording by them), CHECK <case> <what>
  * ok|FAIL|UNSUPPORTED, HASH <case> <crc32>, NOTE. Ends with RESULT PASS or RESULT FAIL. A watchdog ends the process (exit 3) when
  * nothing has progressed for 20 s.
@@ -75,6 +76,7 @@ static void say(const char *format, ...) {
 }
 #define HR(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { say("FAILED %s 0x%08lx in %s\nRESULT FAIL\n", #x, (unsigned long)hr_, doing.load()); leave(1); } } while (0)
 
+static bool ordered; /* OBELISK_DXMT_INIT_ORDER=1, as far as this program is told */
 static bool once; /* OBELISK_DXMT_QUERY_RESCUE=once, as far as this program is told */
 /* On libdxmt-native itself every look is this program's; through Neptune a look reads what the render server's own looks published (and for
  * a query ended in a command list, nothing is published: the guest asks itself, 50 ms later at the earliest). */
@@ -131,6 +133,7 @@ static const Vertex kFull[3] = {{{-1, -1}, {0, 1}, {1, 1, 1, 1}}, {{-1, 3}, {0, 
 struct Colour { uint8_t v[4]; };
 static const UINT DONT = D3D11_ASYNC_GETDATA_DONOTFLUSH;
 
+static bool immutable_as_host; /* natively: immutable textures are made without their data, and updated, as Neptune's host makes what the guest made with them */
 /* A device, its immediate context, what a rectangle takes, two pictures, and the same two by the CPU. */
 struct Gpu {
   ID3D11Device *dev = nullptr;
@@ -264,7 +267,9 @@ struct Gpu {
     D3D11_SUBRESOURCE_DATA init = {data.data(), 64 * 4, 0};
     ID3D11Texture2D *t;
     ID3D11ShaderResourceView *v;
-    HR(dev->CreateTexture2D(&d, &init, &t));
+    const bool late = usage == D3D11_USAGE_IMMUTABLE && immutable_as_host;
+    HR(dev->CreateTexture2D(&d, late ? nullptr : &init, &t));
+    if (late) ctx->UpdateSubresource(t, 0, nullptr, data.data(), 64 * 4, 0);
     HR(dev->CreateShaderResourceView(t, nullptr, &v));
     use(i);
     D3D11_VIEWPORT vp = {(float)x, (float)y, (float)w, (float)h, 0, 1};
@@ -823,7 +828,7 @@ static void list_events() {
 /* Textures made with their data on another thread, all the time, while the GPU is busy and this thread ends events and only looks: how
  * long a look takes (the uploads have a queue of two command buffers of their own, which a commit may wait for), without the device's lock
  * and with it. */
-static void uploads_of(bool locked) {
+static void uploads_of(bool locked, D3D11_USAGE small = D3D11_USAGE_DEFAULT) { /* small: of the textures that are drawn */
   ID3D11Multithread *mt = nullptr;
   if (locked && FAILED(g.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt))) return;
   if (mt) mt->SetMultithreadProtected(TRUE);
@@ -852,7 +857,7 @@ static void uploads_of(bool locked) {
   for (int n = 0; n < 60; n++) {
     g.rect(0, n * 3, n * 2 + locked, 20, 20, shade(n));
     g.burn(layers_40ms / 2);
-    for (int k = 0; k < 8; k++) g.fresh_rect(1, k * 30, n * 4 + locked, 20, 3, shade(n * 8 + k + locked)); /* (its upload is of the chunk that only the looks commit) */
+    for (int k = 0; k < 8; k++) g.fresh_rect(1, k * 30, n * 4 + locked, 20, 3, shade(n * 8 + k + locked), small); /* (its upload is of the chunk that only the looks commit) */
     g.ctx->End(e);
     const uint64_t began = ns();
     HRESULT hr = S_FALSE;
@@ -909,13 +914,335 @@ static void uploads() {
   e->Release();
   uint32_t crc;
   const unsigned bad = g.differs(1, &crc);
-  if (bad && !native) {
+  if (bad && !native && !ordered) {
     say("CHECK uploads of immutable textures: %u pixels drawn before their texture's data: KNOWN (Neptune and DXMT, with the switch and without)\n", bad);
     g.use(1);
     g.clear(1, shade(2));
   } else {
     check(!bad, "immutable textures: their data were seen (%u pixels differ)", bad);
   }
+}
+
+/* Resources that are immutable, made with their data and read at once: what is drawn is their data, and nothing that was there before. Natively the data
+ * come with the resource; through Neptune they are an update that follows it, which without OBELISK_DXMT_INIT_ORDER=1 is in no order with the draws
+ * that read it (told, KNOWN: the number is what is compared). Beside another thread that makes and fills textures all the time. */
+struct Immutable { /* a texture of one colour, immutable */
+  ID3D11Texture2D *t = nullptr;
+  ID3D11ShaderResourceView *v = nullptr;
+  void make(Colour k, UINT px, UINT mips, D3D11_USAGE usage) {
+    std::vector<uint8_t> data(px * px * 4);
+    for (size_t n = 0; n < data.size(); n++) data[n] = k.v[n & 3];
+    D3D11_TEXTURE2D_DESC d = {px, px, mips, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, usage, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    std::vector<D3D11_SUBRESOURCE_DATA> init(mips);
+    for (UINT m = 0; m < mips; m++) init[m] = {data.data(), std::max(1u, px >> m) * 4, 0};
+    HR(g.dev->CreateTexture2D(&d, immutable_as_host ? nullptr : init.data(), &t));
+    for (UINT m = 0; immutable_as_host && m < mips; m++) g.ctx->UpdateSubresource(t, m, nullptr, init[m].pSysMem, init[m].SysMemPitch, 0);
+    HR(g.dev->CreateShaderResourceView(t, nullptr, &v));
+  }
+  void draw(int x, int y, int w, int h) { /* on whatever the target is */
+    D3D11_VIEWPORT vp = {(float)x, (float)y, (float)w, (float)h, 0, 1};
+    UINT stride = sizeof(Vertex), off = 0;
+    g.ctx->RSSetViewports(1, &vp);
+    g.ctx->IASetVertexBuffers(0, 1, &g.vb, &stride, &off);
+    g.ctx->IASetInputLayout(g.layout);
+    g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.ctx->VSSetShader(g.vs, nullptr, 0);
+    g.ctx->PSSetShader(g.ps_tex, nullptr, 0);
+    g.ctx->PSSetSamplers(0, 1, &g.sampler);
+    g.ctx->PSSetShaderResources(0, 1, &v);
+    g.ctx->OMSetBlendState(nullptr, nullptr, ~0u);
+    g.ctx->OMSetDepthStencilState(g.pass, 0);
+    g.ctx->Draw(3, 0);
+  }
+  void drop() { if (v) v->Release(); if (t) t->Release(); *this = {}; }
+};
+static void told(const char *what, int i) {
+  const unsigned bad = g.differs(i, nullptr);
+  note("COUNT %s: %u pixels differ", what, bad);
+  if (bad && (!native || immutable_as_host) && !ordered) {
+    say("CHECK immutables %s: %u pixels drawn before the data: KNOWN (Neptune and DXMT, as released)\n", what, bad);
+  } else {
+    check(!bad, "%s: the data were seen (%u pixels differ)", what, bad);
+  }
+  g.use(i);
+  g.clear(i, {{0, 0, 0, 255}});
+}
+static void immutables_of() {
+  for (int locked = 0; locked < 2; locked++) { /* (uploads()'s own streaming, its small textures immutable) */
+    uploads_of(locked, D3D11_USAGE_IMMUTABLE);
+    told(locked ? "streamed, the device's lock on" : "streamed", 1);
+  }
+  ID3D11Query *e = g.query(D3D11_QUERY_EVENT);
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> ahead{0};
+  std::vector<uint8_t> bulk(4096 * 4096 * 4, 0x55);
+  std::thread uploader([&] { /* a world that streams in */
+    for (unsigned n = 0; !stop; n++) {
+      const UINT px = n % 16 == 7 ? 4096 : n % 4 == 1 ? 2048 : 512;
+      D3D11_TEXTURE2D_DESC d = {px, px, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+      D3D11_SUBRESOURCE_DATA init = {bulk.data(), px * 4, 0};
+      ID3D11Texture2D *t;
+      HR(g.dev->CreateTexture2D(&d, &init, &t));
+      t->Release();
+      nap_us(300);
+      ahead += px * px * 4;
+      while (!stop && ahead > 1ull << 30) nap_us(500);
+    }
+  });
+  auto frame_done = [&] { g.ctx->End(e); const HRESULT hr = look_event(e, DONT, 4000, 60).hr; if (hr != S_OK) check(false, "an event of it was there"); ahead = 0; progress++; };
+  { /* first used in the middle of what is drawn already, of the same target; seen the next frame again */
+    std::vector<Immutable> kept;
+    for (int n = 0; n < 60; n++) {
+      g.burn(layers_40ms / 4);
+      g.rect(1, 0, n * 4, 8, 3, shade(n + 1));
+      for (int k = 0; k < 6; k++) {
+        Immutable m;
+        m.make(shade(n * 8 + k + 3), 64, 7, D3D11_USAGE_IMMUTABLE);
+        g.use(1);
+        m.draw(10 + k * 30, n * 4, 20, 3);
+        g.drawn(1, 10 + k * 30, n * 4, 20, 3, shade(n * 8 + k + 3));
+        g.rect(1, 31 + k * 30, n * 4, 8, 3, shade(n + k));
+        kept.push_back(m);
+      }
+      frame_done();
+    }
+    told("first used in a pass that draws", 1);
+    g.use(1);
+    for (size_t n = 0; n < kept.size(); n++) {
+      g.use(1);
+      kept[n].draw((int)(n % 24) * 10, (int)(n / 24) * 6, 8, 4);
+      g.drawn(1, (int)(n % 24) * 10, (int)(n / 24) * 6, 8, 4, shade((unsigned)(n / 6) * 8 + n % 6 + 3));
+    }
+    frame_done();
+    { /* (whatever was first seen of them, they are there now: in every arm) */
+      const unsigned bad = g.differs(1, nullptr);
+      check(!bad, "used again: the data were seen (%u pixels differ)", bad);
+      g.use(1);
+      g.clear(1, {{0, 0, 0, 255}});
+    }
+    for (auto &m : kept) m.drop();
+  }
+  { /* a target derived from the first use, which is kept: what it missed it misses as long as it is not drawn again */
+    ID3D11Texture2D *atlas;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+    D3D11_TEXTURE2D_DESC d = {PX, PX, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    HR(g.dev->CreateTexture2D(&d, nullptr, &atlas));
+    HR(g.dev->CreateRenderTargetView(atlas, nullptr, &rtv));
+    HR(g.dev->CreateShaderResourceView(atlas, nullptr, &srv));
+    const float black[4] = {0, 0, 0, 1};
+    g.ctx->ClearRenderTargetView(rtv, black);
+    for (int n = 0; n < 60; n++) {
+      g.burn(layers_40ms / 4);
+      g.ctx->OMSetRenderTargets(1, &rtv, nullptr);
+      g.target = -1;
+      for (int k = 0; k < 8; k++) {
+        Immutable m;
+        m.make(shade(n * 8 + k + 5), 32, 1, D3D11_USAGE_IMMUTABLE);
+        m.draw(k * 30, n * 4, 20, 3);
+        g.drawn(1, k * 30, n * 4, 20, 3, shade(n * 8 + k + 5));
+        m.drop();
+      }
+      frame_done();
+    }
+    for (int n = 0; n < 8; n++) { g.burn(layers_40ms / 8); frame_done(); } /* (nothing of the sources is left, nothing is under way) */
+    g.use(1);
+    Immutable a;
+    a.t = atlas; a.v = srv;
+    a.draw(0, 0, PX, PX);
+    told("a target derived from the first use, kept", 1);
+    rtv->Release();
+    a.drop();
+  }
+  { /* vertex buffers: a mesh that is missing */
+    std::vector<uint8_t> pad(1 << 20);
+    for (int n = 0; n < 60; n++) {
+      g.burn(layers_40ms / 4);
+      for (int k = 0; k < 8; k++) {
+        const bool large = k == 7; /* the triangle at the end of a MiB */
+        D3D11_BUFFER_DESC bd = {large ? (UINT)pad.size() : (UINT)sizeof(kFull), D3D11_USAGE_IMMUTABLE, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};
+        memcpy(&pad[pad.size() / 32 * 32 - 32 * 3], kFull, sizeof(kFull));
+        D3D11_SUBRESOURCE_DATA init = {large ? (const void *)pad.data() : kFull, 0, 0};
+        ID3D11Buffer *vb;
+        HR(g.dev->CreateBuffer(&bd, immutable_as_host ? nullptr : &init, &vb));
+        if (immutable_as_host && large && (n & 1)) { /* in two parts */
+          const D3D11_BOX first = {0, 0, 0, 1 << 19, 1, 1}, second = {1 << 19, 0, 0, 1 << 20, 1, 1};
+          g.ctx->UpdateSubresource(vb, 0, &first, pad.data(), 0, 0);
+          g.ctx->UpdateSubresource(vb, 0, &second, pad.data() + (1 << 19), 0, 0);
+        } else if (immutable_as_host) {
+          g.ctx->UpdateSubresource(vb, 0, nullptr, init.pSysMem, 0, 0);
+        }
+        g.use(1);
+        g.rect_on(g.ctx, 0, 0, 0, 0, shade(n * 8 + k + 7), false); /* (its state, and the colour; nothing seen) */
+        UINT stride = sizeof(Vertex), off = large ? (UINT)(pad.size() / 32 * 32 - 32 * 3) : 0;
+        D3D11_VIEWPORT vp = {(float)(k * 30), (float)(n * 4), 20, 3, 0, 1};
+        g.ctx->RSSetViewports(1, &vp);
+        g.ctx->OMSetDepthStencilState(g.pass, 0);
+        g.ctx->IASetVertexBuffers(0, 1, &vb, &stride, &off);
+        g.ctx->Draw(3, 0);
+        g.drawn(1, k * 30, n * 4, 20, 3, shade(n * 8 + k + 7));
+        vb->Release();
+      }
+      frame_done();
+    }
+    told("vertex buffers", 1);
+  }
+  { /* made on another thread, handed over as soon as they are */
+    for (int n = 0; n < 60; n++) {
+      g.burn(layers_40ms / 4);
+      Immutable m[8];
+      std::atomic<int> ready{0};
+      std::thread maker([&] { for (int k = 0; k < 8; k++) { m[k].make(shade(n * 8 + k + 9), 64, 1, D3D11_USAGE_IMMUTABLE); ready = k + 1; } });
+      for (int k = 0; k < 8; k++) {
+        while (ready <= k) std::this_thread::yield();
+        g.use(1);
+        m[k].draw(k * 30, n * 4, 20, 3);
+        g.drawn(1, k * 30, n * 4, 20, 3, shade(n * 8 + k + 9));
+      }
+      maker.join();
+      frame_done();
+      for (auto &x : m) x.drop();
+    }
+    told("made on another thread", 1);
+  }
+  stop = true;
+  uploader.join();
+  e->Release();
+}
+
+static void immutables() {
+  immutables_of();
+  if (!native) return;
+  ID3D11Multithread *mt; /* (another thread updates what it makes: the host's lock is on) */
+  HR(g.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt));
+  mt->SetMultithreadProtected(TRUE);
+  g.clear(0, {{0, 0, 0, 255}});
+  immutable_as_host = true;
+  note("as Neptune's host makes them");
+  immutables_of();
+  immutable_as_host = false;
+  mt->SetMultithreadProtected(FALSE);
+  mt->Release();
+}
+
+/* An occlusion query whose draws are the last of their pass, and what is drawn after it on the same targets: exact counts. Its list executed once, twice,
+ * beside another's, and in between what nobody counts. Without OBELISK_DXMT_INIT_ORDER=1 the passes are put together with the counting on (told, KNOWN). */
+static void occlusion_join() {
+  ID3D11DeviceContext *dc;
+  HR(g.dev->CreateDeferredContext(0, &dc));
+  ID3D11Query *a = g.query(D3D11_QUERY_OCCLUSION), *b = g.query(D3D11_QUERY_OCCLUSION);
+  unsigned wrong = 0, rounds = 0;
+  uint64_t over = 0;
+  auto list = [&](ID3D11Query *q, int x, int w, int h, Colour k) {
+    ID3D11CommandList *l;
+    Gpu::use_on(dc, g.picture[0]);
+    dc->Begin(q);
+    g.rect_on(dc, x, 10, w, h, k);
+    dc->End(q); /* (nothing is drawn after it in the list) */
+    HR(dc->FinishCommandList(FALSE, &l));
+    return l;
+  };
+  auto count = [&](ID3D11Query *q, uint64_t want, const char *what) {
+    UINT64 got = ~0ull;
+    const HRESULT hr = look(g.ctx, q, 0, &got, sizeof(got)).hr;
+    rounds++;
+    if (hr != S_OK || got != want) {
+      wrong++;
+      over += got > want ? got - want : 0;
+      if (wrong <= 4) note("%s: 0x%08lx, %llu of %llu", what, (unsigned long)hr, (unsigned long long)got, (unsigned long long)want);
+    }
+  };
+  /* In one list: the counted draws are the last of a pass, and another pass of the same targets follows that could be put together with it. */
+  for (int n = 0; n < 200; n++) {
+    const int w = 20 + n % 17, h = 10 + n % 11;
+    const Colour k = shade(n);
+    auto on = [&](int i) { Gpu::use_on(dc, g.picture[i]); };
+    auto counted = [&](ID3D11Query *q, int x, int w, int h) { dc->Begin(q); g.rect_on(dc, x, 150, w, h, k); dc->End(q); };
+    uint64_t want_a = (uint64_t)w * h, want_b = 0;
+    on(0);
+    switch (n % 5) {
+    case 0: counted(a, 5, w, h); on(1); g.rect_on(dc, 5, 150, 30, 30, k); on(0); g.rect_on(dc, 100, 150, 40, 41, k); break;
+    case 1: g.rect_on(dc, 150, 150, 9, 9, k); counted(a, 5, w, h); on(1); g.rect_on(dc, 5, 150, 30, 30, k); on(0); g.rect_on(dc, 100, 150, 40, 41, k); counted(b, 60, h, w); want_b = want_a; break;
+    case 2: /* a query open across a target, ended there: the first pass ends counting, and the third is nobody's */
+      dc->Begin(a); g.rect_on(dc, 5, 150, w, h, k); on(1); g.rect_on(dc, 5, 150, 7, 8, k); dc->End(a); want_a += 7 * 8;
+      on(0); g.rect_on(dc, 100, 150, 40, 41, k);
+      break;
+    case 3: counted(a, 5, w, h); on(1); g.rect_on(dc, 5, 150, 30, 30, k); on(0); counted(b, 60, h, w); on(1); g.rect_on(dc, 50, 150, 30, 30, k); on(0); g.rect_on(dc, 100, 150, 40, 41, k); want_b = want_a; break;
+    case 4: /* two open at once, one ended */
+      dc->Begin(a); dc->Begin(b); g.rect_on(dc, 5, 150, w, h, k); dc->End(b); want_b = want_a; g.rect_on(dc, 60, 150, 11, 3, k); dc->End(a); want_a += 33;
+      on(1); g.rect_on(dc, 5, 150, 30, 30, k); on(0); g.rect_on(dc, 100, 150, 40, 41, k);
+      break;
+    }
+    ID3D11CommandList *l;
+    HR(dc->FinishCommandList(FALSE, &l));
+    g.ctx->ExecuteCommandList(l, FALSE);
+    if (n % 7 == 3) g.ctx->ExecuteCommandList(l, FALSE); /* (again: what it counts is the same) */
+    g.target = -1;
+    const char *what[] = {"in a list: its target, another, its own", "in a list: the second query after", "in a list: open across a target", "in a list: twice, and nobody's", "in a list: two open"};
+    count(a, want_a, what[n % 5]);
+    if (want_b) count(b, want_b, what[n % 5]);
+    l->Release();
+    progress++;
+  }
+  for (int i = 0; i < 2; i++) { g.use(i); g.clear(i, {{0, 0, 0, 255}}); }
+  for (int n = 0; n < 200; n++) {
+    const int w = 20 + n % 17, h = 10 + n % 11;
+    ID3D11CommandList *la = list(a, 5, w, h, shade(n)), *lb = list(b, 60, h, w, shade(n + 1));
+    g.use(0);
+    switch (n % 5) {
+    case 0: /* the list, then draws of the same targets */
+      g.ctx->ExecuteCommandList(la, FALSE);
+      g.target = -1;
+      g.rect(0, 100, 50, 40, 41, shade(n + 2));
+      g.drawn(0, 5, 10, w, h, shade(n));
+      count(a, (uint64_t)w * h, "a list, then draws");
+      break;
+    case 1: /* draws, the list, draws */
+      g.rect(0, 100, 50, 40, 41, shade(n + 2));
+      g.ctx->ExecuteCommandList(la, TRUE);
+      g.rect(0, 100, 100, 40, 41, shade(n + 3));
+      g.drawn(0, 5, 10, w, h, shade(n));
+      count(a, (uint64_t)w * h, "draws, a list, draws");
+      break;
+    case 2: /* two lists, each with its own, and draws */
+      g.ctx->ExecuteCommandList(la, FALSE);
+      g.ctx->ExecuteCommandList(lb, FALSE);
+      g.target = -1;
+      g.rect(0, 100, 50, 40, 41, shade(n + 2));
+      g.drawn(0, 5, 10, w, h, shade(n));
+      g.drawn(0, 60, 10, h, w, shade(n + 1));
+      count(a, (uint64_t)w * h, "two lists, the first");
+      count(b, (uint64_t)w * h, "two lists, the second");
+      break;
+    case 3: /* the same list twice: the second execution's count */
+      g.ctx->ExecuteCommandList(la, FALSE);
+      g.ctx->ExecuteCommandList(la, FALSE);
+      g.target = -1;
+      g.rect(0, 100, 50, 40, 41, shade(n + 2));
+      g.drawn(0, 5, 10, w, h, shade(n));
+      count(a, (uint64_t)w * h, "a list twice");
+      break;
+    case 4: /* the immediate context's own: its last draws counted, then another target, then the first again */
+      g.ctx->Begin(a);
+      g.rect(0, 5, 10, w, h, shade(n));
+      g.ctx->End(a);
+      g.rect(1, 5, 10, 30, 30, shade(n + 5));
+      g.rect(0, 100, 50, 40, 41, shade(n + 2));
+      count(a, (uint64_t)w * h, "its own, another target, the first");
+      break;
+    }
+    la->Release();
+    lb->Release();
+    progress++;
+  }
+  note("COUNT occlusion: %u of %u wrong, %llu samples too many", wrong, rounds, (unsigned long long)over);
+  if (wrong && !ordered) {
+    say("CHECK occlusion-join %u of %u counts wrong: KNOWN (passes put together with the counting on, as released)\n", wrong, rounds);
+  } else {
+    check(!wrong, "%u counts, each exact (%u wrong)", rounds, wrong);
+  }
+  picture_good();
+  a->Release(); b->Release(); dc->Release();
 }
 
 /* Exact counts, no draws, hidden draws, across target changes and chunks; predicates. */
@@ -1666,7 +1993,7 @@ static void protection() {
 struct Case { const char *name; void (*run)(); };
 static const Case kCases[] = {
     {"noflush-spin", noflush_spin}, {"flags-zero", flags_zero}, {"covered", covered}, {"one-rescue", one_rescue}, {"pacing", pacing}, {"reuse", reuse},
-    {"deferred", deferred}, {"list-events", list_events}, {"uploads", uploads}, {"occlusion", occlusion}, {"timestamps", timestamps}, {"readback", readback}, {"predication", predication}, {"waits", waits},
+    {"deferred", deferred}, {"list-events", list_events}, {"uploads", uploads}, {"immutables", immutables}, {"occlusion", occlusion}, {"occlusion-join", occlusion_join}, {"timestamps", timestamps}, {"readback", readback}, {"predication", predication}, {"waits", waits},
     {"keyed", keyed}, {"teardown", teardown}, {"two-threads", two_threads},
 #ifndef _WIN32
     {"sixty-four", sixty_four}, {"host-threads", host_threads}, {"owed", owed}, {"protection", protection},
@@ -1981,7 +2308,8 @@ int main(int argc, char **argv) {
   if (!create_device) { printf("-d <dxmt-native> is needed\n"); return 2; }
   if (const char *rescue = getenv("OBELISK_DXMT_QUERY_RESCUE")) once = !strcmp(rescue, "once");
 #endif
-  if (argc > at && !strcmp(argv[at], "-once")) { once = true; at++; }
+  if (const char *order = getenv("OBELISK_DXMT_INIT_ORDER")) ordered = ordered || !strcmp(order, "1");
+  for (; argc > at && (!strcmp(argv[at], "-once") || !strcmp(argv[at], "-order")); at++) (argv[at][2] == 'n' ? once : ordered) = true;
   const std::string what = argc > at ? argv[at++] : "cases";
   std::thread([] {
     uint64_t last = ~0ull;

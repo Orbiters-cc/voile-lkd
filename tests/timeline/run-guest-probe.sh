@@ -33,9 +33,10 @@ one timeline-on timeline "$LAUNCH" OBELISK_TIMELINE="$D/on" OBELISK_TIMELINE_MB=
 one timeline-half timeline "$LAUNCH" OBELISK_TIMELINE_MB=64 OBELISK_TIMELINE_PASSES=8
 one switches timeline "$LAUNCH" OBELISK_WSD_UPSCALE=metalfx OBELISK_WSD_PRESENT=arrival
 one queries timeline "$LAUNCH" OBELISK_DXMT_QUERY_RESCUE=once
-one all timeline "$LAUNCH" OBELISK_WSD_UPSCALE=metalfx OBELISK_WSD_PRESENT=arrival OBELISK_DXMT_QUERY_RESCUE=once OBELISK_TIMELINE="$D/on" OBELISK_TIMELINE_MB=64 OBELISK_TIMELINE_PASSES=8
+one order timeline "$LAUNCH" OBELISK_DXMT_INIT_ORDER=1
+one all timeline "$LAUNCH" OBELISK_WSD_UPSCALE=metalfx OBELISK_WSD_PRESENT=arrival OBELISK_DXMT_QUERY_RESCUE=once OBELISK_DXMT_INIT_ORDER=1 OBELISK_TIMELINE="$D/on" OBELISK_TIMELINE_MB=64 OBELISK_TIMELINE_PASSES=8
 status=0
-for name in ${RELEASED:+released-script} timeline-off timeline-on timeline-half switches queries all; do
+for name in ${RELEASED:+released-script} timeline-off timeline-on timeline-half switches queries order all; do
     if diff "$D/out/released-off.txt" "$D/out/$name.txt" > "$D/out/$name.diff"; then
         echo "identical: $name ($(wc -l < "$D/out/$name.txt" | tr -d ' ') lines: $(cut -d' ' -f1 "$D/out/$name.txt" | sort | uniq -c | awk '{printf "%s%s %s", s, $1, $2; s=", "}'))"
     else
