@@ -4,11 +4,13 @@
  * (build-query-client.sh): Windows x86-64, run through the engine's Wine, Neptune and the render server (run-query-client.sh),
  * and a Mac program on libdxmt-native itself, whose every look is the application's own (so that they can be counted).
  *
- * Usage: query_client [-d <dxmt-native>] cases [case ...]
- *        query_client [-d <dxmt-native>] soak <seed> <generations> [wide]
+ * Usage: query_client [-d <dxmt-native>] [-once] cases [case ...]
+ *        query_client [-d <dxmt-native>] [-once] soak <seed> <generations> [wide]
+ *        query_client [-d <dxmt-native>] [-once] bench <gated|busy|rings|lists> <frames>   (frames as fast as they come: BENCH lines)
  *        query_client [-d <dxmt-native>] pending        (ends the process with queries pending)
  *
  * The pictures are solid rectangles: what each must be is also drawn by the CPU, and compared byte for byte.
+ * -once: the switch is on (the Mac program sees it in its environment): what only it promises is checked, and is otherwise told (KNOWN).
  * Lines: MODE <case> frames=1 begin=<ns> end=<ns> (tools/timeline/otl.py --modes cuts a recording by them), CHECK <case> <what>
  * ok|FAIL|UNSUPPORTED, HASH <case> <crc32>, NOTE. Ends with RESULT PASS or RESULT FAIL. A watchdog ends the process (exit 3) when
  * nothing has progressed for 20 s.
@@ -73,6 +75,14 @@ static void say(const char *format, ...) {
 }
 #define HR(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { say("FAILED %s 0x%08lx in %s\nRESULT FAIL\n", #x, (unsigned long)hr_, doing.load()); leave(1); } } while (0)
 
+static bool once; /* OBELISK_DXMT_QUERY_RESCUE=once, as far as this program is told */
+/* On libdxmt-native itself every look is this program's; through Neptune a look reads what the render server's own looks published (and for
+ * a query ended in a command list, nothing is published: the guest asks itself, 50 ms later at the earliest). */
+#ifdef _WIN32
+static const bool native = false;
+#else
+static const bool native = true;
+#endif
 static const char *current = "";
 static bool check(bool good, const char *format, ...) {
   char text[400];
@@ -246,6 +256,34 @@ struct Gpu {
     rect_on(ctx, x, y, w, h, k, seen);
     if (seen) drawn(i, x, y, w, h, k);
   }
+  /* A rectangle of a texture made for it, with its data: it is seen only once its upload was. */
+  void fresh_rect(int i, int x, int y, int w, int h, Colour k, D3D11_USAGE usage = D3D11_USAGE_DEFAULT) {
+    std::vector<uint8_t> data(64 * 64 * 4);
+    for (size_t n = 0; n < data.size(); n++) data[n] = k.v[n & 3];
+    D3D11_TEXTURE2D_DESC d = {64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, usage, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_SUBRESOURCE_DATA init = {data.data(), 64 * 4, 0};
+    ID3D11Texture2D *t;
+    ID3D11ShaderResourceView *v;
+    HR(dev->CreateTexture2D(&d, &init, &t));
+    HR(dev->CreateShaderResourceView(t, nullptr, &v));
+    use(i);
+    D3D11_VIEWPORT vp = {(float)x, (float)y, (float)w, (float)h, 0, 1};
+    UINT stride = sizeof(Vertex), off = 0;
+    ctx->RSSetViewports(1, &vp);
+    ctx->IASetVertexBuffers(0, 1, &vb, &stride, &off);
+    ctx->IASetInputLayout(layout);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(vs, nullptr, 0);
+    ctx->PSSetShader(ps_tex, nullptr, 0);
+    ctx->PSSetSamplers(0, 1, &sampler);
+    ctx->PSSetShaderResources(0, 1, &v);
+    ctx->OMSetBlendState(nullptr, nullptr, ~0u);
+    ctx->OMSetDepthStencilState(pass, 0);
+    ctx->Draw(3, 0);
+    v->Release();
+    t->Release();
+    drawn(i, x, y, w, h, k);
+  }
   void copy(int to, int from, int x, int y, int w, int h) {
     D3D11_BOX b = {(UINT)x, (UINT)y, 0, (UINT)(x + w), (UINT)(y + h), 1};
     ctx->CopySubresourceRegion(picture[to].tex, 0, x, y, 0, picture[from].tex, 0, &b);
@@ -264,7 +302,13 @@ struct Gpu {
       const uint8_t *row = (const uint8_t *)m.pData + y * m.RowPitch;
       c = crc32_of(row, PX * 4, c);
       if (memcmp(row, &p.model[y * PX * 4], PX * 4))
-        for (int x = 0; x < PX; x++) bad += memcmp(row + x * 4, &p.model[(y * PX + x) * 4], 4) != 0;
+        for (int x = 0; x < PX; x++)
+          if (memcmp(row + x * 4, &p.model[(y * PX + x) * 4], 4) && bad++ < 3) {
+            uint32_t got, want;
+            memcpy(&got, row + x * 4, 4);
+            memcpy(&want, &p.model[(y * PX + x) * 4], 4);
+            note("picture %d at %d, %d: %08x, wanted %08x", i, x, y, got, want);
+          }
     }
     ctx->Unmap(p.staging, 0);
     if (crc) *crc = c;
@@ -272,6 +316,11 @@ struct Gpu {
   }
   /* GPU work of `layers` blended layers over 2048 x 2048. */
   void burn(unsigned layers) {
+    make_big();
+    target = -1;
+    burn_on(ctx, layers);
+  }
+  void make_big() {
     if (!big) {
       D3D11_TEXTURE2D_DESC d = {2048, 2048, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
                                 D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
@@ -280,21 +329,22 @@ struct Gpu {
       HR(dev->CreateTexture2D(&d, nullptr, &big_source));
       HR(dev->CreateShaderResourceView(big_source, nullptr, &big_srv));
     }
-    target = -1;
-    ctx->OMSetRenderTargets(1, &big_rtv, nullptr);
+  }
+  void burn_on(ID3D11DeviceContext *c, unsigned layers) {
+    c->OMSetRenderTargets(1, &big_rtv, nullptr);
     D3D11_VIEWPORT vp = {0, 0, 2048, 2048, 0, 1};
     UINT stride = sizeof(Vertex), off = 0;
-    ctx->RSSetViewports(1, &vp);
-    ctx->IASetVertexBuffers(0, 1, &vb, &stride, &off);
-    ctx->IASetInputLayout(layout);
-    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx->VSSetShader(vs, nullptr, 0);
-    ctx->PSSetShader(ps_tex, nullptr, 0);
-    ctx->PSSetSamplers(0, 1, &sampler);
-    ctx->PSSetShaderResources(0, 1, &big_srv);
-    ctx->OMSetBlendState(add, nullptr, ~0u);
-    ctx->OMSetDepthStencilState(pass, 0);
-    for (unsigned i = 0; i < layers; i++) ctx->Draw(3, 0);
+    c->RSSetViewports(1, &vp);
+    c->IASetVertexBuffers(0, 1, &vb, &stride, &off);
+    c->IASetInputLayout(layout);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(vs, nullptr, 0);
+    c->PSSetShader(ps_tex, nullptr, 0);
+    c->PSSetSamplers(0, 1, &sampler);
+    c->PSSetShaderResources(0, 1, &big_srv);
+    c->OMSetBlendState(add, nullptr, ~0u);
+    c->OMSetDepthStencilState(pass, 0);
+    for (unsigned i = 0; i < layers; i++) c->Draw(3, 0);
   }
   ID3D11Query *query(D3D11_QUERY type) {
     ID3D11Query *q;
@@ -593,6 +643,279 @@ static void deferred() {
   note("GetData of a deferred context: 0x%08lx", (unsigned long)hr);
   picture_good();
   dc->Release(); e->Release(); t->Release(); o->Release(); now->Release();
+}
+
+/* What an event or disjoint query ended in a command list is promised: there only once what comes before its End in the list is done,
+ * at each execution. Without the switch it is ended as the list begins to be executed, so early (KNOWN: not touched). */
+static void early_or(bool good, const char *format, ...) {
+  char text[300];
+  va_list a;
+  va_start(a, format);
+  vsnprintf(text, sizeof(text), format, a);
+  va_end(a);
+  if (good || once) check(good, "%s", text);
+  else say("CHECK %s %s: KNOWN (without the switch a list's event is ended before the list)\n", current, text);
+}
+/* When each of the two is there, in ms, by looks with DONOTFLUSH and nothing else. */
+static bool both_there(ID3D11Query *a, ID3D11Query *b, double &at, double &bt) {
+  const uint64_t begin = ns();
+  at = bt = -1;
+  while ((at < 0 || bt < 0) && ns() - begin < 6000000000ull) {
+    alignas(8) char data[16];
+    if (at < 0 && g.ctx->GetData(a, data, a->GetDataSize(), DONT) == S_OK) at = (ns() - begin) / 1e6;
+    if (bt < 0 && g.ctx->GetData(b, data, b->GetDataSize(), DONT) == S_OK) bt = (ns() - begin) / 1e6;
+    nap_us(50);
+  }
+  progress++;
+  return at >= 0 && bt >= 0;
+}
+/* A list's query whose End comes last, beside one of the immediate context ended right after the list: no earlier than it, but for what
+ * GPU clocks and looks make of it. */
+static bool not_before_its_work(double at, double after) { return at > after * 0.65 - 5; }
+static void list_events() {
+  ID3D11DeviceContext *dc;
+  HR(g.dev->CreateDeferredContext(0, &dc));
+  ID3D11Query *e = g.query(D3D11_QUERY_EVENT), *f = g.query(D3D11_QUERY_EVENT), *d = g.query(D3D11_QUERY_TIMESTAMP_DISJOINT), *after = g.query(D3D11_QUERY_EVENT);
+  g.make_big();
+  auto clean = [] { /* nothing new on the immediate context, and all of it done */
+    ID3D11Query *q = g.query(D3D11_QUERY_EVENT);
+    g.ctx->End(q);
+    look_event(q, 0);
+    q->Release();
+  };
+  auto list_of = [&] { ID3D11CommandList *l; HR(dc->FinishCommandList(FALSE, &l)); return l; };
+  double te, ta;
+  for (int round = 0; round < 4; round++) { /* its End follows 120 ms of GPU work in the list */
+    ID3D11Query *q = round & 1 ? d : e;
+    clean();
+    if (round & 2) g.rect(1, round * 9, 3, 7, 7, shade(round)); /* something new on the immediate context, or nothing */
+    if (q == d) dc->Begin(d);
+    g.burn_on(dc, layers_40ms * 3);
+    dc->End(q);
+    ID3D11CommandList *list = list_of();
+    g.ctx->ExecuteCommandList(list, FALSE);
+    g.target = -1;
+    list->Release();
+    g.rect(1, round * 9, 30, 7, 7, shade(round + 40));
+    g.ctx->End(after);
+    const bool there = both_there(q, after, te, ta);
+    check(there, "round %d: both there", round);
+    early_or(there && not_before_its_work(te, ta), "round %d: the list's %s after its work (%.1f ms; the list's work and what follows it %.1f ms)", round, q == d ? "disjoint query" : "event", te, ta);
+  }
+  for (int round = 0; round < 3; round++) { /* two in one list, most of the work between them */
+    clean();
+    Gpu::use_on(dc, g.picture[0]);
+    g.rect_on(dc, 3, 3 + round, 20, 20, shade(round + 7));
+    dc->End(e);
+    g.burn_on(dc, layers_40ms * 3);
+    dc->End(f);
+    ID3D11CommandList *list = list_of();
+    g.ctx->ExecuteCommandList(list, round & 1);
+    g.target = -1;
+    g.drawn(0, 3, 3 + round, 20, 20, shade(round + 7));
+    list->Release();
+    g.ctx->End(after);
+    double tl;
+    const uint64_t begin = ns();
+    const bool there = both_there(e, f, te, ta) && look_event(after, DONT).hr == S_OK;
+    tl = (ns() - begin) / 1e6;
+    check(there && te <= ta, "two in a list: the first %.1f ms, the second %.1f ms: in order", te, ta);
+    early_or(there && not_before_its_work(ta, tl), "two in a list: the second after the work between them (%.1f of %.1f ms)", ta, tl);
+    if (once && native) check(te < ta * 0.5, "two in a list: the first does not wait for the work after it (%.1f of %.1f ms)", te, ta);
+  }
+  { /* one list, executed again and again, the same query: of each execution */
+    g.burn_on(dc, layers_40ms);
+    Gpu::use_on(dc, g.picture[0]);
+    g.rect_on(dc, 200, 10, 20, 20, shade(5));
+    dc->End(e);
+    ID3D11CommandList *list = list_of();
+    for (int n = 0; n < 5; n++) {
+      clean();
+      g.ctx->ExecuteCommandList(list, n & 1);
+      g.target = -1;
+      g.drawn(0, 200, 10, 20, 20, shade(5));
+      g.ctx->End(after);
+      check(both_there(e, after, te, ta), "execution %d: there (%.1f ms)", n, te);
+      early_or(not_before_its_work(te, ta), "execution %d: after its work (%.1f of %.1f ms)", n, te, ta);
+    }
+    clean(); /* twice in a row, and the query is the last one's */
+    g.ctx->ExecuteCommandList(list, FALSE);
+    g.ctx->ExecuteCommandList(list, FALSE);
+    g.target = -1;
+    g.ctx->End(after);
+    const bool there = both_there(e, after, te, ta);
+    early_or(there && not_before_its_work(te, ta), "executed twice in a row: after the second (%.1f of %.1f ms)", te, ta);
+    g.rect(0, 220, 40, 9, 9, shade(9));
+    g.ctx->End(e); /* then ended by the immediate context */
+    Looked l = look_event(e, DONT);
+    check(l.hr == S_OK, "then ended on the immediate context: there (%.1f ms)", l.ms);
+    list->Release();
+  }
+  { /* ended twice in one list: the last End's */
+    clean();
+    Gpu::use_on(dc, g.picture[0]);
+    g.rect_on(dc, 5, 200, 9, 9, shade(21));
+    dc->End(e);
+    g.burn_on(dc, layers_40ms * 2);
+    dc->End(e);
+    ID3D11CommandList *list = list_of();
+    g.ctx->ExecuteCommandList(list, FALSE);
+    g.target = -1;
+    g.drawn(0, 5, 200, 9, 9, shade(21));
+    list->Release();
+    g.ctx->End(after);
+    const bool there = both_there(e, after, te, ta);
+    early_or(there && not_before_its_work(te, ta), "ended twice in a list: at the last (%.1f of %.1f ms)", te, ta);
+  }
+  if (g.ctx4) { /* held by a GPU wait before the list: not there until it is let go, whatever is looked at */
+    Gpu other;
+    other.make();
+    ID3D11Device5 *dev5 = nullptr;
+    ID3D11Fence *fence = nullptr;
+    if (SUCCEEDED(other.dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&dev5)) &&
+        SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), (void **)&fence)))
+      for (UINT64 v = 1; v <= 3; v++) {
+        clean();
+        Gpu::use_on(dc, g.picture[0]);
+        g.rect_on(dc, (int)v * 20, 220, 9, 9, shade((unsigned)v + 60));
+        dc->End(e);
+        ID3D11CommandList *list = list_of();
+        if (FAILED(g.ctx4->Wait(fence, v))) { list->Release(); say("CHECK list-events Wait: UNSUPPORTED\n"); break; }
+        g.ctx->ExecuteCommandList(list, FALSE);
+        g.target = -1;
+        g.drawn(0, (int)v * 20, 220, 9, 9, shade((unsigned)v + 60));
+        list->Release();
+        if (v & 1) g.ctx->Flush();
+        Looked l = look_event(e, DONT, 120);
+        check(l.hr == S_FALSE, "held by a wait before the list: not there (%llu looks)", (unsigned long long)l.looks);
+        HR(other.ctx4->Signal(fence, v));
+        other.ctx->Flush();
+        l = look_event(e, DONT);
+        check(l.hr == S_OK, "let go: there (%.1f ms)", l.ms);
+      }
+    if (fence) fence->Release();
+    if (dev5) dev5->Release();
+    other.drop();
+  }
+  { /* hundreds of lists, each with a query of its own, looked at in any order */
+    ID3D11Query *many[40];
+    bool good = true;
+    for (auto &q : many) q = g.query(D3D11_QUERY_EVENT);
+    for (int n = 0; n < 400; n++) {
+      const int k = n % 40;
+      if (n >= 40) good &= look_event(many[(k + 7) % 40], DONT).hr == S_OK;
+      Gpu::use_on(dc, g.picture[n & 1]);
+      g.rect_on(dc, n % 200, (n * 7) % 200, 5, 5, shade(n));
+      dc->End(many[k]);
+      ID3D11CommandList *list = list_of();
+      g.ctx->ExecuteCommandList(list, n & 2);
+      g.target = -1;
+      g.drawn(n & 1, n % 200, (n * 7) % 200, 5, 5, shade(n));
+      list->Release();
+    }
+    for (auto q : many) { good &= look_event(q, DONT).hr == S_OK; q->Release(); }
+    check(good, "400 lists with a query each: there");
+  }
+  picture_good();
+  dc->Release(); e->Release(); f->Release(); d->Release(); after->Release();
+}
+
+/* Textures made with their data on another thread, all the time, while the GPU is busy and this thread ends events and only looks: how
+ * long a look takes (the uploads have a queue of two command buffers of their own, which a commit may wait for), without the device's lock
+ * and with it. */
+static void uploads_of(bool locked) {
+  ID3D11Multithread *mt = nullptr;
+  if (locked && FAILED(g.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt))) return;
+  if (mt) mt->SetMultithreadProtected(TRUE);
+  const char *how = locked ? "the device's lock on" : "the device's lock off";
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> made{0}, ahead{0}; /* at most 1 GiB made since the last event was there: the Mac's memory is not what is asked */
+  std::vector<uint8_t> data(4096 * 4096 * 4, 0x55);
+  std::thread uploader([&] {
+    for (unsigned n = 0; !stop; n++) {
+      const UINT px = n % 16 == 7 ? 4096 : n % 4 == 1 ? 2048 : 512;
+      D3D11_TEXTURE2D_DESC d = {px, px, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+      D3D11_SUBRESOURCE_DATA init = {data.data(), px * 4, 0};
+      ID3D11Texture2D *t;
+      HR(g.dev->CreateTexture2D(&d, &init, &t));
+      t->Release();
+      made++;
+      nap_us(300);
+      ahead += px * px * 4;
+      while (!stop && ahead > 1ull << 30) nap_us(500);
+    }
+  });
+  ID3D11Query *e = g.query(D3D11_QUERY_EVENT);
+  std::vector<uint64_t> took, waits, rescues;
+  unsigned slow_first = 0, slow_rescue = 0;
+  bool good = true;
+  for (int n = 0; n < 60; n++) {
+    g.rect(0, n * 3, n * 2 + locked, 20, 20, shade(n));
+    g.burn(layers_40ms / 2);
+    for (int k = 0; k < 8; k++) g.fresh_rect(1, k * 30, n * 4 + locked, 20, 3, shade(n * 8 + k + locked)); /* (its upload is of the chunk that only the looks commit) */
+    g.ctx->End(e);
+    const uint64_t began = ns();
+    HRESULT hr = S_FALSE;
+    BOOL there;
+    for (unsigned n_look = 1; hr == S_FALSE && ns() - began < 6000000000ull; n_look++) {
+      const uint64_t a = ns();
+      hr = g.ctx->GetData(e, &there, sizeof(there), DONT);
+      took.push_back(ns() - a);
+      if (took.back() >= 500000) { slow_first += n_look <= 64; slow_rescue += n_look == 65; }
+      if (n_look == 65) rescues.push_back(took.back());
+      nap_us(60);
+    }
+    good &= hr == S_OK;
+    waits.push_back(ns() - began);
+    ahead = 0;
+    progress++;
+  }
+  stop = true;
+  uploader.join();
+  std::sort(waits.begin(), waits.end());
+  check(good, "%s: 60 of 60 there beside %llu textures made", how, (unsigned long long)made.load());
+  check(waits.back() < 2000000000, "%s: each within two seconds", how);
+  note("%s: an event was there after %.1f ms (p50), %.1f (p95), %.1f (the longest)", how, waits[30] / 1e6, waits[57] / 1e6, waits.back() / 1e6);
+  std::sort(took.begin(), took.end());
+  const double worst = took.back() / 1e6, p99 = took[took.size() * 99 / 100] / 1e6;
+  const size_t slow = took.end() - std::lower_bound(took.begin(), took.end(), 500000);
+  note("%s: a look: the longest %.3f ms, p99.9 %.3f, p99 %.3f, p50 %.4f ms of %zu; %zu of 0.5 ms or more (%u among the first 64, %u the 65th)", how, worst, took[took.size() * 999 / 1000] / 1e6, p99,
+       took[took.size() / 2] / 1e6, took.size(), slow, slow_first, slow_rescue);
+  std::sort(rescues.begin(), rescues.end());
+  if (!rescues.empty()) note("%s: the 65th look: p50 %.4f ms, the longest %.3f ms of %zu", how, rescues[rescues.size() / 2] / 1e6, rescues.back() / 1e6, rescues.size());
+  /* The 65th is the one that commits. (A look that does nothing may take long where this thread lost its core: macOS's, on a busy Mac.) */
+  if (once && native) {
+    const size_t slow_rescues = rescues.end() - std::lower_bound(rescues.begin(), rescues.end(), 500000);
+    check(slow_rescues <= 1 && slow <= 8 && worst < 25, "%s: no look waited for an upload (%zu of the %zu that committed took 0.5 ms or more, the longest %.3f ms)", how,
+          slow_rescues, rescues.size(), rescues.empty() ? 0 : rescues.back() / 1e6);
+  }
+  if (mt) { mt->Enter(); mt->Leave(); mt->SetMultithreadProtected(FALSE); mt->Release(); }
+  e->Release();
+}
+static void uploads() {
+  uploads_of(false);
+  picture_good("the textures' uploads were seen");
+  uploads_of(true);
+  picture_good("the textures' uploads were seen");
+  /* Textures that are immutable. Neptune's host makes them without their data and updates them, which DXMT takes for something that cannot
+   * happen: an immutable texture's update and the draws that read it are not put in order (with the switch and without: not touched). */
+  ID3D11Query *e = g.query(D3D11_QUERY_EVENT);
+  for (int n = 0; n < 60; n++) {
+    g.burn(layers_40ms / 4);
+    for (int k = 0; k < 8; k++) g.fresh_rect(1, k * 30, n * 4, 20, 3, shade(n * 8 + k + 2), D3D11_USAGE_IMMUTABLE);
+    g.ctx->End(e);
+    look_event(e, DONT, 4000, 60);
+  }
+  e->Release();
+  uint32_t crc;
+  const unsigned bad = g.differs(1, &crc);
+  if (bad && !native) {
+    say("CHECK uploads of immutable textures: %u pixels drawn before their texture's data: KNOWN (Neptune and DXMT, with the switch and without)\n", bad);
+    g.use(1);
+    g.clear(1, shade(2));
+  } else {
+    check(!bad, "immutable textures: their data were seen (%u pixels differ)", bad);
+  }
 }
 
 /* Exact counts, no draws, hidden draws, across target changes and chunks; predicates. */
@@ -1041,17 +1364,213 @@ static void host_threads() {
   mt->Release();
   for (auto q : e) q->Release();
 }
+/* With the switch: what a look could not do for the device's lock, or for pending uploads, is done without another look; and no look waits. */
+static void owed() {
+  if (!once) { note("not asked without the switch: a look there waits for the device's lock"); return; }
+  ID3D11Multithread *mt;
+  HR(g.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt));
+  mt->SetMultithreadProtected(TRUE);
+  ID3D11Query *e = g.query(D3D11_QUERY_EVENT);
+  std::vector<uint8_t> data(1024 * 1024 * 4, 0x33);
+  auto upload = [&](UINT px) {
+    D3D11_TEXTURE2D_DESC d = {px, px, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_SUBRESOURCE_DATA init = {data.data(), px * 4, 0};
+    ID3D11Texture2D *t;
+    HR(g.dev->CreateTexture2D(&d, &init, &t));
+    t->Release();
+  };
+  for (int round = 0; round < 12; round++) {
+    const bool lock = round % 3 != 1, pending = round % 3 != 0; /* the lock, uploads, both */
+    g.rect(0, round * 10, 10, 9, 9, shade(round));
+    g.ctx->End(e);
+    if (pending) upload(256 << (round & 1));
+    std::atomic<int> phase{0};
+    std::thread owner([&] { if (lock) mt->Enter(); phase = 1; while (phase != 2) nap_us(100); if (lock) mt->Leave(); });
+    while (phase != 1) nap_us(50);
+    uint64_t worst = 0;
+    BOOL there;
+    HRESULT hr = S_FALSE;
+    for (int n = 0; n < 70; n++) {
+      const uint64_t a = ns();
+      hr = g.ctx->GetData(e, &there, sizeof(there), DONT);
+      worst = std::max(worst, ns() - a);
+    }
+    if (lock) {
+      nap_us(20000);
+      check(hr == S_FALSE && g.ctx->GetData(e, &there, sizeof(there), DONT) == S_FALSE, "round %d: the lock is another's: not there, and no look waited (the longest %.3f ms)", round, worst / 1e6);
+    }
+    check(worst < 25000000, "round %d: no look waited (the longest %.3f ms)", round, worst / 1e6);
+    phase = 2;
+    owner.join();
+    nap_us(60000); /* (nobody looks) */
+    hr = g.ctx->GetData(e, &there, sizeof(there), DONT);
+    check(hr == S_OK, "round %d (%s%s): done without another look: 0x%08lx", round, lock ? "lock " : "", pending ? "uploads" : "", (unsigned long)hr);
+    if (hr != S_OK) look_event(e, 0);
+    progress++;
+  }
+  if (g.ctx4) { /* the queue is full of what waits for a Signal of this very thread: a look that waited for it would wait for good */
+    Gpu other;
+    other.make();
+    ID3D11Device5 *dev5 = nullptr;
+    ID3D11Fence *f = nullptr;
+    if (SUCCEEDED(other.dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&dev5)) &&
+        SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), (void **)&f)))
+      for (UINT64 v = 1; v <= 3; v++) {
+        ID3D11Query *q = g.query(D3D11_QUERY_EVENT);
+        g.ctx->End(q);
+        look_event(q, 0);
+        q->Release();
+        HR(g.ctx4->Wait(f, v));
+        for (int n = 0; n < 31; n++) { g.rect(0, n, 60 + (int)v * 10, 5, 5, shade(n)); g.ctx->Flush(); }
+        g.rect(0, 40 + (int)v * 10, 100, 5, 5, shade(77));
+        g.ctx->End(e);
+        uint64_t worst = 0;
+        BOOL there;
+        HRESULT hr = S_FALSE;
+        for (int n = 0; n < 90 && hr == S_FALSE; n++) {
+          const uint64_t a = ns();
+          hr = g.ctx->GetData(e, &there, sizeof(there), DONT);
+          worst = std::max(worst, ns() - a);
+        }
+        check(hr == S_FALSE && worst < 25000000, "a full queue: not there, and no look waited (the longest %.3f ms)", worst / 1e6);
+        HR(other.ctx4->Signal(f, v));
+        other.ctx->Flush();
+        nap_us(60000);
+        hr = g.ctx->GetData(e, &there, sizeof(there), DONT);
+        check(hr == S_OK, "a full queue let go: done without another look: 0x%08lx", (unsigned long)hr);
+        if (hr != S_OK) look_event(e, 0);
+        progress++;
+      }
+    if (f) f->Release();
+    if (dev5) dev5->Release();
+    other.drop();
+  }
+  mt->Enter(); /* (whoever was on the device is done with it, as seen from here) */
+  mt->Leave();
+  mt->SetMultithreadProtected(FALSE);
+  for (int round = 0; round < 6; round++) { /* not protected: the next looks do it */
+    g.rect(0, round * 10, 30, 9, 9, shade(round + 30));
+    g.ctx->End(e);
+    upload(512);
+    Looked l = look_event(e, DONT, 4000, 50);
+    check(l.hr == S_OK, "no lock asked for, uploads pending: there (%.1f ms, %llu looks)", l.ms, (unsigned long long)l.looks);
+  }
+  picture_good();
+  mt->Release(); e->Release();
+}
 #endif
 
 struct Case { const char *name; void (*run)(); };
 static const Case kCases[] = {
     {"noflush-spin", noflush_spin}, {"flags-zero", flags_zero}, {"covered", covered}, {"one-rescue", one_rescue}, {"pacing", pacing}, {"reuse", reuse},
-    {"deferred", deferred}, {"occlusion", occlusion}, {"timestamps", timestamps}, {"readback", readback}, {"predication", predication}, {"waits", waits},
+    {"deferred", deferred}, {"list-events", list_events}, {"uploads", uploads}, {"occlusion", occlusion}, {"timestamps", timestamps}, {"readback", readback}, {"predication", predication}, {"waits", waits},
     {"keyed", keyed}, {"teardown", teardown}, {"two-threads", two_threads},
 #ifndef _WIN32
-    {"sixty-four", sixty_four}, {"host-threads", host_threads},
+    {"sixty-four", sixty_four}, {"host-threads", host_threads}, {"owed", owed},
 #endif
 };
+
+/* ---- frames, as fast as they come ---- */
+
+/* `frames` frames of 12 passes, a copy and one or two event queries, off screen; the engine waits for the event of three frames ago, by
+ * looks as Neptune's host makes them: another thread's, every 100 us, under a lock of its own, the device's lock asked for.
+ *   gated: nothing else. busy: the CPU has 6 ms of its own work spread over the frame, and the GPU is behind it. rings: two more lookers,
+ *   one of them without DONOTFLUSH now and then. lists: half of the passes in a command list with an event of its own.
+ * What is drawn is the same whatever the timing: HASH. */
+static int bench(const char *mode, unsigned frames) {
+  current = mode;
+  const bool busy = !strcmp(mode, "busy"), rings = !strcmp(mode, "rings"), lists = !strcmp(mode, "lists");
+  ID3D11Multithread *mt = nullptr;
+  if (SUCCEEDED(g.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt))) mt->SetMultithreadProtected(TRUE);
+  ID3D11DeviceContext *dc;
+  HR(g.dev->CreateDeferredContext(0, &dc));
+  g.make_big();
+  ID3D11Query *e[8], *mid[8], *in_list[8];
+  for (int k = 0; k < 8; k++) { e[k] = g.query(D3D11_QUERY_EVENT); mid[k] = g.query(D3D11_QUERY_EVENT); in_list[k] = g.query(D3D11_QUERY_EVENT); }
+  std::mutex feedback;
+  std::atomic<uint32_t> ended[8] = {}, published[8] = {};
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> looks{0}, longest{0};
+  auto sweep = [&] {
+    std::lock_guard<std::mutex> l(feedback);
+    for (int k = 0; k < 8; k++) {
+      const uint32_t at = ended[k];
+      BOOL there;
+      if (at == published[k]) continue;
+      const uint64_t a = ns();
+      const HRESULT hr = g.ctx->GetData(e[k], &there, sizeof(there), DONT);
+      const uint64_t took = ns() - a;
+      if (took > longest) longest = took;
+      if (hr == S_OK) published[k] = at;
+      looks++;
+    }
+  };
+  std::vector<std::thread> lookers;
+  lookers.emplace_back([&] { while (!stop) { sweep(); nap_us(100); } });
+  if (rings) {
+    lookers.emplace_back([&] { while (!stop) { sweep(); nap_us(370); } });
+    lookers.emplace_back([&] { Random r(7); while (!stop) { BOOL b; const int k = (int)r.below(8); if (ended[k]) g.ctx->GetData(mid[k], &b, sizeof(b), r.below(8) ? DONT : 0); nap_us(2000); } });
+  }
+  std::vector<uint64_t> took;
+  const unsigned layers = 100; /* (not calibrated: the same work in every run) */
+  uint64_t last = ns();
+  const uint64_t begin = last;
+  for (unsigned f = 1; f <= frames; f++) {
+    const int k = (int)(f & 7);
+    if (f > 3) {
+      const int w = (int)((f - 3) & 7);
+      for (const uint64_t from = ns(); published[w] != f - 3 && ns() - from < 4000000000ull;) nap_us(20);
+      if (published[w] != f - 3) { check(false, "frame %u: the event of three frames ago is not there", f); break; }
+    }
+    auto passes = [&](ID3D11DeviceContext *c, unsigned from, unsigned to) {
+      for (unsigned n = from; n < to; n++) {
+        Gpu::use_on(c, g.picture[n & 1]);
+        for (unsigned i = 0; i < 8; i++) {
+          const int x = (int)((f * 3 + n * 17 + i * 29) % 200), y = (int)((f * 5 + n * 23 + i * 41) % 200);
+          g.rect_on(c, x, y, 31, 27, shade(f + n * 8 + i));
+          g.drawn(n & 1, x, y, 31, 27, shade(f + n * 8 + i));
+        }
+        if (busy) for (const uint64_t from2 = ns(); ns() - from2 < 500000;) {}
+      }
+    };
+    g.target = -1;
+    passes(g.ctx, 0, 6);
+    if (lists) {
+      passes(dc, 6, 9);
+      dc->End(in_list[k]);
+      passes(dc, 9, 12);
+      ID3D11CommandList *l;
+      HR(dc->FinishCommandList(FALSE, &l));
+      g.ctx->ExecuteCommandList(l, FALSE);
+      l->Release();
+    } else {
+      g.ctx->End(mid[k]);
+      passes(g.ctx, 6, 12);
+    }
+    g.target = -1;
+    g.copy(1, 0, 10, 10, 20, 20);
+    g.burn(layers);
+    { std::lock_guard<std::mutex> l(feedback); g.ctx->End(e[k]); ended[k] = f; }
+    if (f % 2) g.ctx->Flush(); /* (a frame's end hands it over, every other time: else the looks must) */
+    const uint64_t now = ns();
+    took.push_back(now - last);
+    last = now;
+    progress++;
+  }
+  const double all = (ns() - begin) / 1e9;
+  for (int k = 0; k < 8; k++) for (const uint64_t from = ns(); published[k] != ended[k] && ns() - from < 4000000000ull;) nap_us(100);
+  stop = true;
+  for (auto &t : lookers) t.join();
+  std::sort(took.begin(), took.end());
+  auto at = [&](double p) { return took.empty() ? 0.0 : took[std::min(took.size() - 1, (size_t)(took.size() * p))] / 1e6; };
+  say("BENCH %s frames=%zu fps=%.2f ms p50=%.3f p95=%.3f p99=%.3f looks=%llu longest_look=%.3f\n", mode, took.size(), took.size() / all, at(.5), at(.95), at(.99),
+      (unsigned long long)looks.load(), longest / 1e6);
+  picture_good();
+  if (mt) { mt->SetMultithreadProtected(FALSE); mt->Release(); }
+  dc->Release();
+  for (int k = 0; k < 8; k++) { e[k]->Release(); mid[k]->Release(); in_list[k]->Release(); }
+  return 0;
+}
 
 /* ---- the soak ---- */
 static int soak(uint64_t seed, uint64_t generations, bool wide) {
@@ -1257,7 +1776,9 @@ int main(int argc, char **argv) {
     at = 3;
   }
   if (!create_device) { printf("-d <dxmt-native> is needed\n"); return 2; }
+  if (const char *rescue = getenv("OBELISK_DXMT_QUERY_RESCUE")) once = !strcmp(rescue, "once");
 #endif
+  if (argc > at && !strcmp(argv[at], "-once")) { once = true; at++; }
   const std::string what = argc > at ? argv[at++] : "cases";
   std::thread([] {
     uint64_t last = ~0ull;
@@ -1288,6 +1809,17 @@ int main(int argc, char **argv) {
     const uint64_t begin = ns();
     soak(seed, generations, argc > at && !strcmp(argv[at], "wide"));
     say("MODE soak frames=1 begin=%llu end=%llu\n", (unsigned long long)begin, (unsigned long long)ns());
+  } else if (what == "bench") {
+    doing = "bench";
+    const char *mode = argc > at ? argv[at++] : "gated";
+    const unsigned frames = argc > at ? (unsigned)atoi(argv[at++]) : 300;
+    g.use(0);
+    g.clear(0, {{0, 0, 0, 255}});
+    g.clear(1, {{0, 0, 0, 255}});
+    nap_us(50000);
+    const uint64_t begin = ns();
+    bench(mode, frames);
+    say("MODE %s frames=%u begin=%llu end=%llu\n", mode, frames, (unsigned long long)begin, (unsigned long long)ns());
   } else if (what == "pending") {
     doing = current = "pending";
     g.burn(layers_40ms);

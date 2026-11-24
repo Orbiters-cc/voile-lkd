@@ -39,14 +39,22 @@ What each gives: `tests/timeline/results/2026-11-23-switches.md`.
 
 ## `OBELISK_DXMT_QUERY_RESCUE=once` (the render server's)
 
-Not `wsd`'s: DXMT's (branch `perf-timeline`, `src/d3d11/d3d11_query.hpp`), given by the same `launch.sh` to the render server alone. Unset, DXMT does exactly what it
-did. With it, a look with `D3D11_ASYNC_GETDATA_DONOTFLUSH` at an event or timestamp-disjoint query that was not there 64 looks in a row
+Not `wsd`'s: DXMT's (branch `perf-timeline`, `src/d3d11/d3d11_query_rescue.hpp` and the end of `d3d11_context_imm.cpp`), given by the same `launch.sh` to the
+render server alone. Unset, DXMT's query paths are the function bodies that were measured (`4e3a952`; released, but for the recorder), text for text
+(`dxmt/tests/timeline/check-off-arm.py`): the switch picks, once per device, other classes for the immediate context, the deferred contexts and the event queries.
+
+With it, a look with `D3D11_ASYNC_GETDATA_DONOTFLUSH` at an event or timestamp-disjoint query that was not there 64 looks in a row
 commits what has been recorded only while the query's marker has not been handed to the encoder (then once), and says `S_FALSE` from there on; unset, each such look
 commits whatever has been recorded since the one before, every 100 us, until the GPU gets to the query.
-`GetData` with flags 0, `Flush`, both `End`s, timestamps, occlusion queries and readbacks are as they were.
+And an event or disjoint query ended in a **command list** is signalled where it was ended in the list, at each execution of it; unset, it is ended as the list begins to be
+executed (early: before the list's work, and at once where the immediate context has nothing new). A list's timestamps are sampled as it begins in both.
+`GetData` with flags 0, `Flush`, the immediate context's `End`s, occlusion queries and readbacks are as they were.
 
-What is kept apart: the looks and `End` change a query's state under a lock of their own that nothing waits under; the one commit is made under the
-device's lock, taken only when it is free, after the decision is made again under it, and never when the commit would wait for the GPU. So a look,
-made under Neptune's feedback lock, never waits for the GPU and cannot close a ring of locks.
+What a look may wait for: nothing. A query's End and looks see it whole under a leaf lock of its own. The one commit is made under the device's lock, taken only when it is
+free, after the decision is made again under it; never when the queue is full (the commit would wait for the GPU); and never when resources' initial data are pending
+or being uploaded (the uploads have a queue of two command buffers, which a commit takes one of). What could not be done for one of the three is owed: a thread of the
+context's (`dxmt-rescue-thread`, asleep while nothing is) commits the uploads, the only step that can wait, without any lock but the initializer's, and then the chunk,
+under the same rules, whether or not anybody looks again. Without the device's lock (no `SetMultithreadProtected`; the render server asks for it of every device) that thread
+commits uploads alone, and the next look the chunk. Measured: `tests/timeline/results/2026-11-24-query-rescue.md`.
 
 `tests/graphics/query_client.cpp` (`run-query-client.sh`) is what it was proven with; `otl.py --queries` tells what the looks of a recording flushed.

@@ -98,13 +98,24 @@ enum otl_kind {
                              texture it is of), what kept it from joining a later encoder (enum otl_stop) */
   OTL_D_STALL = 53,       /* GetData(DONOTFLUSH) of an event query not there the 64 times before flushed something, or should have; a: 1 its event had been
                              handed to the encoder (nothing to rescue) | 2 a chunk was committed | 4 and the event still was
-                             not | 8 OBELISK_DXMT_QUERY_RESCUE=once; v: queue id, chunk, the event, the last event handed over
-                             before, after, frame group */
-  OTL_D_QUERIES = 54,     /* follows OTL_D_SIGNAL: since the one before; a: 1 as OTL_D_STALL's 8 | 2 the device's lock is on; v: queue id,
+                             not | 8 OBELISK_DXMT_QUERY_RESCUE=once | 16 by the rescue thread, for a look that could not;
+                             v: queue id, chunk, the event, the last event handed over before, after, frame group */
+  OTL_D_QUERIES = 54,     /* follows OTL_D_SIGNAL, or a look 200 ms after the one before: since that one, one snapshot with OTL_D_LOOKS after
+                             it; a: 1 as OTL_D_STALL's 8 | 2 the device's lock is on | 4 at a look, not at a Signal; v: queue id,
                              frame group, queries ended (16 bits each: event, disjoint, timestamp, occlusion), events ended with
                              nothing new recorded | rescues left to the next look << 32, looks at event and disjoint queries not
                              there (first 64 | the others << 32), of those others flags DONOTFLUSH and nothing to rescue, so nothing
                              done | looks that found them there << 32 */
+  OTL_D_QUERY = 55,       /* an event or disjoint query was ended (at most 128 of these in 100 ms); a: 1 disjoint | 2 with nothing new
+                             recorded, so at a moment that was already marked | 4 in a command list, as it was executed; v: queue id,
+                             query id << 32 | which End of it, its event, the chunk its marker is in (with 2: at the latest), frame group */
+  OTL_D_QUERY_SEEN = 56,  /* a look found it there (t: after the look); a: 1 ended again, never seen; v: queue id, as OTL_D_QUERY, the
+                             start of the first look, the end of the last look that did not find it (0: none), looks, its event */
+  OTL_D_LOOKS = 57,       /* follows OTL_D_QUERIES; a: as it; v: queue id, frame group, looks at event and disjoint queries | S_FALSE
+                             answers << 32, S_OK answers | rescues << 32 (with the switch: chunks a look or the rescue thread committed;
+                             without: command buffers committed by a look after the first 64), 16 bits each: rescues not
+                             made at once for the device's lock, for a full queue, rescues whose uploads the rescue thread commits,
+                             chunks the rescue thread committed; the longest look in ns | the longest rescue on a looking thread in ns << 32, both with DONOTFLUSH */
 
   /* wsd (role wsd) */
   OTL_W_ATTACH = 64,      /* a buffer was attached; a: buffer; v: memory identity, width<<32|height, format, client id */

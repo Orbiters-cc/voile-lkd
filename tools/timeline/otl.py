@@ -24,7 +24,8 @@ K = dict(THREAD=1, SUMMARY=2, HIST=3, LOST=4, END=5, N_EXPORT=16, N_SIGNAL=18, N
          N_FLUSH=23, V_RETIRE=24, N_GONE=26, N_FRAME=27, N_EVENT=28, N_ARM=29, D_READY=32, D_ENCODE=33, D_DONE=34, D_SIGNAL=35,
          D_SEOC=36, D_NOTIFY=37, D_PIPELINE=38, D_INIT=39, D_INIT_DONE=40, D_PASS=41, D_PASS_DS=42, D_BLIT=43, D_COMPUTE=44,
          D_OPS=45, D_PASS_TIME=46, D_QUEUE=47, D_PASS_SKIP=48, D_CLOCK=49, D_COMMIT=50,
-         D_PASS_ENDED=51, D_PASS_ID=52, D_STALL=53, D_QUERIES=54, W_ATTACH=64, W_RX=65, W_TICK=66, W_DRAW=67, W_GPU=68,
+         D_PASS_ENDED=51, D_PASS_ID=52, D_STALL=53, D_QUERIES=54, D_QUERY=55,
+         D_QUERY_SEEN=56, D_LOOKS=57, W_ATTACH=64, W_RX=65, W_TICK=66, W_DRAW=67, W_GPU=68,
          W_SHOWN=69, W_RELEASE=70, W_DETACH=71)
 REC = struct.Struct("<QHHI6Q")
 Rec = collections.namedtuple("Rec", "t kind thr a v")
@@ -647,9 +648,9 @@ def queries(s, lo, hi):
     """What the looks at event and disjoint queries did (D_STALL, D_QUERIES) and every command buffer by what committed it, of all
     devices: per device by chunk, so that it needs no frames (a program that presents nothing has none)."""
     out = dict(stall_flushes=0, not_handed_over=0, handed_over=0, handed_over_and_committed=0, left_not_handed_over=0, most_rescues_of_a_chunk=0,
-               once=set(), locked=set(), commits=collections.Counter())
-    ended, per = collections.Counter(), collections.Counter()
-    signals = 0
+               once=set(), locked=set(), commits=collections.Counter(), by_the_rescue_thread=0)
+    ended, per, told, seconds = collections.Counter(), collections.Counter(), collections.Counter(), collections.defaultdict(collections.Counter)
+    signals, longest = 0, dict(look_ns=0, rescue_ns=0)
     for d in s.dxmt.values():
         chunks = collections.Counter()
         for r in d.get("D_STALL"):
@@ -659,6 +660,7 @@ def queries(s, lo, hi):
                 out["handed_over" if r.a & 1 else "not_handed_over"] += 1
                 out["handed_over_and_committed"] += r.a & 3 == 3
                 out["left_not_handed_over"] += bool(r.a & 4)
+                out["by_the_rescue_thread"] += bool(r.a & 16)
                 if not r.a & 1:
                     chunks[(r.v[0], r.v[1])] += 1
         out["most_rescues_of_a_chunk"] = max([out["most_rescues_of_a_chunk"], *chunks.values()])
@@ -667,7 +669,7 @@ def queries(s, lo, hi):
                 out["commits"][commit_text(r)] += 1
         for r in d.get("D_QUERIES"):
             if lo <= r.t <= hi:
-                signals += 1
+                signals += not r.a & 4
                 out["once"].add(bool(r.a & 1))
                 out["locked"].add(bool(r.a & 2))
                 for i, name in enumerate(("event", "disjoint", "timestamp", "occlusion")):
@@ -676,8 +678,18 @@ def queries(s, lo, hi):
                                 ("looks, not there, of the first 64", r.v[4] & 0xffffffff), ("looks, not there, after them", r.v[4] >> 32),
                                 ("of those, nothing to rescue and nothing done", r.v[5] & 0xffffffff), ("looks that found it there", r.v[5] >> 32)):
                     per[name] += v
+        for r in d.get("D_LOOKS"):
+            if lo <= r.t <= hi:
+                one = dict(looks=r.v[2] & 0xffffffff, s_false=r.v[2] >> 32, s_ok=r.v[3] & 0xffffffff, rescues=r.v[3] >> 32,
+                           not_made_for_the_lock=r.v[4] & 0xffff, not_made_for_a_full_queue=r.v[4] >> 16 & 0xffff,
+                           uploads_left_to_the_rescue_thread=r.v[4] >> 32 & 0xffff, rescues_by_the_rescue_thread=r.v[4] >> 48)
+                told.update(one)
+                seconds[r.t // 10**9].update(one)
+                longest["look_ns"] = max(longest["look_ns"], r.v[5] & 0xffffffff)
+                longest["rescue_ns"] = max(longest["rescue_ns"], r.v[5] >> 32)
     out.update(once=sorted(out["once"]), locked=sorted(out["locked"]), signals=signals, commits=dict(out["commits"].most_common()),
-               ended=dict(ended), looks=dict(per))
+               ended=dict(ended), looks=dict(per), window=dict(told), longest=longest, per_second=[dict(v) for _, v in sorted(seconds.items())],
+               one_by_one=query_times(s, lo, hi))
     print(f"  queries: the switch {'/'.join('once' if o else 'off' for o in out['once']) or 'not told'}; the device's lock "
           f"{'/'.join('on' if o else 'off' for o in out['locked']) or 'not told'}. {out['stall_flushes']} flushes by a look after the first 64: "
           f"{out['not_handed_over']} with the marker not handed over (at most {out['most_rescues_of_a_chunk']} for a chunk; {out['left_not_handed_over']} "
@@ -685,8 +697,76 @@ def queries(s, lo, hi):
     if signals:
         print("    a frame: ended " + ", ".join(f"{v / signals:.2f} {k}" for k, v in ended.items()) + "; " +
               ", ".join(f"{v / signals:.1f} {k}" for k, v in per.items()))
+    if told:
+        print(f"    the window: {told['looks']} looks at event and disjoint queries, {told['s_false']} answered S_FALSE, {told['s_ok']} S_OK; "
+              f"{told['rescues']} rescues" + (f" ({told['rescues_by_the_rescue_thread']} by the rescue thread)" if True in out["once"] else
+              " (command buffers committed by a look after the first 64)") +
+              f", put off {told['not_made_for_the_lock']} times for the device's lock, {told['not_made_for_a_full_queue']} for a full queue, "
+              f"{told['uploads_left_to_the_rescue_thread']} with their uploads left to the rescue thread; the longest look with DONOTFLUSH {longest['look_ns'] / 1e6:.3f} ms, "
+              f"the longest rescue on a looking thread {longest['rescue_ns'] / 1e6:.3f} ms")
+    query_times_report(out["one_by_one"])
     print("    command buffers by what committed them: " + (", ".join(f"{c} {w}" for w, c in out["commits"].items()) or "none"))
     return out
+
+
+def query_times(s, lo, hi):
+    """Each recorded End of an event or disjoint query (D_QUERY, a bounded sample) with its own looks (D_QUERY_SEEN, the same query and
+    the same End: one record each) and its chunk's hand-over, rescue and GPU end (by queue and chunk). That it was signalled is known
+    from the looks alone: after the last that did not find it, before the end of the first that did. A clean End's marker is an
+    earlier one's: its chunk is not known and nothing is said of it."""
+    rows, lost = [], collections.Counter()
+    for d in s.dxmt.values():
+        seen = Table(d.get("D_QUERY_SEEN"), lambda r: (r.v[0], r.v[1]))
+        ready = {(r.v[0], r.v[1]): r.t for r in d.get("D_READY")}
+        done = {(r.v[5], r.v[0]): r for r in d.get("D_DONE")}
+        rescued = {(r.v[0], r.v[1]): r for r in d.get("D_STALL") if r.a & 3 == 2}  # a commit, its event not handed over before
+        for r in d.get("D_QUERY"):
+            if not lo <= r.t <= hi:
+                continue
+            row = dict(issue=r.t, kind="disjoint" if r.a & 1 else "event", clean=bool(r.a & 2), in_list=bool(r.a & 4), queue=r.v[0], query=r.v[1] >> 32,
+                       end=r.v[1] & 0xffffffff, event=r.v[2], chunk=r.v[3])
+            rows.append(row)
+            if not row["clean"]:
+                key = (row["queue"], row["chunk"])
+                row["handed_over"] = ready.get(key)
+                if key in rescued and rescued[key].v[3] < row["event"] <= rescued[key].v[4]:
+                    row["rescue"] = rescued[key].t
+                if key in done and done[key].a == COMPLETED:
+                    row["gpu_end"] = done[key].v[2]
+            q, why = seen.take((r.v[0], r.v[1]))
+            if q is None:
+                lost["its looks: " + why if why != "missing" else "not seen by the end of the recording"] += 1
+                continue
+            row.update(first_look=q.v[2] or None, last_not=q.v[3] or None, looks=q.v[4])
+            if q.a & 1:
+                lost["ended again before it was seen"] += 1
+            else:
+                row["seen"] = q.t
+
+    def spread(values):
+        values = [v for v in values if v is not None]
+        return dict(n=len(values), p50=pct(values, 50), p95=pct(values, 95), p99=pct(values, 99), most=max(values)) if values else None
+    since = lambda name, rs: spread([r[name] - r["issue"] for r in rs if r.get(name) is not None])
+    own = [r for r in rows if not r["clean"]]
+    out = dict(recorded=len(rows), clean=len(rows) - len(own), in_lists=sum(r["in_list"] for r in rows), seen=sum("seen" in r for r in rows), not_seen=dict(lost),
+               rescued=sum("rescue" in r for r in own),
+               ns=dict(issue_to_first_look=since("first_look", rows), issue_to_hand_over=since("handed_over", own), issue_to_rescue=since("rescue", own),
+                       issue_to_gpu_end=since("gpu_end", own), issue_to_last_look_without_it=since("last_not", rows), issue_to_seen=since("seen", rows),
+                       gpu_end_to_seen=spread([r["seen"] - r["gpu_end"] for r in own if "seen" in r and "gpu_end" in r])),
+               looks=spread([r["looks"] for r in rows if "seen" in r]))
+    return out
+
+
+def query_times_report(q):
+    if not q["recorded"]:
+        return
+    print(f"    one by one (a sample): {q['recorded']} Ends of event and disjoint queries, {q['clean']} with nothing new before them, {q['in_lists']} in command lists; "
+          f"{q['seen']} seen, {q['rescued']} rescued" + "".join(f"; {n} {w}" for w, n in q["not_seen"].items()))
+    for name, v in q["ns"].items():
+        if v:
+            print(f"      {name.replace('_', ' '):32s} p50 {v['p50'] / 1e6:8.3f}  p95 {v['p95'] / 1e6:8.3f}  p99 {v['p99'] / 1e6:8.3f}  most {v['most'] / 1e6:8.3f} ms  ({v['n']})")
+    if q["looks"]:
+        print(f"      {'looks until it was seen':32s} p50 {q['looks']['p50']:8.0f}  p95 {q['looks']['p95']:8.0f}  p99 {q['looks']['p99']:8.0f}  most {q['looks']['most']:8.0f}")
 
 
 def pass_text(e):

@@ -475,6 +475,80 @@ class Queries(unittest.TestCase):
         self.assertEqual(told["looks"]["rescues left to the next look"], 10)
         self.assertEqual(told["looks"]["of those, nothing to rescue and nothing done"], 58)
 
+    def told(self, r, lo=5, hi=900):
+        out = io.StringIO()
+        s = r.finish()
+        with contextlib.redirect_stdout(out):
+            told = otl.queries(s, lo * MS, hi * MS)
+        return told, out.getvalue()
+
+    def test_the_counts_of_a_window_are_what_its_records_say(self):
+        r = Recording()
+        for t, at_a_look in ((10, 0), (20, 4), (1200, 0)):
+            r.put("dxmt", t * MS, "D_QUERIES", 1 | 2 | at_a_look, 1, t, 3, 0, 64, 0)
+            r.put("dxmt", t * MS + 1, "D_LOOKS", 1 | 2 | at_a_look, 1, t, 100 | 90 << 32, 10 | 2 << 32, 3 | 4 << 16 | 5 << 32 | 1 << 48, (7 + t) * 1000 | 9000 << 32)
+        told, text = self.told(r)
+        self.assertEqual(told["window"], dict(looks=200, s_false=180, s_ok=20, rescues=4, not_made_for_the_lock=6, not_made_for_a_full_queue=8,
+                                              uploads_left_to_the_rescue_thread=10, rescues_by_the_rescue_thread=2))
+        self.assertEqual((told["longest"], told["signals"]), (dict(look_ns=27000, rescue_ns=9000), 1))
+        self.assertIn("200 looks at event and disjoint queries, 180 answered S_FALSE, 20 S_OK; 4 rescues (2 by the rescue thread)", text)
+        self.assertEqual([w["looks"] for w in self.told(r, 5, 2000)[0]["per_second"]], [200, 100])
+
+    def query(self, r, t, query, end, event, chunk, a=0, queue=1):
+        r.put("dxmt", t * MS, "D_QUERY", a, queue, query << 32 | end, event, chunk, 1)
+
+    def seen(self, r, t, query, end, first, last, looks, event, a=0, queue=1):
+        r.put("dxmt", t * MS, "D_QUERY_SEEN", a, queue, query << 32 | end, first * MS, last * MS, looks, event)
+
+    def test_a_query_is_timed_by_its_own_records_alone(self):
+        r = Recording()
+        self.query(r, 10, 7, 1, 50, 5)
+        self.seen(r, 40, 7, 1, 12, 39, 100, 50)
+        self.query(r, 50, 7, 2, 60, 6, a=1)  # the same query again, a disjoint one's; another queue has an End of the same numbers
+        self.query(r, 51, 7, 2, 60, 6, queue=2)
+        self.seen(r, 70, 7, 2, 55, 0, 1, 60, queue=2)
+        for queue, chunk, t in ((1, 5, 20), (1, 6, 60), (2, 6, 52)):
+            r.put("dxmt", t * MS, "D_READY", 0, queue, chunk, 0, 1)
+            r.put("dxmt", (t + 9) * MS, "D_DONE", 4, chunk, (t + 1) * MS, (t + 8) * MS, 0, 0, queue)
+        r.put("dxmt", 20 * MS, "D_STALL", 2 | 8, 1, 5, 50, 49, 51, 1)
+        r.put("dxmt", 53 * MS, "D_STALL", 1 | 2, 2, 6, 60, 61, 62, 1)  # (of a chunk whose event was handed over: no rescue)
+        q = self.told(r)[0]["one_by_one"]
+        self.assertEqual((q["recorded"], q["seen"], q["rescued"], q["not_seen"]), (3, 2, 1, {"not seen by the end of the recording": 1}))
+        ns = q["ns"]
+        self.assertEqual((ns["issue_to_rescue"]["n"], ns["issue_to_rescue"]["most"], ns["issue_to_hand_over"]["n"]), (1, 10 * MS, 3))
+        self.assertEqual((ns["issue_to_first_look"]["most"], ns["issue_to_last_look_without_it"]["n"], ns["issue_to_last_look_without_it"]["most"]),
+                         (4 * MS, 1, 29 * MS))
+        self.assertEqual((ns["issue_to_seen"]["n"], ns["issue_to_seen"]["most"], ns["issue_to_gpu_end"]["n"]), (2, 30 * MS, 3))
+        self.assertEqual((ns["gpu_end_to_seen"]["most"], q["looks"]["most"]), (12 * MS, 100))
+
+    def test_what_was_not_seen_is_not_timed(self):
+        r = Recording()
+        self.query(r, 10, 7, 1, 50, 5)
+        self.seen(r, 30, 7, 1, 12, 29, 9, 50, a=1)  # ended again
+        self.query(r, 30, 7, 2, 50, 5, a=2 | 4)     # clean, in a list: its marker is another's
+        self.seen(r, 31, 7, 2, 31, 0, 1, 50)
+        r.put("dxmt", 20 * MS, "D_READY", 0, 1, 5, 0, 1)
+        r.put("dxmt", 25 * MS, "D_DONE", 5, 5, 21 * MS, 22 * MS, 0, 0, 1)  # failed
+        q, text = self.told(r)
+        q = q["one_by_one"]
+        self.assertEqual((q["clean"], q["in_lists"], q["seen"], q["not_seen"]), (1, 1, 1, {"ended again before it was seen": 1}))
+        self.assertEqual((q["ns"]["issue_to_hand_over"]["n"], q["ns"]["issue_to_gpu_end"], q["ns"]["issue_to_seen"]["n"]), (1, None, 1))
+        self.assertIn("1 with nothing new before them, 1 in command lists; 1 seen, 0 rescued; 1 ended again before it was seen", text)
+
+    def test_two_records_of_one_end_are_not_picked_from(self):
+        r = Recording()
+        self.query(r, 10, 7, 1, 50, 5)
+        self.seen(r, 30, 7, 1, 12, 29, 9, 50)
+        self.seen(r, 31, 7, 1, 12, 29, 9, 50)
+        q = self.told(r)[0]["one_by_one"]
+        self.assertEqual((q["seen"], q["not_seen"]), (0, {"its looks: ambiguous": 1}))
+
+    def test_a_recording_without_these_records_says_nothing_of_them(self):
+        r = steady()
+        told, text = self.told(r)
+        self.assertEqual((told["window"], told["one_by_one"]["recorded"], told["per_second"]), ({}, 0, []))
+        self.assertNotIn("one by one", text)
+
 
 if __name__ == "__main__":
     unittest.main()
