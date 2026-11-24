@@ -391,6 +391,22 @@ static void spin(double ms) {
 }
 static void think8(unsigned f) { spin(8); scene_with(f, nullptr); }
 static void think16(unsigned f) { spin(16); scene_with(f, nullptr); }
+/* the CPU's own work between the draws of the scene (8 and 16 ms over it: a slow recording, as a game's that is short of CPU), with an
+ * event query a frame and without: what a look's flush submits before the frame is recorded to its end is a start the GPU gets early */
+static double slow_us;
+static void at_slow(unsigned, int) { spin(slow_us / 1000); }
+static void slow(unsigned f, double ms_all, bool query) {
+  slow_us = ms_all * 1000 / 266;
+  if (query && f > 3) poll(events[(f + 1) & 3], D3D11_ASYNC_GETDATA_DONOTFLUSH);
+  scene_with(f, at_slow);
+  if (query) ctx->End(events[f & 3]);
+}
+static void slow8_none(unsigned f) { slow(f, 8, false); }
+static void slow8_event(unsigned f) { slow(f, 8, true); }
+static void slow16_none(unsigned f) { slow(f, 16, false); }
+static void slow16_event(unsigned f) { slow(f, 16, true); }
+static void slow30_none(unsigned f) { slow(f, 30, false); }
+static void slow30_event(unsigned f) { slow(f, 30, true); }
 static void think_uneven(unsigned f) { spin(f % 4 ? 10 : 34); scene_with(f, nullptr); }
 
 struct Mode { const char *name; void (*frame)(unsigned); };
@@ -406,6 +422,8 @@ static const Mode kModes[] = {
     {"m-discard", m_discard}, {"m-nooverwrite", m_nooverwrite}, {"m-dyntex", m_dyntex}, {"m-update", m_update},
     {"m-readback", m_readback}, {"m-readback-end", m_readback_end}, {"m-flush", m_flush},
     {"think8", think8}, {"think16", think16}, {"think-uneven", think_uneven},
+    {"slow8-none", slow8_none}, {"slow8-event", slow8_event}, {"slow16-none", slow16_none}, {"slow16-event", slow16_event},
+    {"slow30-none", slow30_none}, {"slow30-event", slow30_event},
 };
 
 static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcA(h, m, w, l); }
