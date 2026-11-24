@@ -1,3 +1,22 @@
+# The fourth round, 16:20 to 17:30 (no VRChat start): the third review's corrections alone
+
+DXMT `ad8b1eb` (third round `a05c004`), Neptune `0979d4f`, voile-lkd and Obelisk as this file's history says. wsd, the render server and the proxy's library byte for byte as before; DXMT alone is new:
+`9e16d38352285044` -> `c700994a492e7225`. Both trees of the generation have 10,238 entries; four host files differ, every guest file is the released one.
+
+| the review | now |
+|---|---|
+| a failed or killed run can leave the generation in place | `restoration-owed.json` before it is put in place, taken away once every digest is the released one, and only then `go_on`; putting it back depends on no other step; `--restore`, and the next start, after a kill. `test_restoration.py`: 20 cases in a scratch library, with a stand-in and with the developer's CLI and generation. With the owned client on the engine: SIGTERM and SIGKILL of the runner alone, both back |
+| profiles, gate and cooldown differ from Home's | read as N4N0 reads them, or nothing is started |
+| the commands do not execute | they do, and a test runs each |
+| a nested Enter and Leave lose the outer one across a flag's change (the switch on) | they are each other's own; 9 checks more in `protection`, three of which the third round's build fails |
+| shown rate by the callback's time; frames that lose what they belong to | by the presentation's own time; they stay counted (45 of 96, the review's fixture) |
+| conditions, counters, inventory, corroboration taken for granted | required, or told as missing |
+| the scorer | comparability first; the series' own files (INVALID when they contradict each other); timing only until pictures and eye are recorded |
+
+`query_client cases` natively, twice an arm: unset 240 and 241, `queries=once` 339, `order=1` 242, both 341, 0 failed; soaks natively 4 seeds of 40,000 an arm, 0 wrong, 0 hung. Through the render server: 202, 199, 205, 205, 0 failed (KNOWN 3, 6, 0, 0), the pictures' hashes the same in
+the four; 120,000 an arm: 0 wrong. With the switch 650 commits, 0 for nothing, 0 left, at most one a chunk. Of 31 rescues of one case the Ends of 2 to 7 are not among the sampled: told now, taken for matching before. `check-off-arm.py`: all the same. The guest probe: 8 of 8.
+A whole series with the owned client on the screen (`rehearse.py --aba`): three starts as planned, the release back and proven after each; INCONCLUSIVE, as a client at the display's rate must be. The reader on the real trace of 2026-11-23: the numbers of before.
+
 # DXMT: a look at an event query flushes once, not at each look (`OBELISK_DXMT_QUERY_RESCUE=once`): 2026-11-24, third round, 13:40 to 16:30 (no VRChat start)
 
 After the second independent review (GO WITH CHANGES for one real A/B/A, NO-GO for shipping). DXMT `a05c004` (second round `aa13aa3`), Neptune `0979d4f` (`otl.h` alone), voile-lkd and
