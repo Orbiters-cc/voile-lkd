@@ -1433,12 +1433,17 @@ static void owed() {
           worst = std::max(worst, ns() - a);
         }
         check(hr == S_FALSE && worst < 25000000, "a full queue: not there, and no look waited (the longest %.3f ms)", worst / 1e6);
+        if (v == 2) { /* (the protection taken back while the rescue is owed for the queue) */
+          mt->SetMultithreadProtected(FALSE);
+          nap_us(10000);
+        }
         HR(other.ctx4->Signal(f, v));
         other.ctx->Flush();
         nap_us(60000);
         hr = g.ctx->GetData(e, &there, sizeof(there), DONT);
         check(hr == S_OK, "a full queue let go: done without another look: 0x%08lx", (unsigned long)hr);
         if (hr != S_OK) look_event(e, 0);
+        if (v == 2) mt->SetMultithreadProtected(TRUE);
         progress++;
       }
     if (f) f->Release();
@@ -1458,6 +1463,204 @@ static void owed() {
   picture_good();
   mt->Release(); e->Release();
 }
+
+/* What the application sets of ID3D11Multithread, at any moment and from any thread: what it is told back, what Enter holds by it, and,
+ * with the switch, that a rescue that is owed stays owed and that nothing is recorded beside the rescue thread. (Without the switch nothing is
+ * owed, and the lock is taken away from whoever is in it: only what is told back is asked.) */
+static void protection() {
+  ID3D11Multithread *mt;
+  HR(g.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt));
+  {
+    ID3D11Multithread *of_device;
+    HR(g.dev->QueryInterface(__uuidof(ID3D11Multithread), (void **)&of_device));
+    const BOOL first = mt->SetMultithreadProtected(FALSE);
+    bool good = !first && !mt->GetMultithreadProtected() && !of_device->GetMultithreadProtected();
+    good &= !of_device->SetMultithreadProtected(TRUE) && mt->GetMultithreadProtected() && of_device->GetMultithreadProtected();
+    good &= mt->SetMultithreadProtected(TRUE) && mt->SetMultithreadProtected(FALSE) && !of_device->GetMultithreadProtected();
+    check(good, "what was set is what is told, by the device's and the context's");
+    of_device->Release();
+  }
+  ID3D11Query *e = g.query(D3D11_QUERY_EVENT);
+  auto there = [&] { BOOL b; return g.ctx->GetData(e, &b, sizeof(b), DONT); };
+  /* Another thread draws and ends the event; whether it came through within `ms`. Waited for in the end. */
+  auto other_records = [&](int ms, auto &&meanwhile) {
+    std::atomic<bool> came{false};
+    std::thread t([&] { g.rect(0, 3, 3, 4, 4, shade(5)); g.ctx->End(e); came = true; });
+    for (int n = 0; n < ms && !came; n++) nap_us(1000);
+    const bool in_time = came;
+    meanwhile();
+    t.join();
+    return in_time;
+  };
+  check(other_records(2000, [] {}), "not protected: another thread records");
+  mt->Enter(); /* (holds nothing: it is off) */
+  check(other_records(2000, [] {}), "not protected, entered: another thread records");
+  mt->Leave();
+  mt->Leave();
+  mt->SetMultithreadProtected(TRUE);
+  mt->Enter();
+  mt->Enter();
+  mt->Leave();
+  check(!other_records(60, [&] { mt->Leave(); }), "protected, entered twice, left once: another thread waits");
+  mt->Enter();
+  mt->SetMultithreadProtected(FALSE);
+  check(other_records(2000, [] {}), "entered, then not protected any more: another thread records");
+  mt->Leave(); /* (left already) */
+  mt->SetMultithreadProtected(TRUE);
+  check(other_records(2000, [] {}), "protected again, nothing entered: another thread records");
+  mt->Enter();
+  check(!other_records(60, [&] { mt->Leave(); }), "and entered: it waits");
+  check(look_event(e, 0).hr == S_OK, "the event of it is there");
+  if (!once) { mt->SetMultithreadProtected(FALSE); mt->Release(); e->Release(); picture_good(); return; }
+
+  /* The rescue thread at work while the protection goes on and off: every event is there without another look. */
+  enum { SAME, FROM_ANOTHER, ON_AND_OFF, HOWS };
+  for (int how = 0; how < HOWS; how++)
+    for (int round = 0; round < 40; round++) {
+      mt->SetMultithreadProtected(TRUE);
+      g.rect(0, round * 5, 40 + how * 10, 4, 4, shade(round + how));
+      g.ctx->End(e);
+      std::atomic<int> phase{0};
+      std::thread owner([&] {
+        mt->Enter();
+        phase = 1;
+        while (phase < 2) nap_us(50);
+        if (how == FROM_ANOTHER) { mt->SetMultithreadProtected(FALSE); nap_us(round * 20); }
+        mt->Leave();
+      });
+      while (phase < 1) nap_us(20);
+      HRESULT hr = S_FALSE;
+      for (int n = 0; n < 70; n++) hr = there();
+      bool stop_it = false;
+      std::atomic<bool> stop{false};
+      std::thread toggler;
+      if (how == SAME) mt->SetMultithreadProtected(FALSE);
+      if (how == ON_AND_OFF) { stop_it = true; toggler = std::thread([&] { for (unsigned n = 0; !stop; n++) { mt->SetMultithreadProtected(n & 1); if (n % 64 == 0) nap_us(1); } }); }
+      const bool held = hr == S_FALSE;
+      phase = 2;
+      owner.join();
+      for (int n = 0; n < 60 && (n < 4 || hr != S_OK); n++) { nap_us(1000); if (n >= 30) hr = there(); } /* (nobody looks for 30 ms) */
+      if (stop_it) { stop = true; toggler.join(); }
+      if (!held || hr != S_OK) check(false, "how %d, round %d: not before it was let go, and then without another look: %d 0x%08lx", how, round, (int)held, (unsigned long)hr);
+      if (hr != S_OK) look_event(e, 0);
+      progress++;
+    }
+  check(true, "%d x 40 events owed while the protection went", (int)HOWS);
+
+  /* Recording, ending and looking beside two lookers, with the protection going on and off all along. */
+  {
+    std::atomic<bool> stop{false};
+    ID3D11Query *q[8];
+    std::mutex feedback;
+    uint32_t seen[8] = {}, ended[8] = {};
+    for (auto &x : q) x = g.query(D3D11_QUERY_EVENT);
+    std::thread toggler([&] { Random r(3); while (!stop) { mt->SetMultithreadProtected(r.one_in(2)); if (r.one_in(3)) { mt->Enter(); nap_us(r.below(200)); mt->Leave(); } nap_us(r.below(60)); } });
+    auto sweep = [&] {
+      std::lock_guard<std::mutex> l(feedback);
+      for (int k = 0; k < 8; k++) { BOOL b; if (seen[k] != ended[k] && g.ctx->GetData(q[k], &b, sizeof(b), DONT) == S_OK) seen[k] = ended[k]; }
+    };
+    std::thread a([&] { while (!stop) { sweep(); nap_us(100); } }), b([&] { while (!stop) { sweep(); nap_us(330); } });
+    Random r(17);
+    bool good = true;
+    for (uint32_t f = 1; f <= 6000 && good; f++) {
+      for (unsigned n = r.below(4); n--;) g.rect(r.below(2), r.below(200), r.below(200), 30, 30, shade(r.next()));
+      const int k = (int)(f & 7);
+      { std::lock_guard<std::mutex> l(feedback); g.ctx->End(q[k]); ended[k] = f; }
+      if (r.one_in(120)) g.burn(layers_40ms / 20);
+      if (r.one_in(60)) nap_us(r.below(9000));
+      const int wait = (int)((f + 3) & 7);
+      const uint64_t begin = ns();
+      for (;;) {
+        { std::lock_guard<std::mutex> l(feedback); if (seen[wait] == ended[wait]) break; }
+        if (ns() - begin > 4000000000ull) { good = false; break; }
+        nap_us(20);
+      }
+      progress++;
+    }
+    stop = true;
+    toggler.join(); a.join(); b.join();
+    check(good, "6000 Ends beside two lookers and one who sets the protection: each there");
+    for (auto x : q) x->Release();
+  }
+
+  /* A full queue, and the protection taken back while the rescue is owed for it: from this thread, from another, and not. */
+  if (g.ctx4) {
+    Gpu other;
+    other.make();
+    ID3D11Device5 *dev5 = nullptr;
+    ID3D11Fence *f = nullptr;
+    if (SUCCEEDED(other.dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&dev5)) &&
+        SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), (void **)&f)))
+      for (UINT64 v = 1; v <= 6; v++) {
+        mt->SetMultithreadProtected(TRUE);
+        look_event(e, 0);
+        HR(g.ctx4->Wait(f, v));
+        for (int n = 0; n < 31; n++) { g.rect(1, n, 60 + (int)v * 10, 5, 5, shade(n)); g.ctx->Flush(); }
+        g.rect(1, 40 + (int)v * 10, 100, 5, 5, shade(77));
+        g.ctx->End(e);
+        uint64_t worst = 0;
+        HRESULT hr = S_FALSE;
+        for (int n = 0; n < 90 && hr == S_FALSE; n++) { const uint64_t a = ns(); hr = there(); worst = std::max(worst, ns() - a); }
+        check(hr == S_FALSE && worst < 25000000, "a full queue, %llu: not there, and no look waited (the longest %.3f ms)", (unsigned long long)v, worst / 1e6);
+        const uint64_t a = ns();
+        if (v == 2 || v == 5) mt->SetMultithreadProtected(FALSE);
+        if (v == 3) std::thread([&] { mt->SetMultithreadProtected(FALSE); }).join();
+        if (v == 5 || v == 6) { mt->SetMultithreadProtected(FALSE); mt->SetMultithreadProtected(TRUE); }
+        check(ns() - a < 25000000, "a full queue, %llu: what is set waits for nothing (%.3f ms)", (unsigned long long)v, (ns() - a) / 1e6);
+        nap_us(10000);
+        HR(other.ctx4->Signal(f, v));
+        other.ctx->Flush();
+        nap_us(60000);
+        hr = there();
+        check(hr == S_OK, "a full queue let go, %llu, protected %d: done without another look: 0x%08lx", (unsigned long long)v, (int)mt->GetMultithreadProtected(), (unsigned long)hr);
+        if (hr != S_OK) look_event(e, 0);
+        progress++;
+      }
+    if (f) f->Release();
+    if (dev5) dev5->Release();
+    other.drop();
+  }
+
+  /* A device let go of with a rescue owed, the protection going meanwhile. */
+  {
+    double worst = 0;
+    for (int n = 0; n < 24; n++) {
+      Gpu t;
+      t.make();
+      ID3D11Multithread *m;
+      HR(t.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&m));
+      m->SetMultithreadProtected(TRUE);
+      ID3D11Query *q = t.query(D3D11_QUERY_EVENT);
+      t.rect(0, 1, 1, 5, 5, shade(n));
+      t.ctx->End(q);
+      std::atomic<int> phase{0};
+      std::thread owner([&] { m->Enter(); phase = 1; while (phase < 2) nap_us(50); if (n & 1) m->SetMultithreadProtected(FALSE); m->Leave(); phase = 3; });
+      while (phase < 1) nap_us(20);
+      BOOL b;
+      for (int k = 0; k < 70; k++) t.ctx->GetData(q, &b, sizeof(b), DONT);
+      std::atomic<bool> stop{false};
+      std::thread toggler([&] { for (unsigned k = 0; !stop; k++) { m->SetMultithreadProtected(k & 1); nap_us(5); } });
+      phase = 2;
+      owner.join();
+      if (n % 3 == 2) nap_us(n * 10); /* (the rescue thread at it) */
+      else nap_us(15000);             /* (as teardown() says) */
+      if (n % 3 == 2) nap_us(15000);
+      stop = true;
+      toggler.join();
+      m->Release();
+      const uint64_t begin = ns();
+      q->Release();
+      t.drop();
+      worst = std::max(worst, (ns() - begin) / 1e6);
+      progress++;
+    }
+    check(worst < 3000, "24 devices let go of: the longest %.1f ms", worst);
+  }
+  mt->SetMultithreadProtected(FALSE);
+  mt->Release();
+  e->Release();
+  picture_good();
+}
 #endif
 
 struct Case { const char *name; void (*run)(); };
@@ -1466,7 +1669,7 @@ static const Case kCases[] = {
     {"deferred", deferred}, {"list-events", list_events}, {"uploads", uploads}, {"occlusion", occlusion}, {"timestamps", timestamps}, {"readback", readback}, {"predication", predication}, {"waits", waits},
     {"keyed", keyed}, {"teardown", teardown}, {"two-threads", two_threads},
 #ifndef _WIN32
-    {"sixty-four", sixty_four}, {"host-threads", host_threads}, {"owed", owed},
+    {"sixty-four", sixty_four}, {"host-threads", host_threads}, {"owed", owed}, {"protection", protection},
 #endif
 };
 

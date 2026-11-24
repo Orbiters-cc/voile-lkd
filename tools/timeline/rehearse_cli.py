@@ -53,7 +53,7 @@ def play(words):
             print(line, end="", flush=True)
             return 1
         elif event["event"] == "rehearsal_exited":
-            record(session, "Finished", None, exit_code=event["exit_code"], played=dict(seconds=1))
+            record(session, "Finished", None, exit_code=event["exit_code"], played=dict(seconds=1, ended_by_obelisk=True, exit_signal=None))
             tell(event="exited", app_id=438100, session_id=session, frames=None, exit_code=event["exit_code"], exit_signal=None, seconds=1, ended_by_request=True)
     return child.wait()
 

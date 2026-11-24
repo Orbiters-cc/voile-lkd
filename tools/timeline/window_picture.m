@@ -3,6 +3,7 @@
  *
  *   window_picture find <pid>              the largest window of that process that is on the screen: "<id> <width> <height> <layer>"
  *   window_picture shot <pid> <out.png>    its picture by its window id (macOS's own screencapture -l: never the screen), as "<id> <w> <h>"
+ *   window_picture may                     whether macOS lets whoever started this record windows: "yes" or "no" (nothing is asked, or taken)
  *   window_picture diff <a.png> <b.png> [<heat.png>]   JSON: mean difference, PSNR, SSIM, the share of pixels that differ; where
  *
  * Nothing of the program is touched, and nothing but that window is seen. exit 1: no such window, or no picture of it.
@@ -117,6 +118,7 @@ int main(int argc, char **argv) {
       if (t.terminationStatus || ![NSFileManager.defaultManager fileExistsAtPath:@(argv[3])]) { fprintf(stderr, "no picture of it\n"); return 1; }
       return told(w);
     }
+    if (argc == 2 && !strcmp(argv[1], "may")) return puts(CGPreflightScreenCaptureAccess() ? "yes" : "no") < 0;
     if ((argc == 4 || argc == 5) && !strcmp(argv[1], "diff")) return diff(argv[2], argv[3], argc == 5 ? argv[4] : NULL);
     fprintf(stderr, "window_picture find <pid> | shot <pid> <out.png> | diff <a.png> <b.png> [<heat.png>]\n");
     return 2;

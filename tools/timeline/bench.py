@@ -12,8 +12,11 @@ of three starts, the window server at `app_active=0` and level 0 throughout, Saf
 arrived, and whenever something else is in front before the first window, the app bundle of this session's own window server is
 opened with `open`, as a click on its Dock icon does. What was in front is told by name.
 
-Starts VRChat with `obelisk-cli steam play 438100 [--render-percent N] -- <arguments> <link>` in a private instance of a
-fixed world, waits until the local player is in that very instance, as this start's own VRChat log says it (the log whose
+Starts VRChat with `obelisk-cli steam play 438100 --no-saved-arguments [--render-percent N] -- <arguments> <link>` in a private
+instance of a fixed world (as Home of Orbiters - N4N0 starts it: nothing that is saved for the game is added, on the default profile. On a
+computer that uses several VRChat profiles it refuses to start: which one Home would start is Home's to know, and a private place may
+not ride with a cold start there, crates/orbiters-core/src/vrchat_launch.rs; nor does it start while N4N0 holds the one slot for a start, or
+its wait after an early end is not over), waits until the local player is in that very instance, as this start's own VRChat log says it (the log whose
 command line holds the link: a fallback destination is no arrival), and loading and shader compilation have settled (a
 start that does not settle is not scored), then records equal timed windows with nobody touching the game, quits by
 session (never forced) and writes one results file, whatever happened (the outcome says what). Nothing here sends input to
@@ -26,7 +29,7 @@ ended. A run whose session did not end, or that may have started one it was not 
 stops there.
 
 exit status: 0 measured, 2 did not start, 3 did not arrive, 4 did not settle or ended before a window, 5 its session did not
-end (whatever else happened).
+end (whatever else happened), 6 refused: nothing was started.
 
 The three frame counters are kept apart (R3), per swapchain generation (a new one at each `guest swapchain: created`):
   - guest Present: Neptune's nptunix line, `<n> presents (<m> shown events), last 60: interval avg X ms, fence wait avg
@@ -46,7 +49,7 @@ Otherwise it is kept with `valid: false` and why. `--allow-locked` scores produc
 usage: bench.py --link 'vrchat://launch?...' [--percent N] [--arg A]... [--warm 90] [--window 60] [--windows 3]
                 [--cli PATH] [--allow-locked] --out results.json
 """
-import argparse, datetime, glob, json, os, re, subprocess, sys, threading, time, urllib.parse
+import argparse, datetime, fcntl, glob, json, os, re, subprocess, sys, threading, time, urllib.parse
 
 HOME = os.path.expanduser("~")
 ENGINE_LOG = f"{HOME}/Library/Logs/Obelisk/Steam/wine-438100.log"
@@ -66,6 +69,8 @@ SETTLE_DEADLINE = 180  # s after the warm time for the frames to settle
 GAP = 5.0              # s between two looks (or two shown frames' lines) at most in a scored window
 COVERED = 0.9          # of a scored window its counted submissions and its shown frames must fill
 RECORDS = f"{LIBRARY}/SteamSessions"
+N4N0 = f"{HOME}/Library/Application Support/orbiters-desktop"  # what Orbiters - N4N0 keeps: its settings, its gate for a start
+WHOLE_SCREEN = ["-screen-fullscreen", "1", "-window-mode", "borderless"]
 
 
 def now():
@@ -161,6 +166,154 @@ def destination(link):
 def same_place(wanted, said):
     """Whether the location VRChat said is the one wanted: the world, the instance and every tag the link asked for."""
     return bool(wanted and said) and wanted[:2] == said[:2] and all(said[2].get(k) == v for k, v in wanted[2].items())
+
+
+# ---- a start as Home makes it (Orbiters - N4N0: crates/orbiters-core/src/vrchat_launch.rs, obelisk.rs; AGENTS.md, "Several VRChat
+# accounts on one computer") ----
+
+WORLD_ID = re.compile(r"wrld_[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+INSTANCE_ID = re.compile(r"[A-Za-z0-9]{1,64}(~[A-Za-z]{1,32}(\([A-Za-z0-9_.-]{1,128}\))?)*$")
+LINK_ITEM = re.compile(r"(ref|shortName)=[A-Za-z0-9._-]*$")
+
+
+class Refused(Exception):
+    """Why nothing is started. Never a link, an account or a world in it."""
+
+
+def check_link(link):
+    """Refuses what is not a launch link of one instance, in VRChat's own grammar (nothing in it can become another argument)."""
+    head, _, query = link.partition("?")
+    items = query.split("&")
+    place_of = [i[3:] for i in items if i.startswith("id=")]
+    if head != "vrchat://launch" or len(place_of) != 1 or not all(i.startswith("id=") or LINK_ITEM.match(i) for i in items):
+        raise Refused("the link is not a launch link of one instance (vrchat://launch?ref=...&id=<world>:<instance>)")
+    world, _, instance = urllib.parse.unquote(place_of[0]).partition(":")
+    if not WORLD_ID.match(world) or len(instance) > 512 or not INSTANCE_ID.match(instance):
+        raise Refused("the link's world and instance are not of VRChat's own grammar")
+
+
+def home_profiles():
+    """The numbers of the VRChat profiles on Home's choice; whose they are is not kept. No settings: N4N0 was never used here."""
+    try:
+        with open(f"{N4N0}/settings.json") as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        raise Refused(f"N4N0's settings cannot be read ({type(e).__name__}): how many VRChat profiles this computer uses is not known") from None
+    launch = settings.get("launch", {}) if isinstance(settings, dict) else None
+    profiles = launch.get("profiles", {}) if isinstance(launch, dict) else None
+    if not isinstance(profiles, dict):
+        raise Refused("N4N0's settings are not as they are written: how many VRChat profiles this computer uses is not known")
+    return sorted(int(k) for k in profiles if k.strip().isdigit())  # (a key that is no number is none of VRChat's)
+
+
+def profile_arguments():
+    """What names the profile chosen in Home, as Home's start does: nothing, the default one, where there is a single one."""
+    several = [p for p in home_profiles() if p != 0]
+    if several:
+        raise Refused("this computer uses several VRChat profiles (Home's choice remembers " + ", ".join(f"profile {p}" for p in several) + "). Which one is "
+                      "started is Home's to choose, and a private instance may not go with the start of a game whose account is not known: "
+                      "this benchmark is for one profile alone. Nothing was started. (A profile that is used no more is taken off Home's "
+                      "choice with its x.)")
+    return []
+
+
+def play_command(cli, percent, arguments, link):
+    """The launch. Every argument the game gets is in it: none that is saved for it is added."""
+    for a in arguments:
+        if a == "--profile" or a.startswith(("--profile=", "vrchat://")):
+            raise Refused("--arg names no profile and no place: the profile is Home's, the place is --link's")
+    check_link(link)
+    return ([cli, "steam", "play", "438100", "--no-saved-arguments"] + (["--render-percent", str(percent)] if percent else []) + ["--"] + WHOLE_SCREEN +
+            list(arguments) + profile_arguments() + [link])
+
+
+def boot_clock():
+    """This boot, and the seconds since it, sleep included (N4N0's boot_clock)."""
+    return run(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"]).strip().upper(), time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+class Slot:
+    """The one slot for a start of VRChat on this computer, as every N4N0 takes it (obelisk_cli.rs: a lock on obelisk-start-gate.lock, held
+    from before a start is decided until how it ended is known), and the gate beside it. While it is held no N4N0 starts VRChat."""
+
+    def __init__(self):
+        self.file = None
+
+    def __enter__(self):
+        os.makedirs(N4N0, exist_ok=True)
+        path = f"{N4N0}/obelisk-start-gate.lock"
+        try:
+            self.file = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o644), "r+")
+            fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.let_go()
+            raise Refused("Orbiters - N4N0 is starting or has started VRChat: nothing is started beside it") from None
+        except OSError as e:
+            self.let_go()
+            raise Refused(f"the lock that keeps two VRChats from starting at once cannot be taken ({e.strerror})") from None
+        try:
+            if self.file.read().strip():
+                raise Refused("a start of VRChat that N4N0 or this program made is not settled: open Orbiters - N4N0, which settles it, and wait")
+            self.gate()
+        except BaseException:
+            self.let_go()
+            raise
+        return self
+
+    def gate(self):
+        boot, at = boot_clock()
+        try:
+            with open(f"{N4N0}/obelisk-start-gate.json") as f:
+                kept = json.load(f)
+            until, of = kept.get("until"), kept["boot"]
+            if not isinstance(of, str) or not (until is None or isinstance(until, (int, float))):
+                raise ValueError
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, KeyError, AttributeError):
+            raise Refused("N4N0's gate for a start of VRChat cannot be read: open Orbiters - N4N0, which writes it again, and wait") from None
+        if of.upper() == boot and until is not None and until > at:
+            raise Refused(f"the last VRChat ended early: {min(until - at, 80):.0f} s are left of the wait after it")
+
+    def say(self, session):
+        """A start of this program's is in flight (N4N0's InFlight): whoever finds it here, this program gone, waits as after an early end."""
+        boot, at = boot_clock()
+        self.write(json.dumps(dict(boot=boot, started=at, session=session, program=None, until=None)))
+
+    def settled(self):
+        self.write("")
+
+    def write(self, text):
+        if self.file:
+            self.file.seek(0)
+            self.file.write(text)
+            self.file.truncate()
+            self.file.flush()
+
+    def let_go(self):
+        if self.file:
+            self.file.close()
+            self.file = None
+
+    def __exit__(self, *_):
+        self.let_go()
+
+
+class HeldByCaller:
+    """The slot is held by the program that started this one (real_session.py), which says and settles what is in it."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    def say(self, session):
+        pass
+
+    settled = let_go = lambda self: None
 
 
 JOINING = re.compile(r"\[Behaviour\] Joining (wrld_\S+)")
@@ -538,7 +691,11 @@ def close(cli, session, proc, res, started_nothing=False):
 
 def main():
     ending = {"resolved": True}
-    status = measure(ending)
+    try:
+        status = measure(ending)
+    except Refused as e:
+        print(f"Not started: {e}", file=sys.stderr)
+        return 6
     return status if ending["resolved"] else 5
 
 
@@ -558,13 +715,22 @@ def measure(ending):
     ap.add_argument("--picture-tool", help="tools/timeline/window_picture.m, built")
     ap.add_argument("--picture-at", type=float, default=100, help="seconds after the arrival")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--slot-held", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.percent is not None and not 1 <= a.percent <= 100:
         ap.error("--percent is the engine's percent, 1 to 100")
     cli = a.cli or sorted(glob.glob(f"{HOME}/Library/Application Support/orbiters-desktop/obelisk-cli/obelisk-cli-*-arm64/obelisk-cli"))[-1]
+    wanted = destination(a.link)
+    if wanted is None:
+        ap.error("--link names no world and instance")
+    with (HeldByCaller() if a.slot_held else Slot()) as slot:
+        # Decided with the slot held: nobody else starts VRChat from here on.
+        return started(a, cli, play_command(cli, a.percent, a.arg, a.link), wanted, slot, ending)
+
+
+def started(a, cli, command, wanted, slot, ending):
     started_wall = time.time()
     lines, vlines, events = [], [], []
-    command = [cli, "steam", "play", "438100"] + (["--render-percent", str(a.percent)] if a.percent else []) + ["--", "-screen-fullscreen", "1", "-window-mode", "borderless"] + a.arg + [a.link]
     res = {
         "label": a.label,
         "when": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -579,9 +745,7 @@ def measure(ending):
         old_log = (st.st_ino, st.st_dev)
     except FileNotFoundError:
         old_log = None
-    wanted = destination(a.link)
-    if wanted is None:
-        ap.error("--link names no world and instance")
+    slot.say(None)
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     session = {"id": None, "running_at": None}
     state = {"gpu": [], "cpu": [], "look": [], "fronted": [], "programs": {}}
@@ -597,6 +761,8 @@ def measure(ending):
                 continue
             events.append((now(), e))
             told(session, e, now())
+            if e.get("event") == "starting" and session["id"]:
+                slot.say(session["id"])
     reader = threading.Thread(target=read_events, daemon=True)
     reader.start()
     t_start = now()
@@ -708,6 +874,8 @@ def measure(ending):
         print("outcome:", res["outcome"])
         # Whatever is returned above: nothing more may be started while this one may still run.
         ending["resolved"] = resolved
+        if resolved:
+            slot.settled()
 
 
 if __name__ == "__main__":

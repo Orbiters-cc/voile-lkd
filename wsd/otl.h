@@ -109,13 +109,20 @@ enum otl_kind {
   OTL_D_QUERY = 55,       /* an event or disjoint query was ended (at most 128 of these in 100 ms); a: 1 disjoint | 2 with nothing new
                              recorded, so at a moment that was already marked | 4 in a command list, as it was executed; v: queue id,
                              query id << 32 | which End of it, its event, the chunk its marker is in (with 2: at the latest), frame group */
-  OTL_D_QUERY_SEEN = 56,  /* a look found it there (t: after the look); a: 1 ended again, never seen; v: queue id, as OTL_D_QUERY, the
+  OTL_D_QUERY_SEEN = 56,  /* a look found it there (t: after the look); a: 1 ended again, never seen | 2 neither: the 65th look did not find it; v: queue id, as OTL_D_QUERY, the
                              start of the first look, the end of the last look that did not find it (0: none), looks, its event */
   OTL_D_LOOKS = 57,       /* follows OTL_D_QUERIES; a: as it; v: queue id, frame group, looks at event and disjoint queries | S_FALSE
                              answers << 32, S_OK answers | rescues << 32 (with the switch: chunks a look or the rescue thread committed;
                              without: command buffers committed by a look after the first 64), 16 bits each: rescues not
                              made at once for the device's lock, for a full queue, rescues whose uploads the rescue thread commits,
                              chunks the rescue thread committed; the longest look in ns | the longest rescue on a looking thread in ns << 32, both with DONOTFLUSH */
+  OTL_D_DEBTS = 58,       /* follows OTL_D_LOOKS; a: as it; v: queue id, frame group, times the highest event that is owed to the rescue thread
+                             grew | times what was owed was handed over << 32, tries that could not hand over: by looks | by the rescue
+                             thread << 32, the highest event owed now (0: none), since when the oldest is in ns, at most 2^32 - 1 | looks with
+                             DONOTFLUSH of 0.5 ms or more << 32 | of those, of 5 ms or more << 48 */
+  OTL_D_OWED = 59,        /* a: 0 the highest event that is owed grew | 1 what was owed up to it was handed over | 2 the context ends with it
+                             owed | why it was owed << 8 (1: the device's lock was another's, 2: the queue was full; with 1: 0); v: queue id, the event,
+                             the last event handed over, when the oldest of what is (was) owed became so */
 
   /* wsd (role wsd) */
   OTL_W_ATTACH = 64,      /* a buffer was attached; a: buffer; v: memory identity, width<<32|height, format, client id */

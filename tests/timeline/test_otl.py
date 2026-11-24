@@ -331,6 +331,107 @@ class Bounds(unittest.TestCase):
             planes = otl.cadence(s, 0, 2**62)
         self.assertEqual((planes[0]["shown"], planes[0]["zero_time"], planes[0]["redisplays_shown"]), (4, 1, 1))
 
+    def read(self, r, lo, hi, *more):
+        told = os.path.join(r.dir, "out.json")
+        text = self.main(r.dir, "--from", str(lo), "--to", str(hi), "--cadence", "--json", told, *more)
+        with open(told) as f:
+            return json.load(f)["reports"][0], text
+
+    def presented(self, r, serial, at, plane=5, callback=None, sent=None, a=1):
+        sent = sent if sent is not None else at - 20 * MS
+        r.put("wsd", sent, "W_RX", 1, 1, serial, sent, sent, 0, 1 << 32 | plane)
+        r.put("wsd", callback if callback is not None else at + MS, "W_SHOWN", a, serial, at, 1, plane)
+
+    def test_a_window_s_rate_is_over_all_of_it(self):
+        # the review's case: 60 s, 2300 frames 25 ms apart, then nothing for 2.525 s. 40.00 was told, 38.33 are.
+        r = Recording()
+        base = 1000 * MS
+        for i in range(2300):
+            self.presented(r, i + 1, base + i * 25 * MS)
+        r.finish()
+        one, text = self.read(r, base, base + 60_000 * MS, "--plane", "5")
+        c = one["cadence"][0]
+        self.assertEqual((c["shown"], round(c["shown_per_s"], 2), round(c["shown_per_s_from_the_first_to_the_last"], 2)), (2300, 38.33, 40.0))
+        self.assertEqual((c["leading_gap_ms"], c["trailing_gap_ms"], c["largest_gap_ms"], c["holds_of_3_refreshes_or_more"]), (0, 2525, 2525, 1))
+        self.assertIn("SHOWN 2300 (38.33/s over 60.000 s)", text)
+
+    def test_a_frame_is_of_the_window_it_was_presented_in_whenever_its_callback_ran(self):
+        r = Recording()
+        cut = 2000 * MS
+        self.presented(r, 1, cut - 10 * MS, callback=cut + 200 * MS)  # told late: of the window before
+        self.presented(r, 2, cut)                                      # at the cut itself: of the one after
+        self.presented(r, 3, cut + 1000 * MS - 1, callback=cut + 2500 * MS)
+        self.presented(r, 4, cut + 1000 * MS)
+        r.put("wsd", cut + 500 * MS, "W_SHOWN", 1, 1, cut + 500 * MS, 1, 5)            # (told again: it was new once)
+        r.put("wsd", cut + 510 * MS, "W_SHOWN", 1 | 1 << 31, 2, cut + 510 * MS, 1, 5)  # a redisplay
+        r.put("wsd", cut + 520 * MS, "W_SHOWN", 1, 9, 0, 1, 5)
+        r.finish()
+        before, at, after = (self.read(r, cut + k * 1000 * MS, cut + (k + 1) * 1000 * MS, "--plane", "5")[0]["cadence"][0] for k in (-1, 0, 1))
+        self.assertEqual([c["shown"] for c in (before, at, after)], [1, 2, 1], "each once, none in two windows")
+        self.assertEqual((at["zero_time"], at["redisplays_shown"]), (1, 1))
+        self.assertEqual([round(c["shown_per_s"], 3) for c in (before, at, after)], [1.0, 2.0, 1.0])
+
+    def test_a_window_of_no_frame_or_of_one_has_its_rate_and_its_gaps(self):
+        r = Recording()
+        self.presented(r, 1, 1500 * MS)
+        self.presented(r, 2, 9000 * MS)
+        r.finish()
+        one = self.read(r, 1000 * MS, 2000 * MS, "--plane", "5")[0]["cadence"][0]
+        self.assertEqual((one["shown"], one["shown_per_s"], one["largest_gap_ms"], one["shown_interval_ms"]["p50"], one["holds_of_3_refreshes_or_more"]),
+                         (1, 1.0, 500, None, 2))
+        none = self.read(r, 3000 * MS, 5000 * MS, "--plane", "5")[0]["cadence"]
+        # (nothing of this plane is loaded with the window at all, or it is told with nothing shown)
+        self.assertTrue(not none or (none[0]["shown"], none[0]["shown_per_s"], none[0]["largest_gap_ms"]) == (0, 0.0, 2000), none)
+        near = self.read(r, 2000 * MS, 4000 * MS, "--plane", "5")[0]["cadence"][0]
+        self.assertEqual((near["shown"], near["shown_per_s"], near["largest_gap_ms"], near["holds_of_3_refreshes_or_more"]), (0, 0.0, 2000, 1))
+
+    def test_what_is_told_of_a_plane_is_its_own(self):
+        r = Recording()
+        r.export(MS, 0xAAA, export=1, buffer=1)
+        r.export(2 * MS, 0xBBB, pointer=0x2000, export=2, buffer=2)
+        for i in range(40):  # the game's: on its queue 1; another window's, half as many, on queue 2
+            r.frame((1000 + 20 * i) * MS, export=1, plane=5)
+            if i % 2:
+                r.frame((1007 + 20 * i) * MS, export=2, plane=6, window=2, queue=2, chunks=3)
+        for queue, events in ((1, 3), (2, 50)):
+            r.put("dxmt", 1300 * MS, "D_QUERIES", 1 | 2, queue, 1, events, 0, 0, 0)
+            r.put("dxmt", 1300 * MS, "D_STALL", 2 | 8, queue, 7, 50, 49, 51, 1)
+        r.finish()
+        one, text = self.read(r, 1200 * MS, 1600 * MS, "--plane", "game", "--splits")
+        self.assertEqual((one["plane"], round(one["plane_share"], 2), one["queues"]), (5, round(21 / 31, 2), [[10, 1]]))
+        self.assertEqual([c["plane"] for c in one["cadence"]], [5])
+        self.assertEqual((one["production"]["frames"], one["production"]["per_s"], one["production"]["interval_ms"]["mean"]), (20, 50.0, 20.0))
+        self.assertEqual((one["work"]["frames"], one["work"]["draws"]), (21, 10))
+        self.assertEqual((one["queries"]["ended"]["event"], one["queries_of_every_queue"]["ended"]["event"]), (3, 53))
+        self.assertEqual((one["queries"]["stall_flushes"], one["queries_of_every_queue"]["stall_flushes"]), (1, 2))
+        self.assertEqual(one["whole_share"], 1.0)
+        self.assertEqual(one["trace_not_complete"], [])
+
+    def test_a_frame_of_the_game_s_queue_that_is_not_told_is_one_of_its_frames(self):
+        r = steady(10)
+        r.frame(400 * MS, leave=("RX",))
+        r.finish()
+        one, _ = self.read(r, 90 * MS, 500 * MS, "--plane", "5")
+        self.assertEqual((one["frames"], one["whole"]), (11, 9), "the one that was not presented, and the first of its plane")
+        self.assertLess(one["whole_share"], 0.95)
+
+    def test_a_window_that_is_not_recorded_whole_says_so(self):
+        told = lambda r, lo=150 * MS, hi=250 * MS: self.read(r, lo, hi, "--plane", "5")[0]["trace_not_complete"]
+        r = steady(20)
+        r.finish()
+        self.assertEqual(told(r), [])
+        r.put("dxmt", 999 * MS, "LOST", 0, 160 * MS, 170 * MS, 7, 7, thr=0xffff)
+        r.finish()
+        self.assertEqual(told(r), ["dxmt 10: records lost"])
+        r = steady(20)
+        r.put("wsd", 200 * MS, "END", 1, 1, 0, 0, 0, 0)
+        r.finish()
+        self.assertEqual(told(r), ["wsd 8: its recorder ended (budget)"], "its last record may be later")
+        r = steady(20)
+        r.records[("vtest", 9)].clear()
+        r.finish(only=("npt", "dxmt", "wsd"))
+        self.assertEqual(told(r), ["vtest: not recorded"])
+
     def test_a_file_cut_in_a_record_is_read_to_its_last_whole_one(self):
         r = steady(3)
         r.finish()
@@ -499,6 +600,83 @@ class Queries(unittest.TestCase):
 
     def seen(self, r, t, query, end, first, last, looks, event, a=0, queue=1):
         r.put("dxmt", t * MS, "D_QUERY_SEEN", a, queue, query << 32 | end, first * MS, last * MS, looks, event)
+
+    def test_a_commit_is_judged_by_its_watermarks_not_by_what_it_says(self):
+        r = Recording()
+        for t, a, chunk, event, before, after in ((10, 2, 7, 50, 49, 51),    # a rescue
+                                                  (20, 2, 8, 51, 51, 52),    # says nothing of it, and its marker had been handed over
+                                                  (30, 2, 9, 60, 52, 53)):   # and one that left its marker where it was
+            r.put("dxmt", t * MS, "D_STALL", a | 8, 1, chunk, event, before, after, 1)
+            r.put("dxmt", t * MS, "D_READY", 0, 1, chunk, 0, 1)
+            r.put("dxmt", t * MS, "D_COMMIT", 17, 1, chunk, 1, 0, 0, 0)
+        told, text = self.told(r)
+        self.assertEqual([told[k] for k in ("handed_over_and_committed", "left_not_handed_over", "said_otherwise_than_its_watermarks", "most_rescues_of_a_chunk")], [1, 1, 2, 1])
+        self.assertIn("NOT AS IT IS MEANT TO BE: 2 said otherwise", text)
+
+    def test_a_rescue_is_of_the_chunk_its_marker_is_in_and_that_chunk_was_handed_over(self):
+        r = Recording()
+        for t, chunk, event, ready, why in ((10, 7, 50, True, 17), (20, 8, 60, False, 17), (30, 9, 70, True, 19), (40, 10, 80, True, 17)):
+            r.put("dxmt", t * MS, "D_STALL", 2 | 8, 1, chunk, event, event - 1, event + 1, 1)
+            if ready:
+                r.put("dxmt", t * MS, "D_READY", 0, 1, chunk, 0, 1)
+            r.put("dxmt", t * MS, "D_COMMIT", why, 1, chunk, 1, 0, 0, 0)
+        self.query(r, 5, 7, 1, 50, 7)
+        self.query(r, 35, 7, 2, 80, 9)   # its marker is of the chunk before
+        told, _ = self.told(r)
+        self.assertEqual([told[k] for k in ("rescues_whose_chunk_was_not_handed_over", "rescues_of_a_chunk_something_else_committed",
+                                            "rescues_of_another_chunk_than_its_end_s", "handed_over_and_committed")], [1, 1, 1, 0])
+
+    def owed(self, r, t, what, event, submitted, why=0, queue=1):
+        r.put("dxmt", t * MS, "D_OWED", what | why << 8, queue, event, submitted, t * MS)
+
+    def test_what_is_owed_is_followed_until_it_is_handed_over_or_its_context_ends(self):
+        r = Recording()
+        self.owed(r, 10, 0, 50, 49, why=2)
+        self.owed(r, 20, 0, 52, 49, why=1)
+        self.owed(r, 30, 1, 50, 50)          # the first alone
+        self.owed(r, 45, 1, 52, 52)
+        self.owed(r, 50, 0, 60, 59, why=1)   # with a context that ends
+        self.owed(r, 60, 2, 60, 59)
+        self.owed(r, 70, 0, 9, 8, why=2, queue=2)
+        told, text = self.told(r)
+        self.assertEqual(told["debts"], dict(accepted=4, covered=2, cancelled=1, for_the_lock=2, for_a_full_queue=2, longest_ns=25 * MS,
+                                             outstanding_at_the_end=1, highest_outstanding=9, oldest_outstanding_ns=830 * MS))
+        self.assertIn("4 markers (2 for the device's lock, 2 for a full queue), handed over 2 times", text)
+        self.assertEqual(told["left_not_handed_over"], 0)
+
+    def test_a_debt_that_was_dropped_stays_owed_whatever_is_said_of_it(self):
+        # (the review's transition: the rescue thread said it was done, its marker was not handed over)
+        r = Recording()
+        self.owed(r, 10, 0, 50, 49, why=2)
+        self.owed(r, 12, 1, 50, 49)
+        told, _ = self.told(r)
+        self.assertEqual((told["debts"]["outstanding_at_the_end"], told["debts"]["oldest_outstanding_ns"], told["left_not_handed_over"]), (1, 890 * MS, 1))
+        # and it is known in a window long after it
+        told, _ = self.told(r, 50_000, 60_000)
+        self.assertEqual((told["debts"]["outstanding_at_the_end"], told["debts"]["highest_outstanding"]), (1, 50))
+
+    def test_slow_looks_are_counted(self):
+        r = Recording()
+        for t in (10, 20):
+            r.put("dxmt", t * MS, "D_DEBTS", 1 | 2, 1, t, 1 | 1 << 32, 5 | 9 << 32, 50, 400 * (t == 20) | 3 << 32 | 2 << 48)
+        told, text = self.told(r)
+        self.assertEqual(told["tries"], dict(debts_accepted=2, debts_handed_over=2, tries_of_looks_that_could_not=10,
+                                             tries_of_the_rescue_thread_that_could_not=18, looks_of_half_a_ms_or_more=6, looks_of_5_ms_or_more=4))
+        self.assertEqual((told["longest"]["oldest_owed_ns"], told["longest"]["highest_owed"]), (400, 50))
+        self.assertIn("of 0.5 ms or more: 6, of them of 5 ms or more: 4", text)
+
+    def test_an_end_that_was_looked_at_and_never_found_is_told_from_one_nobody_asked(self):
+        r = Recording()
+        self.query(r, 10, 7, 1, 50, 5)
+        r.put("dxmt", 14 * MS, "D_QUERY_SEEN", 2, 1, 7 << 32 | 1, 11 * MS, 0, 65, 50)
+        self.query(r, 10, 8, 1, 51, 5)
+        self.query(r, 10, 9, 1, 52, 5)
+        self.seen(r, 20, 9, 1, 0, 0, 0, 52, a=1)
+        r.put("dxmt", 3000 * MS, "D_READY", 0, 1, 99, 0, 1)
+        q = self.told(r, 5, 2900)[0]["one_by_one"]
+        self.assertEqual((q["not_seen"], q["not_seen_though_looked_at"], q["not_seen_of_more_than_a_second"], q["ended_again_without_a_look"]),
+                         ({"not seen by the end of the recording": 2, "ended again before it was seen": 1}, 1, 2, 1))
+        self.assertGreater(q["oldest_not_seen_though_looked_at_ns"], 2000 * MS)
 
     def test_a_query_is_timed_by_its_own_records_alone(self):
         r = Recording()

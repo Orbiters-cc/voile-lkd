@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Checks of bench.py's scoring, arrival and cleanup (fourth verification, finding 11; fifth, findings 11 and 12), without
 a game: python3 -I tests/timeline/test_bench.py"""
-import contextlib, datetime, json, os, shutil, subprocess, sys, tempfile, unittest
+import contextlib, datetime, fcntl, io, json, os, shutil, subprocess, sys, tempfile, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../tools/timeline"))
 import bench  # noqa: E402
+
+bench.N4N0 = "/nonexistent/n4n0-of-the-tests"  # (never this Mac's own: each test that starts anything names one)
 
 
 def npt(n, shown=0, interval=16.0, fence=8.0):
@@ -355,6 +357,7 @@ def write(session, phase, game):
     for name in (session, "session"):
         open(f"{root}/records/{name}.new", "w").write(json.dumps(value))
         os.rename(f"{root}/records/{name}.new", f"{root}/records/{name}.v2.json")
+open(f"{root}/argv", "a").write(json.dumps(sys.argv[1:]) + "\n")
 if sys.argv[1:3] == ["steam", "quit"]:
     open(f"{root}/quit", "a").write(" ".join(sys.argv) + "\n")
     sys.exit(0)
@@ -384,6 +387,14 @@ if "recovered" in how:
     sys.exit(1)
 say(event="running", app_id=438100, pid=4242, session_id="s-1")
 link = sys.argv[-1]
+import fcntl
+slot = open(f"{root}/n4n0/obelisk-start-gate.lock", "r+")
+try:
+    fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    held = "free"
+except BlockingIOError:
+    held = "held"
+open(f"{root}/slot", "w").write(held + " " + slot.read())
 log = open(f"{root}/vrchat/output_log_1.txt", "w")
 log.write(f"Arg: {link}\n[Behaviour] Joining {how['joins']}\n[Behaviour] OnPlayerJoinComplete Some One\n[Behaviour] Initialized PlayerAPI \"Some One\" is local\n")
 log.flush()
@@ -405,10 +416,16 @@ say(event="exited", app_id=438100, session_id="s-1", exit_code=0)
 class WholeRun(unittest.TestCase):
     """measure() against a program that answers as obelisk-cli does; no game, nothing of this Mac's own."""
 
-    def run_with(self, deadline=8, **how):
+    def run_with(self, deadline=8, settings=None, files=None, link=LINK, args=(), **how):
         with tempfile.TemporaryDirectory() as root:
-            for folder in ("records", "vrchat"):
+            for folder in ("records", "vrchat", "n4n0"):
                 os.mkdir(f"{root}/{folder}")
+            if settings is not None:
+                with open(f"{root}/n4n0/settings.json", "w") as f:
+                    f.write(settings)
+            for name, text in (files or {}).items():
+                with open(f"{root}/n4n0/{name}", "w") as f:
+                    f.write(text)
             with open(f"{root}/how.json", "w") as f:
                 json.dump({"joins": HERE} | how, f)
             cli = f"{root}/obelisk-cli"
@@ -416,22 +433,36 @@ class WholeRun(unittest.TestCase):
                 f.write(FAKE_CLI.replace("ROOT,", repr(root) + ",").replace("ROOT +", repr(root) + " +"))
             os.chmod(cli, 0o755)
             patches = {
-                "ENGINE_LOG": f"{root}/engine.log", "VRC_LOGS": f"{root}/vrchat", "RECORDS": f"{root}/records",
+                "N4N0": f"{root}/n4n0", "ENGINE_LOG": f"{root}/engine.log", "VRC_LOGS": f"{root}/vrchat", "RECORDS": f"{root}/records",
                 "START_DEADLINE": deadline, "ARRIVE_DEADLINE": 4, "CLOSE_DEADLINE": 4, "SETTLE_DEADLINE": 3,
                 "settled": lambda lines, at: not how.get("never_calm"),
                 "screen_locked": lambda: False, "frontmost": lambda: 500, "front_name": lambda: "VRChat", "tree": lambda listing, pid: {pid: "bash", 500: "wsd"},
             }
             kept = {name: getattr(bench, name) for name in patches}
-            argv, sys.argv = sys.argv, ["bench.py", "--cli", cli, "--link", LINK, "--warm", "0", "--window", "3", "--windows", "1", "--no-sample", "--out", f"{root}/out.json"]
+            argv, sys.argv = sys.argv, ["bench.py", "--cli", cli, "--link", link, "--warm", "0", "--window", "3", "--windows", "1", "--no-sample", "--out", f"{root}/out.json", *args]
             try:
                 for name, value in patches.items():
                     setattr(bench, name, value)
-                with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet):
+                said = io.StringIO()
+                with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(said):
                     status = bench.main()
+                self.said = said.getvalue()
             finally:
                 sys.argv = argv
                 for name, value in kept.items():
                     setattr(bench, name, value)
+            self.argv, self.slot = [], None
+            if os.path.exists(f"{root}/argv"):
+                with open(f"{root}/argv") as f:
+                    self.argv = [json.loads(line) for line in f]
+            if os.path.exists(f"{root}/n4n0/obelisk-start-gate.lock"):
+                with open(f"{root}/n4n0/obelisk-start-gate.lock") as f:
+                    self.slot = f.read()
+            if os.path.exists(f"{root}/slot"):
+                with open(f"{root}/slot") as f:
+                    self.slot_while_it_ran = f.read()
+            if not os.path.exists(f"{root}/out.json"):
+                return status, None, False
             with open(f"{root}/out.json") as f:
                 self.quits = []
                 if os.path.exists(f"{root}/quit"):
@@ -453,6 +484,77 @@ class WholeRun(unittest.TestCase):
         again = bench.summarize([tuple(x) for x in seen["lines"]], window["from"], window["to"], state, False, [tuple(x) for x in seen["moves"]])
         for key in ("valid", "invalid_because", "guest_present", "wsd_shown", "looks"):
             self.assertEqual(again[key], window[key], key)
+
+    def test_a_start_is_given_its_own_arguments_alone_as_home_s_is(self):
+        for settings in (None, '{"launch": {"profiles": {}}}', '{"launch": {"profiles": {"0": "usr_x"}}}', '{"launch": {}}', "{}"):
+            status, res, _ = self.run_with(settings=settings, args=("--percent", "45"))
+            self.assertEqual(status, 0, (settings, self.said))
+            self.assertEqual(self.argv[0], ["steam", "play", "438100", "--no-saved-arguments", "--render-percent", "45", "--", "-screen-fullscreen", "1",
+                                            "-window-mode", "borderless", LINK], "one profile: the link accompanies the start")
+        self.assertNotIn("usr_", json.dumps(res["command"]), "what is kept of it names no place")
+        self.run_with(args=("--arg=--fps=60",))
+        self.assertEqual(self.argv[0][-2:], ["--fps=60", LINK])
+        self.assertLess(self.argv[0].index("--no-saved-arguments"), self.argv[0].index("--"))
+
+    def test_with_several_profiles_nothing_is_started_and_why_is_said(self):
+        for profiles in ({"0": "usr_secret", "2": "usr_other"}, {"1": "usr_secret"}, {"0": "usr_secret", " 3 ": "x"}):
+            status, res, _ = self.run_with(settings=json.dumps({"launch": {"profiles": profiles}}))
+            self.assertEqual((status, res, self.argv), (6, None, []), profiles)
+            self.assertIn("several VRChat profiles", self.said)
+            for private in ("usr_", WORLD, "25038"):
+                self.assertNotIn(private, self.said, "neither an account nor the place is told")
+        for unknown in ("{", "[]", '{"launch": 3}', '{"launch": {"profiles": [1]}}'):
+            status, res, _ = self.run_with(settings=unknown)
+            self.assertEqual((status, res, self.argv), (6, None, []), unknown)
+            self.assertIn("is not known", self.said)
+
+    def test_no_argument_names_a_profile_or_another_place(self):
+        for arg in ("--profile=1", "--profile", LINK):
+            status, res, _ = self.run_with(args=(f"--arg={arg}",))
+            self.assertEqual((status, res, self.argv), (6, None, []), arg)
+            self.assertNotIn("usr_", self.said)
+
+    def test_the_link_is_one_instance_s_in_vrchat_s_own_grammar(self):
+        good = (LINK, LINK.replace("~", "%7E").replace("(", "%28"), LINK + "&shortName=ab12", f"vrchat://launch?id={HERE}~canRequestInvite~nonce(0a1b-2c)")
+        for link in good:
+            bench.check_link(link)
+        for link in (LINK + " --profile=1", LINK + '"', LINK + "&id=" + HERE, LINK + "&x=1", LINK.replace("launch", "evil"), LINK + "%20--x", "vrchat://launch?ref=x",
+                     f"vrchat://launch?id={WORLD}:", f"vrchat://launch?id=wrld_1:{HERE}", LINK + "~re gion(x)", LINK + "~region()", "https://x/?id=" + HERE):
+            with self.assertRaises(bench.Refused, msg=link) as refused:
+                bench.check_link(link)
+            self.assertNotIn("usr_", str(refused.exception))
+
+    def test_the_slot_for_a_start_is_held_while_its_game_is_there_and_left_empty(self):
+        status, _, _ = self.run_with()
+        self.assertEqual((status, self.slot), (0, ""))
+        held, note = self.slot_while_it_ran.split(" ", 1)
+        note = json.loads(note)
+        self.assertEqual((held, note["session"], note["program"], note["until"]), ("held", "s-1", None, None))
+        self.assertEqual(note["boot"], bench.boot_clock()[0])
+        # A start whose session may still run stays said: N4N0 waits for it as after one that ended early.
+        status, _, _ = self.run_with(stays=True)
+        self.assertEqual((status, json.loads(self.slot)["session"]), (5, "s-1"))
+
+    def test_nothing_is_started_beside_n4n0_s_start_nor_in_its_wait(self):
+        boot, at = bench.boot_clock()
+        gate = lambda **k: {"obelisk-start-gate.json": json.dumps(dict(version=2, boot=boot, until=None, seen={}) | k)}
+        for files, why in ((gate(until=at + 50), "ended early"), ({"obelisk-start-gate.json": "{ half"}, "cannot be read"), ({"obelisk-start-gate.json": "[]"}, "cannot be read"),
+                           ({"obelisk-start-gate.lock": '{"boot": "x"}'}, "not settled")):
+            status, res, _ = self.run_with(files=files)
+            self.assertEqual((status, res, self.argv), (6, None, []), why)
+            self.assertIn(why, self.said)
+        for files in (gate(), gate(until=at - 1), gate(boot="00000000-0000-0000-0000-000000000000", until=at + 50)):
+            self.assertEqual(self.run_with(files=files)[0], 0)
+        with tempfile.TemporaryDirectory() as root:
+            kept, bench.N4N0 = bench.N4N0, root
+            try:
+                with bench.Slot():
+                    with self.assertRaisesRegex(bench.Refused, "beside"):
+                        bench.Slot().__enter__()
+                with bench.Slot():
+                    pass  # (let go of)
+            finally:
+                bench.N4N0 = kept
 
     def test_somebody_else_s_session_is_never_asked_to_quit(self):
         """Sixth verification, finding 3 (the verifier's): a concurrent session's fresh pointer and record were taken for this

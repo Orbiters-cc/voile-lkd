@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Reads a host timeline (wsd/otl.h, format 2) and says where each frame's time went, and how much of it is known.
 
-Usage: otl.py <session folder> [--from NS] [--to NS] [--modes run.log] [--plane ID] [--frames N] [--passes] [--cadence]
+Usage: otl.py <session folder> [--from NS] [--to NS] [--modes run.log] [--plane ID|game] [--frames N] [--passes] [--cadence]
               [--csv out.csv] [--json out.json]
+
+--plane: what is told is that plane's alone, and the render server's queues its frames were made on (`game`: the one most of the
+frames joined are of; which it was is told). A frame of those queues whose presentation is not told counts as one that is not whole.
 
 The session folder holds otl-npt-*.bin and otl-dxmt-*.bin (one of each per render server worker), otl-vtest-*.bin and
 otl-wsd-*.bin. A frame is one presentation signal of a ring: a CopyResource into an exported image, then a Signal.
@@ -18,14 +21,14 @@ What is joined, and by what (each record is used once; nothing is joined by bein
 An id is never reused (a pointer or a handle is). What is missing or ambiguous is counted and the frame is not "whole": no boundary
 is ever filled in from another. All times are host uptime nanoseconds. Standard library only.
 """
-import argparse, bisect, collections, csv, glob, json, os, re, struct, sys
+import argparse, bisect, collections, contextlib, csv, glob, io, json, math, os, re, struct, sys
 
 K = dict(THREAD=1, SUMMARY=2, HIST=3, LOST=4, END=5, N_EXPORT=16, N_SIGNAL=18, N_COUNTS=19, N_FENCE=20, N_PAIR=21, N_RETIRE=22,
          N_FLUSH=23, V_RETIRE=24, N_GONE=26, N_FRAME=27, N_EVENT=28, N_ARM=29, D_READY=32, D_ENCODE=33, D_DONE=34, D_SIGNAL=35,
          D_SEOC=36, D_NOTIFY=37, D_PIPELINE=38, D_INIT=39, D_INIT_DONE=40, D_PASS=41, D_PASS_DS=42, D_BLIT=43, D_COMPUTE=44,
          D_OPS=45, D_PASS_TIME=46, D_QUEUE=47, D_PASS_SKIP=48, D_CLOCK=49, D_COMMIT=50,
          D_PASS_ENDED=51, D_PASS_ID=52, D_STALL=53, D_QUERIES=54, D_QUERY=55,
-         D_QUERY_SEEN=56, D_LOOKS=57, W_ATTACH=64, W_RX=65, W_TICK=66, W_DRAW=67, W_GPU=68,
+         D_QUERY_SEEN=56, D_LOOKS=57, D_DEBTS=58, D_OWED=59, W_ATTACH=64, W_RX=65, W_TICK=66, W_DRAW=67, W_GPU=68,
          W_SHOWN=69, W_RELEASE=70, W_DETACH=71)
 REC = struct.Struct("<QHHI6Q")
 Rec = collections.namedtuple("Rec", "t kind thr a v")
@@ -46,7 +49,7 @@ STOP = {0: "the command buffer's end", 1: "a render pass that needs it", 2: "a d
         4: "a clear that needs it", 5: "a resolve that needs it", 6: "an event signalled or waited for", 7: "a timestamp", 8: "another encoder"}
 COMPLETED, NONE, SERIAL = 4, 2**64 - 1, (1 << 48) - 1  # MTLCommandBufferStatusCompleted
 # Kept whatever the time asked for: what names things that live longer than it.
-ALWAYS = {K[k] for k in ("THREAD", "SUMMARY", "HIST", "LOST", "END", "N_EXPORT", "N_GONE", "N_EVENT", "D_QUEUE", "D_CLOCK",
+ALWAYS = {K[k] for k in ("THREAD", "SUMMARY", "HIST", "LOST", "END", "N_EXPORT", "N_GONE", "N_EVENT", "D_QUEUE", "D_CLOCK", "D_OWED",
                          "W_ATTACH", "W_DETACH")}
 FORMAT = {10: ("R8", 1), 13: ("R8ui", 1), 25: ("R16F", 2), 30: ("RG8", 2), 53: ("R32ui", 4), 55: ("R32F", 4), 65: ("RG16F", 4),
           70: ("RGBA8", 4), 71: ("RGBA8s", 4), 80: ("BGRA8", 4), 81: ("BGRA8s", 4), 90: ("RGB10A2", 4), 92: ("RG11B10F", 4),
@@ -644,31 +647,82 @@ def splits(s, frames):
     return out
 
 
-def queries(s, lo, hi):
-    """What the looks at event and disjoint queries did (D_STALL, D_QUERIES) and every command buffer by what committed it, of all
-    devices: per device by chunk, so that it needs no frames (a program that presents nothing has none)."""
-    out = dict(stall_flushes=0, not_handed_over=0, handed_over=0, handed_over_and_committed=0, left_not_handed_over=0, most_rescues_of_a_chunk=0,
-               once=set(), locked=set(), commits=collections.Counter(), by_the_rescue_thread=0)
-    ended, per, told, seconds = collections.Counter(), collections.Counter(), collections.Counter(), collections.defaultdict(collections.Counter)
-    signals, longest = 0, dict(look_ns=0, rescue_ns=0)
+def mechanism(s, lo, hi, queues=None):
+    """What the looks flushed, judged by the events and the watermarks of each record, not by what the record says of itself: per commit by a
+    look or the rescue thread, its target and the last event handed over before and after it. And the debts (D_OWED): the highest event that
+    was owed to the rescue thread, until a record says it was handed over, or that its context ended."""
+    n = collections.Counter(dict.fromkeys(("stall_flushes", "not_handed_over", "handed_over", "handed_over_and_committed", "left_not_handed_over",
+                                           "by_the_rescue_thread", "said_otherwise_than_its_watermarks", "rescues_whose_chunk_was_not_handed_over",
+                                           "rescues_of_a_chunk_something_else_committed", "rescues_of_another_chunk_than_its_end_s"), 0))
+    once, most = set(), 0
+    debts = collections.Counter(accepted=0, covered=0, cancelled=0, for_the_lock=0, for_a_full_queue=0)
+    ages, outstanding = [], []
     for d in s.dxmt.values():
         chunks = collections.Counter()
+        ready = {(r.v[0], r.v[1]) for r in d.get("D_READY")}
+        commits = {(r.v[0], r.v[1]): r.a & 0xff for r in d.get("D_COMMIT")}
+        ends = {(r.v[0], r.v[2]): r.v[3] for r in d.get("D_QUERY") if not r.a & 2}  # (queue, event) -> the chunk its marker is in
         for r in d.get("D_STALL"):
-            if lo <= r.t <= hi:
-                out["stall_flushes"] += 1
-                out["once"].add(bool(r.a & 8))
-                out["handed_over" if r.a & 1 else "not_handed_over"] += 1
-                out["handed_over_and_committed"] += r.a & 3 == 3
-                out["left_not_handed_over"] += bool(r.a & 4)
-                out["by_the_rescue_thread"] += bool(r.a & 16)
-                if not r.a & 1:
-                    chunks[(r.v[0], r.v[1])] += 1
-        out["most_rescues_of_a_chunk"] = max([out["most_rescues_of_a_chunk"], *chunks.values()])
+            if not lo <= r.t <= hi or (queues is not None and (d.pid, r.v[0]) not in queues):
+                continue
+            queue, chunk, event, before, after = r.v[:5]
+            covered, left = event <= before, event > after
+            n["stall_flushes"] += 1
+            once.add(bool(r.a & 8))
+            n["handed_over" if r.a & 1 or covered else "not_handed_over"] += 1
+            n["handed_over_and_committed"] += bool(r.a & 2 and (r.a & 1 or covered))
+            n["left_not_handed_over"] += bool(r.a & 4 or (r.a & 2 and left))
+            n["said_otherwise_than_its_watermarks"] += bool(r.a & 2 and (bool(r.a & 1) != covered or bool(r.a & 4) != left))
+            n["by_the_rescue_thread"] += bool(r.a & 16)
+            if not (r.a & 1 or covered):
+                chunks[(queue, chunk)] += 1
+            if r.a & 2 and not (r.a & 1 or covered):  # a rescue: its chunk was handed to the encoder, by it, with the marker in it
+                n["rescues_whose_chunk_was_not_handed_over"] += (queue, chunk) not in ready
+                n["rescues_of_a_chunk_something_else_committed"] += commits.get((queue, chunk), 17) not in (16, 17)
+                n["rescues_of_another_chunk_than_its_end_s"] += ends.get((queue, event), chunk) != chunk
+        most = max([most, *chunks.values()])
+        owed = collections.defaultdict(list)  # queue -> [(event, when)], accepted, and not yet told handed over
+        for r in d.get("D_OWED"):
+            queue, event, submitted, _ = r.v[:4]
+            if r.t > hi or (queues is not None and (d.pid, queue) not in queues):
+                continue
+            what, inside = r.a & 0xff, r.t >= lo
+            if what == 0:
+                owed[queue].append((event, r.t))
+                if inside:
+                    debts["accepted"] += 1
+                    debts["for_the_lock" if r.a >> 8 == 1 else "for_a_full_queue"] += 1
+                continue
+            gone = [x for x in owed[queue] if x[0] <= (event if what == 2 else submitted)]
+            owed[queue] = [x for x in owed[queue] if x not in gone]
+            if inside:
+                debts["covered" if what == 1 else "cancelled"] += 1
+                ages += [r.t - t for _, t in gone]
+                n["left_not_handed_over"] += what == 1 and event > submitted
+        outstanding += [x for l in owed.values() for x in l]
+    end = hi if hi < 2**62 else max([d.last for d in s.dxmt.values()] or [0])
+    out = dict(n, most_rescues_of_a_chunk=most, once=once)
+    out["debts"] = dict(debts, longest_ns=max(ages) if ages else None, outstanding_at_the_end=len(outstanding),
+                        highest_outstanding=max((e for e, _ in outstanding), default=None),
+                        oldest_outstanding_ns=max((end - t for _, t in outstanding), default=None))
+    return out
+
+
+def queries(s, lo, hi, queues=None):
+    """What the looks at event and disjoint queries did (D_STALL, D_QUERIES) and every command buffer by what committed it, of all
+    devices (or of `queues` alone, (pid, queue)): per device by chunk, so that it needs no frames (a program that presents nothing has none)."""
+    out = mechanism(s, lo, hi, queues)
+    out.update(locked=set(), commits=collections.Counter())
+    ended, per, told, seconds = collections.Counter(), collections.Counter(), collections.Counter(), collections.defaultdict(collections.Counter)
+    tries = collections.Counter()
+    signals, longest = 0, dict(look_ns=0, rescue_ns=0)
+    for d in s.dxmt.values():
+        mine = lambda r: lo <= r.t <= hi and (queues is None or (d.pid, r.v[0]) in queues)
         for r in d.get("D_COMMIT"):
-            if lo <= r.t <= hi:
+            if mine(r):
                 out["commits"][commit_text(r)] += 1
         for r in d.get("D_QUERIES"):
-            if lo <= r.t <= hi:
+            if mine(r):
                 signals += not r.a & 4
                 out["once"].add(bool(r.a & 1))
                 out["locked"].add(bool(r.a & 2))
@@ -679,7 +733,7 @@ def queries(s, lo, hi):
                                 ("of those, nothing to rescue and nothing done", r.v[5] & 0xffffffff), ("looks that found it there", r.v[5] >> 32)):
                     per[name] += v
         for r in d.get("D_LOOKS"):
-            if lo <= r.t <= hi:
+            if mine(r):
                 one = dict(looks=r.v[2] & 0xffffffff, s_false=r.v[2] >> 32, s_ok=r.v[3] & 0xffffffff, rescues=r.v[3] >> 32,
                            not_made_for_the_lock=r.v[4] & 0xffff, not_made_for_a_full_queue=r.v[4] >> 16 & 0xffff,
                            uploads_left_to_the_rescue_thread=r.v[4] >> 32 & 0xffff, rescues_by_the_rescue_thread=r.v[4] >> 48)
@@ -687,13 +741,25 @@ def queries(s, lo, hi):
                 seconds[r.t // 10**9].update(one)
                 longest["look_ns"] = max(longest["look_ns"], r.v[5] & 0xffffffff)
                 longest["rescue_ns"] = max(longest["rescue_ns"], r.v[5] >> 32)
+        for r in d.get("D_DEBTS"):
+            if mine(r):
+                one = dict(debts_accepted=r.v[2] & 0xffffffff, debts_handed_over=r.v[2] >> 32, tries_of_looks_that_could_not=r.v[3] & 0xffffffff,
+                           tries_of_the_rescue_thread_that_could_not=r.v[3] >> 32, looks_of_half_a_ms_or_more=r.v[5] >> 32 & 0xffff,
+                           looks_of_5_ms_or_more=r.v[5] >> 48)
+                tries.update(one)
+                longest["oldest_owed_ns"] = max(longest.get("oldest_owed_ns", 0), r.v[5] & 0xffffffff)
+                longest["highest_owed"] = max(longest.get("highest_owed", 0), r.v[4])
     out.update(once=sorted(out["once"]), locked=sorted(out["locked"]), signals=signals, commits=dict(out["commits"].most_common()),
                ended=dict(ended), looks=dict(per), window=dict(told), longest=longest, per_second=[dict(v) for _, v in sorted(seconds.items())],
-               one_by_one=query_times(s, lo, hi))
+               tries=dict(tries), one_by_one=query_times(s, lo, hi, queues))
     print(f"  queries: the switch {'/'.join('once' if o else 'off' for o in out['once']) or 'not told'}; the device's lock "
           f"{'/'.join('on' if o else 'off' for o in out['locked']) or 'not told'}. {out['stall_flushes']} flushes by a look after the first 64: "
           f"{out['not_handed_over']} with the marker not handed over (at most {out['most_rescues_of_a_chunk']} for a chunk; {out['left_not_handed_over']} "
           f"left so), {out['handed_over']} with it handed over ({out['handed_over_and_committed']} of them committed a command buffer for nothing)")
+    wrong = {k: out[k] for k in ("said_otherwise_than_its_watermarks", "rescues_whose_chunk_was_not_handed_over",
+                                 "rescues_of_a_chunk_something_else_committed", "rescues_of_another_chunk_than_its_end_s") if out[k]}
+    if wrong:
+        print("    NOT AS IT IS MEANT TO BE: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in wrong.items()))
     if signals:
         print("    a frame: ended " + ", ".join(f"{v / signals:.2f} {k}" for k, v in ended.items()) + "; " +
               ", ".join(f"{v / signals:.1f} {k}" for k, v in per.items()))
@@ -704,24 +770,32 @@ def queries(s, lo, hi):
               f", put off {told['not_made_for_the_lock']} times for the device's lock, {told['not_made_for_a_full_queue']} for a full queue, "
               f"{told['uploads_left_to_the_rescue_thread']} with their uploads left to the rescue thread; the longest look with DONOTFLUSH {longest['look_ns'] / 1e6:.3f} ms, "
               f"the longest rescue on a looking thread {longest['rescue_ns'] / 1e6:.3f} ms")
+    if tries or any(out["debts"].values()):
+        o = out["debts"]
+        print(f"    owed to the rescue thread: {o['accepted']} markers ({o['for_the_lock']} for the device's lock, {o['for_a_full_queue']} for a full queue), handed over "
+              f"{o['covered']} times" + (f", the longest after {o['longest_ns'] / 1e6:.3f} ms" if o["longest_ns"] is not None else "") + f", {o['cancelled']} with a context that ended; at "
+              f"the end {o['outstanding_at_the_end']} owed" + (f", the oldest for {o['oldest_outstanding_ns'] / 1e6:.3f} ms" if o["outstanding_at_the_end"] else "") +
+              f". Tries that could not: {tries['tries_of_looks_that_could_not']} of looks, {tries['tries_of_the_rescue_thread_that_could_not']} of the rescue thread. "
+              f"Looks with DONOTFLUSH of 0.5 ms or more: {tries['looks_of_half_a_ms_or_more']}, of them of 5 ms or more: {tries['looks_of_5_ms_or_more']}")
     query_times_report(out["one_by_one"])
     print("    command buffers by what committed them: " + (", ".join(f"{c} {w}" for w, c in out["commits"].items()) or "none"))
     return out
 
 
-def query_times(s, lo, hi):
+def query_times(s, lo, hi, queues=None):
     """Each recorded End of an event or disjoint query (D_QUERY, a bounded sample) with its own looks (D_QUERY_SEEN, the same query and
     the same End: one record each) and its chunk's hand-over, rescue and GPU end (by queue and chunk). That it was signalled is known
     from the looks alone: after the last that did not find it, before the end of the first that did. A clean End's marker is an
     earlier one's: its chunk is not known and nothing is said of it."""
     rows, lost = [], collections.Counter()
     for d in s.dxmt.values():
-        seen = Table(d.get("D_QUERY_SEEN"), lambda r: (r.v[0], r.v[1]))
+        seen = Table([r for r in d.get("D_QUERY_SEEN") if not r.a & 2], lambda r: (r.v[0], r.v[1]))
+        stalled = {(r.v[0], r.v[1]) for r in d.get("D_QUERY_SEEN") if r.a & 2}  # looked at 65 times, and not there
         ready = {(r.v[0], r.v[1]): r.t for r in d.get("D_READY")}
         done = {(r.v[5], r.v[0]): r for r in d.get("D_DONE")}
         rescued = {(r.v[0], r.v[1]): r for r in d.get("D_STALL") if r.a & 3 == 2}  # a commit, its event not handed over before
         for r in d.get("D_QUERY"):
-            if not lo <= r.t <= hi:
+            if not lo <= r.t <= hi or (queues is not None and (d.pid, r.v[0]) not in queues):
                 continue
             row = dict(issue=r.t, kind="disjoint" if r.a & 1 else "event", clean=bool(r.a & 2), in_list=bool(r.a & 4), queue=r.v[0], query=r.v[1] >> 32,
                        end=r.v[1] & 0xffffffff, event=r.v[2], chunk=r.v[3])
@@ -736,10 +810,15 @@ def query_times(s, lo, hi):
             q, why = seen.take((r.v[0], r.v[1]))
             if q is None:
                 lost["its looks: " + why if why != "missing" else "not seen by the end of the recording"] += 1
+                if why == "missing":
+                    row["never"] = d.last - r.t
+                    row["before_the_end"] = (hi if hi < 2**62 else d.last) - r.t
+                    row["stalled"] = (r.v[0], r.v[1]) in stalled
                 continue
             row.update(first_look=q.v[2] or None, last_not=q.v[3] or None, looks=q.v[4])
             if q.a & 1:
                 lost["ended again before it was seen"] += 1
+                row["never_looked_at"] = not q.v[4]
             else:
                 row["seen"] = q.t
 
@@ -750,6 +829,13 @@ def query_times(s, lo, hi):
     own = [r for r in rows if not r["clean"]]
     out = dict(recorded=len(rows), clean=len(rows) - len(own), in_lists=sum(r["in_list"] for r in rows), seen=sum("seen" in r for r in rows), not_seen=dict(lost),
                rescued=sum("rescue" in r for r in own),
+               ended_again_without_a_look=sum(bool(r.get("never_looked_at")) for r in rows),
+               # (an End of the window's last second may still be seen after it)
+               not_seen_of_more_than_a_second=sum(r.get("before_the_end", 0) > 10**9 for r in rows),
+               not_seen_though_looked_at=sum(bool(r.get("stalled")) for r in rows),
+               not_seen_though_looked_at_of_more_than_a_second=sum(bool(r.get("stalled")) and r["before_the_end"] > 10**9 for r in rows),
+               oldest_not_seen_though_looked_at_ns=max((r["never"] for r in rows if r.get("stalled")), default=None),
+               oldest_not_seen_ns=max((r["never"] for r in rows if "never" in r), default=None),
                ns=dict(issue_to_first_look=since("first_look", rows), issue_to_hand_over=since("handed_over", own), issue_to_rescue=since("rescue", own),
                        issue_to_gpu_end=since("gpu_end", own), issue_to_last_look_without_it=since("last_not", rows), issue_to_seen=since("seen", rows),
                        gpu_end_to_seen=spread([r["seen"] - r["gpu_end"] for r in own if "seen" in r and "gpu_end" in r])),
@@ -761,7 +847,9 @@ def query_times_report(q):
     if not q["recorded"]:
         return
     print(f"    one by one (a sample): {q['recorded']} Ends of event and disjoint queries, {q['clean']} with nothing new before them, {q['in_lists']} in command lists; "
-          f"{q['seen']} seen, {q['rescued']} rescued" + "".join(f"; {n} {w}" for w, n in q["not_seen"].items()))
+          f"{q['seen']} seen, {q['rescued']} rescued" + "".join(f"; {n} {w}" for w, n in q["not_seen"].items()) +
+          (f" ({q['ended_again_without_a_look']} of those ended again without a look)" if q["ended_again_without_a_look"] else "") +
+          (f"; {q['not_seen_of_more_than_a_second']} of those not seen were ended more than a second before the end, {q['not_seen_though_looked_at']} had been looked at 65 times" if q["oldest_not_seen_ns"] is not None else ""))
     for name, v in q["ns"].items():
         if v:
             print(f"      {name.replace('_', ' '):32s} p50 {v['p50'] / 1e6:8.3f}  p95 {v['p95'] / 1e6:8.3f}  p99 {v['p99'] / 1e6:8.3f}  most {v['most'] / 1e6:8.3f} ms  ({v['n']})")
@@ -798,6 +886,7 @@ def counted(s, frames):
     why = collections.Counter(w for f in frames for w in f["why"][:1])
     order = [f["order"] for f in frames if "order" in f]
     return dict(frames=len(frames), whole=sum(1 for f in frames if "parts" in f), not_whole=dict(why.most_common()),
+                whole_share=sum(1 for f in frames if "parts" in f) / len(frames) if frames else None,
                 presented=sum(1 for f in frames if "client" in f), replaced=sum(1 for f in frames if f.get("replaced")),
                 shown=sum(1 for f in frames if f.get("shown")), shown_at_zero=sum(1 for f in frames if f.get("shown") == 0),
                 out_of_order_ms=[round(min(order) / 1e6, 3), round(max(order) / 1e6, 3)] if order else None)
@@ -901,56 +990,148 @@ def passes_report(s, frames):
         print(f"    all stages together (their union: stages overlap and are never added up): p50 {pct(busy, 50) / 1e6:.3f} ms")
 
 
+def game_plane(s, lo, hi):
+    """The plane most of the frames joined in [lo, hi] are of, and which share of them; None when there is none."""
+    planes = collections.Counter(f["plane"] for f in s.frames if "plane" in f and lo <= f["signal_end"] <= hi)
+    if not planes:
+        return None, 0.0
+    plane, n = planes.most_common(1)[0]
+    return plane, n / sum(planes.values())
+
+
+def queues_of(s, plane, lo, hi):
+    """The render server's queues ((pid, queue)) the frames of a plane were made on."""
+    return {(f["npt"].pid, f["queue"]) for f in s.frames if f.get("plane") == plane and "queue" in f and lo <= f["signal_end"] <= hi}
+
+
+def frames_of(s, plane, lo, hi):
+    """The frames of a plane, and those of its queues whose presentation is not told (which are not whole)."""
+    inside = [f for f in s.frames if lo <= f["signal_end"] <= hi]
+    if plane is None:
+        return inside
+    queues = queues_of(s, plane, lo, hi)
+    return [f for f in inside if f.get("plane", plane if "queue" in f and (f["npt"].pid, f["queue"]) in queues else None) == plane]
+
+
+ROLES = ("wsd", "vtest", "npt", "dxmt")
+
+
+def trace_complete(s, lo, hi, queues=None):
+    """Why [lo, hi] is not recorded whole: a role, or a time of it, that is not there, or records of it that may be missing. Nothing: it is."""
+    why = []
+    for role in ROLES:
+        of = [f for f in s.files if f.role == role]
+        mine = [f for f in of if queues is None or role not in ("npt", "dxmt") or any(f.pid == pid for pid, _ in queues)]
+        if not mine:
+            why.append(f"{role}: not recorded")
+        elif not any(f.uptime <= lo and (f.last >= hi or (f.end and f.end["t"] >= hi)) for f in mine):
+            why.append(f"{role}: not recorded from its start to its end")
+    for f in s.files:
+        lost = f.lost_in(lo, hi)
+        if lost:
+            why.append(f"{f.role} {f.pid}: {lost}")
+        if f.cut:
+            why.append(f"{f.role} {f.pid}: {f.cut} bytes cut")
+        if f.end and f.end["refused"]:
+            why.append(f"{f.role} {f.pid}: {f.end['refused']} recorders refused")
+    return why
+
+
+def production(s, plane, lo, hi):
+    """What the guest sent of a plane: its stamps, and the intervals between two of them that end in [lo, hi). Of wsd's records alone:
+    whatever of it the render server's could be joined to."""
+    stamps = sorted(r.v[2] for w in s.wsd for r in w.get("W_RX") if r.v[5] & 0xffffffff == plane)
+    iv = [b - a for a, b in zip(stamps, stamps[1:]) if lo <= b < hi]
+    n = sum(lo <= t < hi for t in stamps)
+    return dict(frames=n, per_s=n / ((hi - lo) / 1e9), interval_ms=dict(mean=mean(iv) / 1e6, **{f"p{q}": pct(iv, q) / 1e6 for q in (50, 95, 99)},
+                                                                      most=max(iv) / 1e6) if iv else None)
+
+
+def work(s, frames):
+    """Per frame, of the whole ones: what the ring and DXMT did for it, and the fence wait."""
+    good = [f for f in frames if "parts" in f]
+    if not good:
+        return None
+    gpu = [f["gpu_busy"] for f in good if "gpu_busy" in f]
+    return dict(frames=len(good), command_buffers=mean([len(f["chunks"]) for f in good if "chunks" in f]), **{k: mean([f.get(k, 0) for f in good]) for k in
+                ("draws", "commands", "maps", "updates", "targets", "flushes")}, fence_wait_ms=mean([f["wait"] for f in good]) / 1e6,
+                gpu_busy_ms=mean(gpu) / 1e6 if gpu else None)
+
+
 def cadence(s, lo, hi, plane=None):
-    """wsd alone, per plane: what its display link gave and what became of the frames it received."""
+    """wsd alone, per plane: what its display link gave and what became of the frames it received. A frame is shown in the window its
+    presentation's own time is in (half open), whenever its callback ran; the rate is over the whole of it, and so are the gaps."""
     out = []
     for w in s.wsd:
-        rx_all = [r for r in w.get("W_RX") if lo <= r.t <= hi]
-        for p in sorted({r.v[5] & 0xffffffff for r in rx_all}):
+        every = w.get("W_RX")
+        a, b = lo, hi
+        if b >= 2**62:  # (no window asked for: what there is, which is all the length that can be told)
+            at = [r.t for kind in ("W_RX", "W_TICK", "W_SHOWN") for r in w.get(kind)]
+            a, b = max(lo, min(at, default=0)), max(at, default=0) + 1
+        length = (b - a) / 1e9
+        inside = lambda t: a <= t < b
+        for p in sorted({r.v[5] & 0xffffffff for r in every if inside(r.t)} | ({plane} if plane is not None else set())):
             if plane is not None and p != plane:
                 continue
-            rx = [r for r in rx_all if r.v[5] & 0xffffffff == p]
-            window, ticks = rx[0].a & 0x3fffffff, [r for r in w.get("W_TICK") if lo <= r.t <= hi and r.v[3] == p]
-            draws = [r for r in w.get("W_DRAW") if lo <= r.t <= hi and r.v[5] == p]
+            sent_all = [r for r in every if r.v[5] & 0xffffffff == p]
+            if not sent_all:
+                continue
+            rx = [r for r in sent_all if inside(r.t)]
+            window, ticks = sent_all[0].a & 0x3fffffff, [r for r in w.get("W_TICK") if inside(r.t) and r.v[3] == p]
+            draws = [r for r in w.get("W_DRAW") if inside(r.t) and r.v[5] == p]
             new = [r for r in draws if not r.a >> 31 and r.v[4] != NONE]
-            callbacks = [r for r in w.get("W_SHOWN") if lo <= r.t <= hi and r.v[3] == p]
-            shown = {r.v[0]: r.v[1] for r in callbacks if r.v[1] and not r.a >> 31}
-            wg = [r.v[2] - r.v[1] for r in w.get("W_GPU") if lo <= r.t <= hi and r.v[5] == p and r.v[2] > r.v[1]]
+            of_plane = [r for r in w.get("W_SHOWN") if r.v[3] == p]
+            callbacks = [r for r in of_plane if inside(r.t)]
+            first = {}  # serial -> its first presentation
+            for r in of_plane:
+                if r.v[1] and not r.a >> 31:
+                    first[r.v[0]] = min(r.v[1], first.get(r.v[0], r.v[1]))
+            shown = {k: t for k, t in first.items() if inside(t)}
+            wg = [r.v[2] - r.v[1] for r in w.get("W_GPU") if inside(r.t) and r.v[5] == p and r.v[2] > r.v[1]]
             waits = [r.v[3] - r.v[2] for r in new]
-            sent = {r.v[1]: r.v[2] for r in rx}
+            sent = {r.v[1]: r.v[2] for r in sent_all}
             client = [t - sent[k] for k, t in shown.items() if k in sent and t > sent[k]]
-            lat = [shown[r.v[1]] - r.v[2] for r in new if r.v[1] in shown]
+            lat = [first[r.v[1]] - r.v[2] for r in new if r.v[1] in first]
             links = [r.v[2] for r in ticks if r.v[2]]
             refresh = pct(links, 50) if links else 1e9 / 60
             times = sorted(shown.values())
-            gaps = [b - a for a, b in zip(times, times[1:])]
-            rate = lambda l: (len(l) - 1) / ((l[-1] - l[0]) / 1e9) if len(l) > 1 and l[-1] > l[0] else float("nan")
+            gaps = [y - x for x, y in zip(times, times[1:])]
+            # the stretches of the window in which no new frame came, its two ends included
+            stretches = [y - x for x, y in zip([a] + times, times + [b])]
+            rate = lambda l: (len(l) - 1) / ((l[-1] - l[0]) / 1e9) if len(l) > 1 and l[-1] > l[0] else None
             states = collections.Counter(r.a >> 16 for r in ticks)
-            d = dict(plane=p, window=window, region=rx[0].a >> 30 & 1, received=len(rx), received_per_s=rate([r.t for r in rx]),
+            some = lambda l, *qs, by=1e6: {f"p{q}": pct(l, q) / by if l else None for q in qs}
+            d = dict(plane=p, window=window, region=sent_all[0].a >> 30 & 1, seconds=length, received=len(rx), received_per_s=len(rx) / length,
                      replaced=sum(r.a >> 31 for r in rx), drawn=len(new), redrawn=sum(1 for r in draws if r.a >> 31),
-                     no_drawable=sum(1 for r in draws if r.v[4] == NONE), shown=len(times), shown_per_s=rate(times),
+                     no_drawable=sum(1 for r in draws if r.v[4] == NONE), shown=len(times), shown_per_s=len(times) / length,
+                     shown_per_s_from_the_first_to_the_last=rate(times),
                      zero_time=sum(1 for r in callbacks if not r.v[1]), redisplays_shown=sum(1 for r in callbacks if r.v[1] and r.a >> 31),
                      refresh_ms=refresh / 1e6, ticks=len(ticks), ticks_per_s=rate([r.t for r in ticks]),
                      tick_states=dict(empty=states[0], frame=states[1], hidden=states[2], again=states[3]),
-                     shown_interval_ms={f"p{q}": pct(gaps, q) / 1e6 for q in (50, 95, 99)},
+                     shown_interval_ms=some(gaps, 50, 95, 99),
+                     leading_gap_ms=stretches[0] / 1e6, trailing_gap_ms=stretches[-1] / 1e6, largest_gap_ms=max(stretches) / 1e6,
+                     holds_of_3_refreshes_or_more=sum(x >= 2.5 * refresh for x in stretches),
                      shown_intervals_in_refreshes=dict(sorted(collections.Counter(round(g / refresh) for g in gaps).items())),
-                     next_drawable_ms={f"p{q}": pct(waits, q) / 1e6 for q in (50, 90, 99)}, gpu_ms={f"p{q}": pct(wg, q) / 1e6 for q in (50, 99)},
+                     next_drawable_ms=some(waits, 50, 90, 99), gpu_ms=some(wg, 50, 99),
                      drawn_on_arrival=sum(1 for r in new if r.a >> 29 & 1), drawn_scaled=sum(1 for r in new if r.a >> 28 & 1),
-                     client_to_shown_ms={f"p{q}": pct(client, q) / 1e6 for q in (50, 95, 99)},
-                     tick_to_shown_ms={f"p{q}": pct(lat, q) / 1e6 for q in (50, 90)})
+                     client_to_shown_ms=some(client, 50, 95, 99),
+                     tick_to_shown_ms=some(lat, 50, 90))
             out.append(d)
+            ms_ = lambda group, q: "-" if d[group][f"p{q}"] is None else f"{d[group][f'p{q}']:.3f}"
             print(f"  plane {p} (window {window}{', overlay' if d['region'] else ''}): received {d['received']} ({d['received_per_s']:.2f}/s), "
                   f"replaced unshown {d['replaced']}, drawn {d['drawn']}, no drawable {d['no_drawable']}, SHOWN {d['shown']} "
-                  f"({d['shown_per_s']:.2f}/s), called back without a time {d['zero_time']}; again: drawn {d['redrawn']}, shown {d['redisplays_shown']}")
-            print(f"    display link: {d['ticks']} ticks ({d['ticks_per_s']:.2f}/s, refresh {d['refresh_ms']:.3f} ms), with a frame "
+                  f"({d['shown_per_s']:.2f}/s over {length:.3f} s), called back without a time {d['zero_time']}; again: drawn {d['redrawn']}, shown {d['redisplays_shown']}")
+            print(f"    display link: {d['ticks']} ticks ({d['ticks_per_s'] or 0:.2f}/s, refresh {d['refresh_ms']:.3f} ms), with a frame "
                   f"{states[1]}, empty {states[0]}, hidden {states[2]}, again {states[3]}")
-            print(f"    shown intervals: p50 {d['shown_interval_ms']['p50']:.3f} p95 {d['shown_interval_ms']['p95']:.3f} p99 "
-                  f"{d['shown_interval_ms']['p99']:.3f} ms; in refreshes: "
-                  + ", ".join(f"{k}: {v}" for k, v in d["shown_intervals_in_refreshes"].items()))
-            print(f"    nextDrawable p50 {d['next_drawable_ms']['p50']:.3f} p99 {d['next_drawable_ms']['p99']:.3f} ms; wsd GPU p50 "
-                  f"{d['gpu_ms']['p50']:.3f} p99 {d['gpu_ms']['p99']:.3f} ms; tick to shown p50 {d['tick_to_shown_ms']['p50']:.3f} p90 "
-                  f"{d['tick_to_shown_ms']['p90']:.3f} ms; client to shown p50 {d['client_to_shown_ms']['p50']:.3f} p95 "
-                  f"{d['client_to_shown_ms']['p95']:.3f} ms; drawn on arrival {d['drawn_on_arrival']}, scaled {d['drawn_scaled']}")
+            print(f"    shown intervals: p50 {ms_('shown_interval_ms', 50)} p95 {ms_('shown_interval_ms', 95)} p99 "
+                  f"{ms_('shown_interval_ms', 99)} ms; in refreshes: "
+                  + ", ".join(f"{k}: {v}" for k, v in d["shown_intervals_in_refreshes"].items())
+                  + f"; the longest without a new frame {d['largest_gap_ms']:.3f} ms, {d['holds_of_3_refreshes_or_more']} of three refreshes or more "
+                  f"(to the first {d['leading_gap_ms']:.3f}, from the last {d['trailing_gap_ms']:.3f})")
+            print(f"    nextDrawable p50 {ms_('next_drawable_ms', 50)} p99 {ms_('next_drawable_ms', 99)} ms; wsd GPU p50 "
+                  f"{ms_('gpu_ms', 50)} p99 {ms_('gpu_ms', 99)} ms; tick to shown p50 {ms_('tick_to_shown_ms', 50)} p90 "
+                  f"{ms_('tick_to_shown_ms', 90)} ms; client to shown p50 {ms_('client_to_shown_ms', 50)} p95 "
+                  f"{ms_('client_to_shown_ms', 95)} ms; drawn on arrival {d['drawn_on_arrival']}, scaled {d['drawn_scaled']}")
     if not out:
         print("  no frames received" + (f" on plane {plane}" if plane is not None else ""))
     return out
@@ -971,13 +1152,22 @@ def write_csv(path, frames):
                                                  "wgpu_start", "wgpu_end", "shown")] + [int(f.get("replaced", 0))])
 
 
+def told_as_json(x):
+    """What is not a number is told as nothing."""
+    if isinstance(x, dict):
+        return {k: told_as_json(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [told_as_json(v) for v in x]
+    return None if isinstance(x, float) and not math.isfinite(x) else x
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("folder")
     p.add_argument("--from", dest="lo", type=int, default=0)
     p.add_argument("--to", dest="hi", type=int, default=2**63)
     p.add_argument("--modes", help="a log with pass_costs' MODE lines: one report per mode")
-    p.add_argument("--plane", type=int, help="only the frames of this plane of wsd's")
+    p.add_argument("--plane", help="only the frames of this plane of wsd's, or `game`: of the one most frames joined are of")
     p.add_argument("--frames", type=int, default=0, help="print that many frames one by one")
     p.add_argument("--passes", action="store_true", help="the encoder list of the commonest frame")
     p.add_argument("--splits", action="store_true", help="what committed the command buffers and cut the main colour target's passes")
@@ -1012,9 +1202,20 @@ def main():
         cuts.append(("all" if not a.lo and a.hi == 2**63 else f"{a.lo} to {a.hi}", a.lo, a.hi))
     told, written = [], []
     for title, lo, hi in cuts:
-        frames = [f for f in s.frames if lo <= f["signal_end"] <= hi and (a.plane is None or f.get("plane") == a.plane)]
+        plane, share = (None, None) if a.plane is None else game_plane(s, lo, hi) if a.plane == "game" else (int(a.plane), None)
+        queues = queues_of(s, plane, lo, hi) if plane is not None else None
+        frames = frames_of(s, plane, lo, hi)
         written += frames
         told.append(dict(title=title, lo=lo, hi=hi) | counted(s, frames))
+        if plane is not None:
+            told[-1].update(plane=plane, plane_share=share, queues=sorted(queues))
+            print(f"\n-- plane {plane}" + (f" (of {100 * share:.1f} % of the frames joined)" if share is not None else "") + f", queues {sorted(queues)}")
+        if hi < 2**62:
+            told[-1].update(seconds=(hi - lo) / 1e9, trace_not_complete=trace_complete(s, lo, hi, queues))
+            if told[-1]["trace_not_complete"]:
+                print(f"\n-- NOT RECORDED WHOLE: {'; '.join(told[-1]['trace_not_complete'])}")
+            if plane is not None:
+                told[-1].update(production=production(s, plane, lo, hi), work=work(s, frames))
         if s.frames:
             report(s, frames, title)
             if a.passes:
@@ -1028,17 +1229,20 @@ def main():
         if a.queries or a.splits:
             if not s.frames:
                 print(f"\n== {title}")
-            told[-1]["queries"] = queries(s, lo, hi)
+            told[-1]["queries"] = queries(s, lo, hi, queues)
+            if queues is not None:  # (the mechanism is every queue's)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    told[-1]["queries_of_every_queue"] = queries(s, lo, hi)
         if a.cadence and s.wsd:
             print(f"\n-- cadence: {title}")
-            told[-1]["cadence"] = cadence(s, lo, hi, a.plane)
+            told[-1]["cadence"] = cadence(s, lo, hi, plane)
     if a.csv:
         write_csv(a.csv, written)
     if a.json:
         files = [dict(file=os.path.basename(f.path), role=f.role, pid=f.pid, records=f.kept, lost=f.lost, lossy_intervals=len(f.lossy),
                       end=f.end, passes=f.passes) for f in s.files]
         with open(a.json, "w") as out:
-            json.dump(dict(lost=dict(lost), not_told=dict(s.unseen), files=files, reports=told), out, indent=1)
+            json.dump(told_as_json(dict(lost=dict(lost), not_told=dict(s.unseen), files=files, reports=told)), out, indent=1, allow_nan=False)
 
 
 if __name__ == "__main__":
