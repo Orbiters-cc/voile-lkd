@@ -371,6 +371,30 @@ class Bounds(unittest.TestCase):
         self.assertEqual((at["zero_time"], at["redisplays_shown"]), (1, 1))
         self.assertEqual([round(c["shown_per_s"], 3) for c in (before, at, after)], [1.0, 2.0, 1.0])
 
+    def test_a_callback_that_ran_long_after_is_of_its_frame_s_window(self):
+        # the review's case: two presented in the window, the second one's callback 3.1 s beyond it. One was counted.
+        base = 1_000_000_000
+        r = Recording()
+        self.presented(r, 1, base + 100 * MS)
+        self.presented(r, 2, base + 900 * MS, callback=base + 4100 * MS)
+        self.presented(r, 3, base + 950 * MS, callback=base + 60_000 * MS)
+        self.presented(r, 4, base + 5000 * MS, callback=base + 5000 * MS)  # (presented after it)
+        r.finish()
+        c = self.read(r, base, base + 1000 * MS, "--plane", "5")[0]["cadence"][0]
+        self.assertEqual((c["shown"], c["shown_per_s"], c["received"], c["trailing_gap_ms"]), (3, 3.0, 3, 50))
+        self.assertEqual(c["client_to_shown_ms"]["p50"], 20)
+
+    def test_a_frame_received_long_before_it_was_shown_keeps_its_stamp(self):
+        base = 10_000 * MS
+        r = Recording()
+        self.presented(r, 1, base + 100 * MS, sent=base - 5000 * MS)
+        self.presented(r, 9, base - 4000 * MS, sent=base - 4900 * MS)  # (shown before it: of another window)
+        r.put("wsd", base + 200 * MS, "W_SHOWN", 1, 9, base + 200 * MS, 1, 5)  # and again: it was new once
+        r.finish()
+        for more in (("--plane", "5"), ()):
+            c, = self.read(r, base, base + 1000 * MS, *more)[0]["cadence"]
+            self.assertEqual((c["plane"], c["shown"], c["received"], c["client_to_shown_ms"]["p50"]), (5, 1, 0, 5100))
+
     def test_a_window_of_no_frame_or_of_one_has_its_rate_and_its_gaps(self):
         r = Recording()
         self.presented(r, 1, 1500 * MS)
@@ -414,6 +438,39 @@ class Bounds(unittest.TestCase):
         one, _ = self.read(r, 90 * MS, 500 * MS, "--plane", "5")
         self.assertEqual((one["frames"], one["whole"]), (11, 9), "the one that was not presented, and the first of its plane")
         self.assertLess(one["whole_share"], 0.95)
+
+    def test_a_frame_that_lost_what_it_belongs_to_is_still_one(self):
+        # the review's fixture: 50 of 96 frames without DXMT's signal and without a receive. 46 were told, 97.83 % of them whole.
+        r = Recording()
+        r.export(MS, 0xAAA)
+        for i in range(120):
+            r.frame((1000 + i * 20) * MS, leave=("DSIGNAL", "RX") if 30 <= i < 80 else ())
+        r.finish()
+        for plane in ("game", "5"):
+            one, _ = self.read(r, 1300 * MS, 3200 * MS, "--plane", plane)
+            self.assertEqual((one["frames"], one["whole"], round(one["whole_share"], 4)), (96, 45, round(45 / 96, 4)))
+        self.assertLess(self.read(r, 1300 * MS, 3200 * MS, "--plane", "game")[0]["plane_share"], 0.5)
+
+    def test_what_is_known_to_be_another_plane_s_is_not_counted(self):
+        r = Recording()
+        r.export(MS, 0xAAA, export=1, buffer=1)
+        r.export(2 * MS, 0xBBB, pointer=0x2000, export=2, buffer=2)
+        for i in range(40):
+            r.frame((1000 + 20 * i) * MS, export=1, plane=5)
+            r.frame((1007 + 20 * i) * MS, export=2, plane=6, window=2, queue=2, leave=("DSIGNAL", "RX") if i % 4 == 0 else ())
+        r.finish()
+        one, _ = self.read(r, 1200 * MS, 1600 * MS, "--plane", "5")
+        self.assertEqual((one["frames"], one["whole_share"]), (21, 1.0), "that image was only ever presented on the other")
+        self.assertLess(self.read(r, 1200 * MS, 1600 * MS, "--plane", "6")[0]["whole_share"], 0.95)
+
+    def test_a_presentation_without_a_frame_is_one_that_is_not_whole(self):
+        r = steady(20)
+        for i in range(5):
+            r.frame((600 + 20 * i) * MS, leave=("SIGNAL", "FRAME", "COUNTS"))
+        r.finish()
+        one, text = self.read(r, 110 * MS, 900 * MS, "--plane", "5")
+        self.assertEqual((one["frames"], one["whole"], one["received_without_a_frame"], one["whole_share"]), (19, 19, 5, 19 / 24))
+        self.assertIn("5  presentations without a recorded frame", text)
 
     def test_a_window_that_is_not_recorded_whole_says_so(self):
         told = lambda r, lo=150 * MS, hi=250 * MS: self.read(r, lo, hi, "--plane", "5")[0]["trace_not_complete"]
@@ -625,6 +682,17 @@ class Queries(unittest.TestCase):
         told, _ = self.told(r)
         self.assertEqual([told[k] for k in ("rescues_whose_chunk_was_not_handed_over", "rescues_of_a_chunk_something_else_committed",
                                             "rescues_of_another_chunk_than_its_end_s", "handed_over_and_committed")], [1, 1, 1, 0])
+        self.assertEqual([told[k] for k in ("rescues", "rescues_whose_commit_is_not_recorded", "rescues_whose_end_is_not_recorded")], [4, 0, 2])
+
+    def test_what_nothing_else_recorded_speaks_for_is_taken_for_neither(self):
+        # (the review: a commit and an End that are not recorded were taken for the ones that were expected)
+        r = Recording()
+        r.put("dxmt", 10 * MS, "D_STALL", 2 | 8, 1, 7, 50, 49, 51, 1)
+        r.put("dxmt", 10 * MS, "D_READY", 0, 1, 7, 0, 1)
+        told, text = self.told(r)
+        self.assertEqual([told[k] for k in ("rescues", "rescues_whose_commit_is_not_recorded", "rescues_whose_end_is_not_recorded",
+                                            "rescues_of_a_chunk_something_else_committed", "rescues_of_another_chunk_than_its_end_s")], [1, 1, 1, 0, 0])
+        self.assertIn("not corroborated, of 1 rescues: 1 rescues whose commit is not recorded, 1 rescues whose end is not recorded", text)
 
     def owed(self, r, t, what, event, submitted, why=0, queue=1):
         r.put("dxmt", t * MS, "D_OWED", what | why << 8, queue, event, submitted, t * MS)

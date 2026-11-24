@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks of bench.py's scoring, arrival and cleanup (fourth verification, finding 11; fifth, findings 11 and 12), without
 a game: python3 -I tests/timeline/test_bench.py"""
-import contextlib, datetime, fcntl, io, json, os, shutil, subprocess, sys, tempfile, unittest
+import contextlib, datetime, fcntl, io, json, os, shutil, signal, subprocess, sys, tempfile, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../tools/timeline"))
 import bench  # noqa: E402
@@ -416,7 +416,7 @@ say(event="exited", app_id=438100, session_id="s-1", exit_code=0)
 class WholeRun(unittest.TestCase):
     """measure() against a program that answers as obelisk-cli does; no game, nothing of this Mac's own."""
 
-    def run_with(self, deadline=8, settings=None, files=None, link=LINK, args=(), **how):
+    def run_with(self, deadline=8, settings=None, files=None, link=LINK, args=(), prepare=None, **how):
         with tempfile.TemporaryDirectory() as root:
             for folder in ("records", "vrchat", "n4n0"):
                 os.mkdir(f"{root}/{folder}")
@@ -426,6 +426,8 @@ class WholeRun(unittest.TestCase):
             for name, text in (files or {}).items():
                 with open(f"{root}/n4n0/{name}", "w") as f:
                     f.write(text)
+            if prepare:
+                prepare(f"{root}/n4n0")
             with open(f"{root}/how.json", "w") as f:
                 json.dump({"joins": HERE} | how, f)
             cli = f"{root}/obelisk-cli"
@@ -507,6 +509,66 @@ class WholeRun(unittest.TestCase):
             status, res, _ = self.run_with(settings=unknown)
             self.assertEqual((status, res, self.argv), (6, None, []), unknown)
             self.assertIn("is not known", self.said)
+
+    def test_what_is_not_read_as_n4n0_reads_it_starts_nothing(self):
+        # (the review: Home's parse::<u32> takes "+1", the settings' reader here did not, and the private link was admitted)
+        for key, why in (("+1", "several"), ("\u20031 ", "several"), ("x", "no number"), ("", "no number"), ("4294967296", "no number"), ("\u0661", "no number"), ("-1", "no number")):
+            status, res, _ = self.run_with(settings=json.dumps({"launch": {"profiles": {"0": "usr_x", key: "usr_secret"}}}))
+            self.assertEqual((status, res, self.argv), (6, None, []), key)
+            self.assertIn(why, self.said)
+            for private in ("usr_", WORLD, "25038"):
+                self.assertNotIn(private, self.said)
+
+        def unreadable(n4n0):
+            with open(f"{n4n0}/settings.json", "w") as f:
+                f.write("{}")
+            os.chmod(f"{n4n0}/settings.json", 0)
+        for prepare in (lambda n4n0: os.symlink("nowhere", f"{n4n0}/settings.json"), unreadable, lambda n4n0: os.mkdir(f"{n4n0}/settings.json"), lambda n4n0: os.chmod(n4n0, 0o300),
+                        lambda n4n0: (os.rmdir(n4n0), os.symlink("nowhere", n4n0))):
+            status, res, _ = self.run_with(prepare=prepare)
+            self.assertEqual((status, res, self.argv), (6, None, []), self.said)
+        for settings in ('{"launch": {"profiles": {"+0": "usr_x", " 00 ": "usr_x"}}}',):
+            self.assertEqual(self.run_with(settings=settings)[0], 0, self.said)
+
+    def test_a_gate_that_is_not_n4n0_s_starts_nothing(self):
+        status, res, _ = self.run_with(files={"obelisk-start-gate.json": '{"boot":"bad"}'})
+        self.assertEqual((status, res, self.argv), (6, None, []))
+        status, res, _ = self.run_with(prepare=lambda n4n0: os.symlink("nowhere", f"{n4n0}/obelisk-start-gate.json"))
+        self.assertEqual((status, res, self.argv), (6, None, []))
+
+    def test_what_it_starts_is_noted_for_whoever_started_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            status, _, _ = self.run_with(files={"obelisk-start-gate.lock": ""}, args=("--slot-held", "--note", f"{d}/note", "--caller", str(os.getppid())))
+            self.assertEqual(status, 0)
+            with open(f"{d}/note") as f:
+                note = json.load(f)
+            self.assertEqual((note["session"], bool(note["program"]["pid"]), bool(note["program"]["born"])), ("s-1", True, True))
+            self.assertEqual(os.stat(f"{d}/note").st_mode & 0o777, 0o600)
+            # whoever held the slot for it is gone: nothing is started, and nothing is noted
+            status, res, _ = self.run_with(args=("--slot-held", "--note", f"{d}/other", "--caller", "1"))
+            self.assertEqual((status, res, self.argv, os.path.exists(f"{d}/other")), (6, None, [], False))
+
+    def test_told_to_stop_it_ends_its_session_once_it_knows_it(self):
+        for at, more in (("starting", {}), ("running", {})):
+            kept, fired = bench.told, []
+
+            def told(session, event, when):
+                kept(session, event, when)
+                if event.get("event") == at and not fired:
+                    fired.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    os.kill(os.getpid(), signal.SIGINT)  # (and again: it ends what it started all the same)
+            handlers = {n: signal.signal(n, bench.cut) for n in (signal.SIGINT, signal.SIGTERM)}
+            try:
+                bench.told = told
+                status, res, quit = self.run_with(**more)
+            finally:
+                bench.told = kept
+                bench.cut.__init__()
+                for n, h in handlers.items():
+                    signal.signal(n, h)
+            self.assertEqual((status, res["session"], quit, self.slot, res["terminal"]["phase"]), (7, "s-1", True, "", "Finished"), at)
+            self.assertEqual(len(self.quits), 1)
 
     def test_no_argument_names_a_profile_or_another_place(self):
         for arg in ("--profile=1", "--profile", LINK):

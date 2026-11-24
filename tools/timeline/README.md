@@ -21,6 +21,7 @@ each site: no thread, file, descriptor or memory.
 python3 tools/timeline/otl.py <folder of the start> [--from NS --to NS] [--plane ID|game] --passes --cadence [--csv out.csv] [--json out.json]
 tools/timeline/real_session.py '<private instance link>' --plan 45 --series NAME ...   # the three real starts, for the owner (read its head first)
 tools/timeline/score_series.py <folder of the series>       # what the three say, by the criteria below
+tools/timeline/compare_pictures.py --series <folder of the series>   # the pictures of its starts, both comparisons with B
 tools/timeline/rehearse.py ...                              # the same without the game, the account or the owner's library
 ```
 
@@ -66,9 +67,10 @@ ended: the highest that is outstanding, and for how long the oldest is. Looks of
 
 `--cadence`: per plane of wsd (a window's base or overlay; a new one is a new plane), what its display link gave and what became of
 what it received. A frame counts as shown only with a positive time, once, redisplays apart, **in the window (half open) that time is in, whenever its
-callback ran; the rate is over the whole of the window**, and so are the gaps (to the first frame, from the last).
+callback ran (its record is kept by the time in it, however late it was written); the rate is over the whole of the window**, and so are the gaps (to the first frame, from the last).
 
-`--plane`: that plane's frames, and of the queues they were made on; a frame of those queues whose presentation is not told is one that is not whole. With a
+`--plane`: that plane's frames, and of the queues they were made on; a frame of those queues whose presentation is not told is one that is not whole, and so is one of no queue and no plane that is told (unless its image was only ever presented on
+another plane), and a presentation received of which no frame is recorded: what lost what it belongs to stays counted. With a
 window: whether it is recorded whole (`trace_not_complete`: roles, losses, recorders that ended), what the guest sent of the plane (`production`) and what a frame took (`work`).
 
 ## The A/B/A of `queries=once` (the owner's three starts)
@@ -81,8 +83,20 @@ L='vrchat://launch?...~private(usr_...)...'   # the same private instance for al
 tools/timeline/real_session.py "$L" --plan 45 --series aba-1
 tools/timeline/real_session.py "$L" --plan 45 --series aba-1 --switch queries=once --nothing-wrong-seen
 tools/timeline/real_session.py "$L" --plan 45 --series aba-1 --nothing-wrong-seen
-tools/timeline/score_series.py ~/Library/Logs/Obelisk/timeline-sessions/aba-1
+tools/timeline/compare_pictures.py --series ~/Library/Logs/Obelisk/timeline-sessions/aba-1
+tools/timeline/score_series.py ~/Library/Logs/Obelisk/timeline-sessions/aba-1 --nothing-wrong-seen
 ```
+
+After a start that was interrupted, or whose runner said that the release is not back, before anything else is played or started:
+
+```sh
+tools/timeline/real_session.py --restore
+```
+
+**The release is owed until it is proven.** Before the developer's generation is put in place the runner writes `restoration-owed.json` beside the series; it is taken away only once every engine file
+has the released digest, and only then can the series' entry say `go_on`, its result `restored`. Putting it back depends on nothing else: not on N4N0's slot being written, not on a report, and one attempt that fails
+is followed by the next. Told to stop (whoever is told: SIGINT, SIGTERM, SIGHUP), the runner ends its bench, which quits its own session, and then puts the release back. Killed, it leaves the file: the next start, or `--restore`, waits until
+the bench, the program it started and everything of the engine are gone, puts the release back through the CLI, verifies it, and nothing is started until that succeeded. The slot's note is taken away only when the record of the session says that it ended.
 
 All three run one generation: A is the same DXMT with the switch unset, whose query paths are the released bodies
 (`dxmt/tests/timeline/check-off-arm.py`). No earlier session is averaged in: the 45 % session of 2026-11-23 had no window in front.
@@ -97,8 +111,9 @@ executions (unset: as the list begins), which is another meaning of them and oth
 
 **How a start is made.** As Home of Orbiters - N4N0 makes it: `steam play 438100 --no-saved-arguments --render-percent 45 -- -screen-fullscreen 1 -window-mode borderless <link>`,
 nothing that is saved for the game added, on the default profile. A computer that uses several VRChat profiles (a nonzero one on Home's choice) is refused, with why: which
-profile Home would start is Home's to know, and a private place may not ride with a cold start there (`vrchat_launch::way`). So is a start while N4N0 makes one,
-or in its wait after an early end; the runner holds N4N0's one slot for a start until the released generation is back. At most three starts in a series, at least 90 s after
+profile Home would start is Home's to know, and a private place may not ride with a cold start there (`vrchat_launch::way`). Its settings' keys are read as N4N0 reads them (`str::trim`, `u32`, a leading `+` with it); a key that is none, a
+settings file or folder that cannot be read, a link to nowhere: refused. So is a start while N4N0 makes one,
+or in its wait after an early end, or beside a gate that is not as N4N0 writes it; a record of the engine's that is damaged, not its own, or of a time still to come, and records that cannot be listed, count as a session that has just ended, for as long as they are so; the runner holds N4N0's one slot for a start until the released generation is back. At most three starts in a series, at least 90 s after
 the end of the last, the session quit by its own name, the released generation verified by every digest after each.
 
 **The same for all three, settled before any result is looked at.** The same generation, developer's CLI, bench, reader, scale, tracing options, warm-up, windows and place (the runner
@@ -109,7 +124,8 @@ what is compared is **W2 with W2 and W3 with W3**, never an average over windows
 
 **A start is inconclusive, and authorizes no other** (the runner's `judge()`; `result.json`'s `why_not`), when a window is not `valid` or VRChat was not in front, its ends are not stamped on the trace's clock, it is not
 recorded whole (a role missing, records lost, a recorder that ended) or under **95 %** of its frames are whole; a role is missing in all or `foreign_images` is not empty; which plane is the
-game's is not known; `queries.locked` is not `[true]` or `queries.once` is not the arm's; it was not on AC or the pressure is not known; one of the three pictures is missing; its session did not end as it was
+game's is not known; a counter named in `real_session.py`'s `COUNTERS` is not there (a missing one is missing, not zero); the Mac's state was not looked at from its start to its end (no look for more than 15 s, no whole one for more than 20 s); what wsd, the
+proxy and the game's worker loaded is not all in `images.json` with the generation's digests (`not_in_the_inventory`); `queries.locked` is not `[true]` or `queries.once` is not the arm's; it was not on AC or the pressure is not known; one of the three pictures is missing; its session did not end as it was
 asked to; pressure reached level 2 in one start alone; or, in B, the mechanism below fails. **A pair of windows is inconclusive** (the scorer) when the work is another (draws a frame more than 5 % apart, Ends of event and
 disjoint queries a frame more than 10 %), the pressure is (level 2 in one alone), or an A has no redundant commit to take away. **A window in which the scene streams (textures or meshes still arriving) or in which the work is not the same says nothing of
 performance**, whatever it shows: neither for B nor against it.
@@ -122,6 +138,8 @@ performance**, whatever it shows: neither for B nor against it.
 | `said_otherwise_than_its_watermarks` | **0** | **0** |
 | `most_rescues_of_a_chunk` | at most **1** | |
 | `left_not_handed_over` | **0** | |
+| `rescues_whose_commit_is_not_recorded` (nothing is concluded from what is not there) | **0** | |
+| `rescues_whose_end_is_not_recorded` (Ends are a sample: `not_corroborated` in the result) | told | |
 | `rescues_whose_chunk_was_not_handed_over`, `rescues_of_a_chunk_something_else_committed`, `rescues_of_another_chunk_than_its_end_s` | **0** | |
 | `debts`: `cancelled`; `oldest_outstanding_ns` at the window's end | **0**; under a second | |
 | `debts.longest_ns`, `highest_outstanding`, `tries` (of looks and of the rescue thread, that could not hand over) | told | |
@@ -152,6 +170,10 @@ steady timing and no more.
   each other in that window, and mean production interval at least 0.5 ms shorter than both; the mechanism's column B as above; latency tails acceptable (below), pictures too.
   **Said separately: whether B sustained 40** distinct shown frames a second in both windows. (To ship it takes independent repeats in another
   order, not the three windows of one start counted as three: one B in the middle cannot be told from a cache of its own, another clock at the same pressure, or any drift that is not a line.)
+- **What can be compared comes first**: where the work, the heat or a number is not the same or not known, no performance is concluded, neither for B nor against it. What B got wrong (a commit for nothing, a marker left or lost) is wrong
+  whatever the work was: a rejection, though its series ended by it.
+- **Invalid**: the series' files contradict each other, or do not show what its journal says (the exact switches A, B, A; `go_on`, `why_not` and what `judge()` finds in the result itself; the release proven to be back; the result's digest).
+- **Timing only**, until both comparisons of B's pictures are recorded (`compare_pictures.py --series`) and the person at the Mac has said of all three starts that nothing was wrong (the second and third start's `--nothing-wrong-seen`, and the scorer's for the third).
 - **Reject**: any failure of correctness, progress or the mechanism; shown rate more than 3 % below both As in W2 and W3; or shown p95/p99, or client stamp to
   shown p95, more than one refresh (16.7 ms) worse than both As beyond the As' own difference. A smaller worsening is said, not accepted in silence. (Found in the rehearsals of 2026-11-24: for a whole start
   wsd may have one drawable more on its way, 32.8 or 49.5 ms from its tick to the screen, with the switch and without. Where that part alone is half a refresh off, client stamp to shown is **inconclusive**: no rejection, and no keep.)
@@ -163,7 +185,9 @@ steady timing and no more.
 - `tests/timeline/run-otl-test.sh`: the recorder (off, bounds, one budget, a full disk, a short write, an exit, a 65th recorder).
 - `tests/timeline/test_otl.py`: the reader's joins, refusals, counts, cuts, clocks, rates over a whole window, the mechanism by its watermarks.
 - `tests/timeline/test_bench.py`: the bench's scoring, arrival and cleanup; the launch's arguments, profiles, slot and refusals (a program that answers as obelisk-cli does).
-- `tests/timeline/test_session.py`: what authorizes a series' next start, what starts nothing, what three starts say.
+- `tests/timeline/test_session.py`: what authorizes a series' next start, what starts nothing, what three starts and their files say, the commands above.
+- `tests/timeline/test_restoration.py`: the release is back, in a scratch library: after a failure, a signal, a kill at each step and `--restore`, with the bench and a program that answers as obelisk-cli does
+  (`TIMELINE_REAL=1`: the developer's CLI and generation themselves, on a clone of the release).
 - `tests/timeline/samples_test.m` of dxmt (`run-samples-test.sh`): the encoders' GPU times with concurrent queues, queues ended and
   made again with work in flight, failures and exhaustion, under ThreadSanitizer.
 - `tests/timeline/run-guest-probe.sh`: what the process that becomes the game is given.

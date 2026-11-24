@@ -1838,6 +1838,45 @@ static void protection() {
   check(look_event(e, 0).hr == S_OK, "the event of it is there");
   if (!once) { mt->SetMultithreadProtected(FALSE); mt->Release(); e->Release(); picture_good(); return; }
 
+  /* Each Leave is its own Enter's, whatever another thread sets in between: a third thread records after the outer Leave, and not before. */
+  {
+    auto set = [&](BOOL on) { std::thread([&] { mt->SetMultithreadProtected(on); }).join(); };
+    auto waits = [&](const char *how) { check(!other_records(150, [&] { mt->Leave(); }), "%s: another thread records after the outer Leave", how); };
+    mt->SetMultithreadProtected(TRUE);
+    mt->Enter();
+    set(FALSE);
+    mt->Enter();
+    mt->Leave();
+    waits("entered, not protected any more by another thread, entered and left");
+    mt->SetMultithreadProtected(TRUE);
+    mt->Enter(); mt->Enter();
+    set(FALSE);
+    mt->Enter(); mt->Enter(); mt->Leave(); mt->Leave(); mt->Leave();
+    waits("entered twice, not protected any more, entered twice more and left three times");
+    mt->SetMultithreadProtected(TRUE);
+    mt->Enter();
+    for (int n = 0; n < 50; n++) { set(FALSE); mt->Enter(); set(TRUE); mt->Enter(); set(n & 1); mt->Leave(); mt->Leave(); }
+    set(FALSE);
+    waits("entered and left at each turn of it");
+    check(!mt->GetMultithreadProtected() && other_records(2000, [] {}), "not protected, all left: another thread records");
+    mt->Enter(); /* (holds nothing: it is off, and this thread is in nothing) */
+    set(TRUE);
+    mt->Enter();
+    set(FALSE);
+    check(!other_records(150, [&] { mt->Leave(); }), "entered while it was off, and again while it was on: another thread waits for the inner Leave");
+    check(other_records(2000, [] {}), "and for no other");
+    mt->Leave(); /* (the outer one's: it held nothing) */
+    mt->SetMultithreadProtected(TRUE);
+    mt->Enter(); mt->Enter();
+    mt->SetMultithreadProtected(FALSE); /* by the thread in it: let go of */
+    mt->Enter(); /* (holds nothing) */
+    check(other_records(2000, [] {}), "entered, not protected any more by this thread, and entered: another thread records");
+    mt->Leave(); mt->Leave(); mt->Leave();
+    mt->SetMultithreadProtected(TRUE);
+    check(other_records(2000, [] {}), "and all left: another thread records");
+    check(look_event(e, 0).hr == S_OK, "the event of them is there");
+  }
+
   /* The rescue thread at work while the protection goes on and off: every event is there without another look. */
   enum { SAME, FROM_ANOTHER, ON_AND_OFF, HOWS };
   for (int how = 0; how < HOWS; how++)

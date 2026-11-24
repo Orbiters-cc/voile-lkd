@@ -54,7 +54,7 @@ def main():
     print("the released generation first:", first.strip()[:160])
     command = ["/usr/bin/python3", "-I", os.path.join(HERE, "real_session.py"), "vrchat://launch?ref=orbiters.cc&id=wrld_00000000-0000-0000-0000-000000000000:12345~private(usr_rehearsal)~region(eu)",
                "--rehearse", "--cli", stub, "--generation", os.path.abspath(a.generation), "--bench", os.path.abspath(a.bench), "--out", os.path.join(out, "evidence"),
-               "--plan", a.plan, "--warm", "4", "--window", str(a.window), "--windows", str(a.windows), "--between", "5", "--passes", a.passes]
+               "--plan", a.plan.split(",")[-1] if a.aba else a.plan, "--warm", "4", "--window", str(a.window), "--windows", str(a.windows), "--between", "5", "--passes", a.passes]
     asked = [["--series", "rehearsal"] + (["--nothing-wrong-seen"] if n else []) + (["--switch", (a.switch or ["queries=once"])[0]] if n == 1 else []) for n in range(3)] if a.aba else \
         [[x for switch in a.switch for x in ("--switch", switch)]]
     status = 0

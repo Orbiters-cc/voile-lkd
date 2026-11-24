@@ -73,6 +73,7 @@ def quit_(words):
 
 
 def main():
+    os.umask(0o077)  # (the engine's records are its own: what others may read is none to whoever scans them)
     words = sys.argv[1:]
     if words[:2] == ["steam", "play"]:
         return play(words)

@@ -48,9 +48,10 @@ FLUSHES = {16, 17, 18, 19, 20, 21, 22, 24}  # the call itself commits; else a co
 STOP = {0: "the command buffer's end", 1: "a render pass that needs it", 2: "a dispatch that needs it", 3: "a blit that needs it",
         4: "a clear that needs it", 5: "a resolve that needs it", 6: "an event signalled or waited for", 7: "a timestamp", 8: "another encoder"}
 COMPLETED, NONE, SERIAL = 4, 2**64 - 1, (1 << 48) - 1  # MTLCommandBufferStatusCompleted
-# Kept whatever the time asked for: what names things that live longer than it.
+# Kept whatever the time asked for: what names things that live longer than it; and what came of a presentation, which is of the time it
+# was presented at (in the record), whenever its callback ran.
 ALWAYS = {K[k] for k in ("THREAD", "SUMMARY", "HIST", "LOST", "END", "N_EXPORT", "N_GONE", "N_EVENT", "D_QUEUE", "D_CLOCK", "D_OWED",
-                         "W_ATTACH", "W_DETACH")}
+                         "W_ATTACH", "W_DETACH", "W_SHOWN")}
 FORMAT = {10: ("R8", 1), 13: ("R8ui", 1), 25: ("R16F", 2), 30: ("RG8", 2), 53: ("R32ui", 4), 55: ("R32F", 4), 65: ("RG16F", 4),
           70: ("RGBA8", 4), 71: ("RGBA8s", 4), 80: ("BGRA8", 4), 81: ("BGRA8s", 4), 90: ("RGB10A2", 4), 92: ("RG11B10F", 4),
           105: ("RG32F", 8), 110: ("RGBA16", 8), 115: ("RGBA16F", 8), 125: ("RGBA32F", 16), 250: ("D16", 2), 252: ("D32F", 4),
@@ -63,6 +64,7 @@ class File:
     def __init__(self, path, lo=0, hi=2**64, margin=3_000_000_000):
         self.path, self.by, self.windows, self.hist = path, collections.defaultdict(list), [], {}
         self.lost, self.lossy, self.end, self.last, self.kept, self.cut = 0, [], None, 0, 0, 0
+        received = {}  # (plane, serial) -> when the frame was sent, of those received outside the time asked for
         lo, hi = max(0, lo - margin), hi + margin
         with open(path, "rb") as f:
             head = f.read(64)
@@ -81,10 +83,14 @@ class File:
                         self.last = max(self.last, t)
                     if lo <= t <= hi or kind in ALWAYS:
                         self.take(t, kind, thr, a, v)
+                    elif kind == K["W_RX"]:
+                        received[v[5] & 0xffffffff, v[1]] = v[2], a
                 if len(block) < 64 * 16384:
                     break
         for l in self.by.values():
             l.sort(key=lambda r: r.t)
+        # (of what was shown in it alone: the rest of them was asked for by nobody)
+        self.received_outside = {(r.v[3], r.v[0]): received[r.v[3], r.v[0]] for r in self.get("W_SHOWN") if (r.v[3], r.v[0]) in received}
 
     def take(self, t, kind, thr, a, v):
         if kind == K["SUMMARY"]:
@@ -211,6 +217,7 @@ class Session:
         self.dxmt = {f.pid: f for f in self.files if f.role == "dxmt"}
         self.npt = [f for f in self.files if f.role == "npt"]
         self.frames, self.unseen = [], collections.Counter()
+        self.unjoined = []  # (when, plane) of every presentation wsd received that is no frame's
         self.passes_by = None
         for f in self.npt:
             if f.pid in self.dxmt:
@@ -373,6 +380,7 @@ class Session:
             l = [i for t, i in attach.get((client, r.v[0]), ()) if t <= r.t]
             if not l or l[-1] is None:
                 self.unseen["presentations of a buffer whose attachment is not recorded"] += 1
+                self.unjoined.append((r.v[2], plane))
             else:
                 images[l[-1]].append((r, previous.get(plane)))
             previous[plane] = r.v[2]
@@ -383,6 +391,8 @@ class Session:
                 end = bisect.bisect_right(times, r.v[2])
                 mine, at = frames[at:end], end
                 if len(mine) != 1:
+                    if not mine:
+                        self.unjoined.append((r.v[2], r.v[5] & 0xffffffff))
                     self.unseen["presentations without a recorded frame" if not mine else "presentations after several frames of their image"] += 1
                     for f in mine:
                         f["why"].append("ambiguous: presented with another frame of its image")
@@ -653,7 +663,8 @@ def mechanism(s, lo, hi, queues=None):
     was owed to the rescue thread, until a record says it was handed over, or that its context ended."""
     n = collections.Counter(dict.fromkeys(("stall_flushes", "not_handed_over", "handed_over", "handed_over_and_committed", "left_not_handed_over",
                                            "by_the_rescue_thread", "said_otherwise_than_its_watermarks", "rescues_whose_chunk_was_not_handed_over",
-                                           "rescues_of_a_chunk_something_else_committed", "rescues_of_another_chunk_than_its_end_s"), 0))
+                                           "rescues_of_a_chunk_something_else_committed", "rescues_of_another_chunk_than_its_end_s", "rescues",
+                                           "rescues_whose_commit_is_not_recorded", "rescues_whose_end_is_not_recorded"), 0))
     once, most = set(), 0
     debts = collections.Counter(accepted=0, covered=0, cancelled=0, for_the_lock=0, for_a_full_queue=0)
     ages, outstanding = [], []
@@ -678,8 +689,13 @@ def mechanism(s, lo, hi, queues=None):
                 chunks[(queue, chunk)] += 1
             if r.a & 2 and not (r.a & 1 or covered):  # a rescue: its chunk was handed to the encoder, by it, with the marker in it
                 n["rescues_whose_chunk_was_not_handed_over"] += (queue, chunk) not in ready
-                n["rescues_of_a_chunk_something_else_committed"] += commits.get((queue, chunk), 17) not in (16, 17)
-                n["rescues_of_another_chunk_than_its_end_s"] += ends.get((queue, event), chunk) != chunk
+                # (what is not recorded says nothing: it is counted, and taken for neither)
+                commit, end = commits.get((queue, chunk)), ends.get((queue, event))
+                n["rescues"] += 1
+                n["rescues_whose_commit_is_not_recorded"] += commit is None
+                n["rescues_whose_end_is_not_recorded"] += end is None
+                n["rescues_of_a_chunk_something_else_committed"] += commit not in (None, 16, 17)
+                n["rescues_of_another_chunk_than_its_end_s"] += end not in (None, chunk)
         most = max([most, *chunks.values()])
         owed = collections.defaultdict(list)  # queue -> [(event, when)], accepted, and not yet told handed over
         for r in d.get("D_OWED"):
@@ -758,6 +774,9 @@ def queries(s, lo, hi, queues=None):
           f"left so), {out['handed_over']} with it handed over ({out['handed_over_and_committed']} of them committed a command buffer for nothing)")
     wrong = {k: out[k] for k in ("said_otherwise_than_its_watermarks", "rescues_whose_chunk_was_not_handed_over",
                                  "rescues_of_a_chunk_something_else_committed", "rescues_of_another_chunk_than_its_end_s") if out[k]}
+    alone = {k: out[k] for k in ("rescues_whose_commit_is_not_recorded", "rescues_whose_end_is_not_recorded") if out[k]}
+    if alone:
+        print(f"    not corroborated, of {out['rescues']} rescues: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in alone.items()))
     if wrong:
         print("    NOT AS IT IS MEANT TO BE: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in wrong.items()))
     if signals:
@@ -881,24 +900,28 @@ def ms(x):
     return f"{x / 1e6:8.3f}"
 
 
-def counted(s, frames):
-    """What is known of these frames, and what is not: the same numbers as the report's first lines."""
+def counted(s, frames, unjoined=0):
+    """What is known of these frames, and what is not: the same numbers as the report's first lines. `unjoined`: presentations received
+    of which no frame is recorded; each is a frame that is not whole."""
     why = collections.Counter(w for f in frames for w in f["why"][:1])
     order = [f["order"] for f in frames if "order" in f]
     return dict(frames=len(frames), whole=sum(1 for f in frames if "parts" in f), not_whole=dict(why.most_common()),
-                whole_share=sum(1 for f in frames if "parts" in f) / len(frames) if frames else None,
+                received_without_a_frame=unjoined,
+                whole_share=sum(1 for f in frames if "parts" in f) / (len(frames) + unjoined) if frames else None,
                 presented=sum(1 for f in frames if "client" in f), replaced=sum(1 for f in frames if f.get("replaced")),
                 shown=sum(1 for f in frames if f.get("shown")), shown_at_zero=sum(1 for f in frames if f.get("shown") == 0),
                 out_of_order_ms=[round(min(order) / 1e6, 3), round(max(order) / 1e6, 3)] if order else None)
 
 
-def report(s, frames, title):
-    n = counted(s, frames)
+def report(s, frames, title, unjoined=0):
+    n = counted(s, frames, unjoined)
     print(f"\n== {title}: {n['frames']} frames, {n['whole']} whole (every boundary known, in order, nothing lost), "
           f"{n['frames'] - n['whole']} not; {n['presented']} presented, {n['replaced']} replaced in wsd, {n['shown']} shown, "
           f"{n['shown_at_zero']} called back without a time")
     for w, c in n["not_whole"].items():
         print(f"  not whole: {c:6d}  {w}")
+    if unjoined:
+        print(f"  and received: {unjoined:3d}  presentations without a recorded frame")
     good = [f for f in frames if "parts" in f]
     if not good:
         return
@@ -990,13 +1013,29 @@ def passes_report(s, frames):
         print(f"    all stages together (their union: stages overlap and are never added up): p50 {pct(busy, 50) / 1e6:.3f} ms")
 
 
+def unresolved(s, frames):
+    """Of these frames, those of no plane that is told and of no queue that is: nothing says that they are not of the plane asked for, but
+    an image that was only ever presented on others."""
+    return [f for f in frames if "plane" not in f and "queue" not in f]
+
+
+def planes_of_images(s):
+    """The planes each exported image was presented on."""
+    out = collections.defaultdict(set)
+    for f in s.frames:
+        if "plane" in f:
+            out[f["identity"]].add(f["plane"])
+    return out
+
+
 def game_plane(s, lo, hi):
-    """The plane most of the frames joined in [lo, hi] are of, and which share of them; None when there is none."""
-    planes = collections.Counter(f["plane"] for f in s.frames if "plane" in f and lo <= f["signal_end"] <= hi)
+    """The plane most of the frames joined in [lo, hi] are of, and which share of them and of those nothing is known of; None when there is none."""
+    inside = [f for f in s.frames if lo <= f["signal_end"] <= hi]
+    planes = collections.Counter(f["plane"] for f in inside if "plane" in f)
     if not planes:
         return None, 0.0
     plane, n = planes.most_common(1)[0]
-    return plane, n / sum(planes.values())
+    return plane, n / (sum(planes.values()) + len(unresolved(s, inside)))
 
 
 def queues_of(s, plane, lo, hi):
@@ -1005,12 +1044,24 @@ def queues_of(s, plane, lo, hi):
 
 
 def frames_of(s, plane, lo, hi):
-    """The frames of a plane, and those of its queues whose presentation is not told (which are not whole)."""
+    """The frames of a plane, and those whose presentation is not told: of its queues, or of none that is told either (neither is whole)."""
     inside = [f for f in s.frames if lo <= f["signal_end"] <= hi]
     if plane is None:
         return inside
-    queues = queues_of(s, plane, lo, hi)
-    return [f for f in inside if f.get("plane", plane if "queue" in f and (f["npt"].pid, f["queue"]) in queues else None) == plane]
+    queues, images = queues_of(s, plane, lo, hi), planes_of_images(s)
+
+    def mine(f):
+        if "plane" in f:
+            return f["plane"] == plane
+        if "queue" in f:
+            return (f["npt"].pid, f["queue"]) in queues
+        return plane in images.get(f["identity"], {plane})
+    return [f for f in inside if mine(f)]
+
+
+def received_alone(s, plane, lo, hi):
+    """How many presentations were sent in [lo, hi) of which no frame is recorded (of the plane)."""
+    return sum(lo <= t < hi and plane in (None, p) for t, p in s.unjoined)
 
 
 ROLES = ("wsd", "vtest", "npt", "dxmt")
@@ -1070,14 +1121,18 @@ def cadence(s, lo, hi, plane=None):
             a, b = max(lo, min(at, default=0)), max(at, default=0) + 1
         length = (b - a) / 1e9
         inside = lambda t: a <= t < b
-        for p in sorted({r.v[5] & 0xffffffff for r in every if inside(r.t)} | ({plane} if plane is not None else set())):
+        planes = {r.v[5] & 0xffffffff for r in every if inside(r.t)} | {r.v[3] for r in w.get("W_SHOWN") if inside(r.v[1])}
+        for p in sorted(planes | ({plane} if plane is not None else set())):
             if plane is not None and p != plane:
                 continue
             sent_all = [r for r in every if r.v[5] & 0xffffffff == p]
-            if not sent_all:
+            # (a frame shown in the window may have been received long before it)
+            outside = {serial: one for (of, serial), one in w.received_outside.items() if of == p}
+            if not sent_all and not outside:
                 continue
             rx = [r for r in sent_all if inside(r.t)]
-            window, ticks = sent_all[0].a & 0x3fffffff, [r for r in w.get("W_TICK") if inside(r.t) and r.v[3] == p]
+            about = sent_all[0].a if sent_all else next(iter(outside.values()))[1]
+            window, ticks = about & 0x3fffffff, [r for r in w.get("W_TICK") if inside(r.t) and r.v[3] == p]
             draws = [r for r in w.get("W_DRAW") if inside(r.t) and r.v[5] == p]
             new = [r for r in draws if not r.a >> 31 and r.v[4] != NONE]
             of_plane = [r for r in w.get("W_SHOWN") if r.v[3] == p]
@@ -1089,7 +1144,7 @@ def cadence(s, lo, hi, plane=None):
             shown = {k: t for k, t in first.items() if inside(t)}
             wg = [r.v[2] - r.v[1] for r in w.get("W_GPU") if inside(r.t) and r.v[5] == p and r.v[2] > r.v[1]]
             waits = [r.v[3] - r.v[2] for r in new]
-            sent = {r.v[1]: r.v[2] for r in sent_all}
+            sent = {serial: at for serial, (at, _) in outside.items()} | {r.v[1]: r.v[2] for r in sent_all}
             client = [t - sent[k] for k, t in shown.items() if k in sent and t > sent[k]]
             lat = [first[r.v[1]] - r.v[2] for r in new if r.v[1] in first]
             links = [r.v[2] for r in ticks if r.v[2]]
@@ -1101,7 +1156,7 @@ def cadence(s, lo, hi, plane=None):
             rate = lambda l: (len(l) - 1) / ((l[-1] - l[0]) / 1e9) if len(l) > 1 and l[-1] > l[0] else None
             states = collections.Counter(r.a >> 16 for r in ticks)
             some = lambda l, *qs, by=1e6: {f"p{q}": pct(l, q) / by if l else None for q in qs}
-            d = dict(plane=p, window=window, region=sent_all[0].a >> 30 & 1, seconds=length, received=len(rx), received_per_s=len(rx) / length,
+            d = dict(plane=p, window=window, region=about >> 30 & 1, seconds=length, received=len(rx), received_per_s=len(rx) / length,
                      replaced=sum(r.a >> 31 for r in rx), drawn=len(new), redrawn=sum(1 for r in draws if r.a >> 31),
                      no_drawable=sum(1 for r in draws if r.v[4] == NONE), shown=len(times), shown_per_s=len(times) / length,
                      shown_per_s_from_the_first_to_the_last=rate(times),
@@ -1206,7 +1261,7 @@ def main():
         queues = queues_of(s, plane, lo, hi) if plane is not None else None
         frames = frames_of(s, plane, lo, hi)
         written += frames
-        told.append(dict(title=title, lo=lo, hi=hi) | counted(s, frames))
+        told.append(dict(title=title, lo=lo, hi=hi) | counted(s, frames, received_alone(s, plane, lo, hi)))
         if plane is not None:
             told[-1].update(plane=plane, plane_share=share, queues=sorted(queues))
             print(f"\n-- plane {plane}" + (f" (of {100 * share:.1f} % of the frames joined)" if share is not None else "") + f", queues {sorted(queues)}")
@@ -1217,7 +1272,7 @@ def main():
             if plane is not None:
                 told[-1].update(production=production(s, plane, lo, hi), work=work(s, frames))
         if s.frames:
-            report(s, frames, title)
+            report(s, frames, title, told[-1]["received_without_a_frame"])
             if a.passes:
                 passes_report(s, frames)
             if a.passes or a.splits:

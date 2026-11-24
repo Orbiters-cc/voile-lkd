@@ -29,7 +29,7 @@ ended. A run whose session did not end, or that may have started one it was not 
 stops there.
 
 exit status: 0 measured, 2 did not start, 3 did not arrive, 4 did not settle or ended before a window, 5 its session did not
-end (whatever else happened), 6 refused: nothing was started.
+end (whatever else happened), 6 refused: nothing was started, 7 told to stop (SIGINT, SIGTERM, SIGHUP), and its session ended.
 
 The three frame counters are kept apart (R3), per swapchain generation (a new one at each `guest swapchain: created`):
   - guest Present: Neptune's nptunix line, `<n> presents (<m> shown events), last 60: interval avg X ms, fence wait avg
@@ -49,7 +49,7 @@ Otherwise it is kept with `valid: false` and why. `--allow-locked` scores produc
 usage: bench.py --link 'vrchat://launch?...' [--percent N] [--arg A]... [--warm 90] [--window 60] [--windows 3]
                 [--cli PATH] [--allow-locked] --out results.json
 """
-import argparse, datetime, fcntl, glob, json, os, re, subprocess, sys, threading, time, urllib.parse
+import argparse, datetime, fcntl, glob, json, math, os, re, signal, subprocess, sys, threading, time, urllib.parse
 
 HOME = os.path.expanduser("~")
 ENGINE_LOG = f"{HOME}/Library/Logs/Obelisk/Steam/wine-438100.log"
@@ -192,20 +192,71 @@ def check_link(link):
         raise Refused("the link's world and instance are not of VRChat's own grammar")
 
 
-def home_profiles():
-    """The numbers of the VRChat profiles on Home's choice; whose they are is not kept. No settings: N4N0 was never used here."""
+def strict_json(text):
+    """JSON as N4N0 (serde_json) reads it, or ValueError: what Python takes besides (NaN, Infinity, half of a surrogate pair), and a key
+    twice in one object, which each reader picks from by its own rule, are none."""
+    def one_of_each(pairs):
+        told = dict(pairs)
+        if len(told) != len(pairs):
+            raise ValueError("a key twice")
+        return told
+
+    def none(what):
+        raise ValueError(what)
+    value = json.loads(text, object_pairs_hook=one_of_each, parse_constant=none)
+    json.dumps(value, ensure_ascii=False).encode()
+    return value
+
+
+def read_file(path):
+    """The text of a file N4N0 or the engine keeps, None when there is none and its folder can be told to have none: not for a link to
+    nowhere, or a folder that cannot be looked into. OSError or ValueError for what cannot be read."""
     try:
-        with open(f"{N4N0}/settings.json") as f:
-            settings = json.load(f)
+        with open(path, encoding="utf-8") as f:
+            return f.read()
     except FileNotFoundError:
+        if os.path.lexists(path):
+            raise OSError("a link to what is not there") from None
+        folder = os.path.dirname(path)
+        if os.path.lexists(folder):
+            os.listdir(folder)
+        return None
+
+
+# What str::trim takes off (White_Space; Python's strip takes more), and what parse::<u32> takes: digits, a plus before them at the most.
+WHITE_SPACE = "\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+U32 = re.compile(r"\+?[0-9]+\Z")
+
+
+def profile_number(key):
+    """A key of N4N0's profiles as N4N0 reads it (vrchat_launch.rs, profile_keys), or None for what it drops."""
+    key = key.strip(WHITE_SPACE)
+    digits = key[1:].lstrip("0") if key.startswith("+") else key.lstrip("0")
+    if not U32.match(key) or len(digits) > 10:
+        return None
+    number = int(digits or "0")
+    return number if number < 2**32 else None
+
+
+def home_profiles():
+    """The numbers of the VRChat profiles on Home's choice; whose they are is not kept. No settings: N4N0 was never used here. Anything that
+    is not read here exactly as N4N0 reads it is refused."""
+    unknown = "how many VRChat profiles this computer uses is not known"
+    try:
+        text = read_file(f"{N4N0}/settings.json")
+        settings = None if text is None else strict_json(text)
+    except (OSError, ValueError, RecursionError) as e:
+        raise Refused(f"N4N0's settings cannot be read ({type(e).__name__}): {unknown}") from None
+    if text is None:
         return []
-    except (OSError, ValueError) as e:
-        raise Refused(f"N4N0's settings cannot be read ({type(e).__name__}): how many VRChat profiles this computer uses is not known") from None
     launch = settings.get("launch", {}) if isinstance(settings, dict) else None
     profiles = launch.get("profiles", {}) if isinstance(launch, dict) else None
-    if not isinstance(profiles, dict):
-        raise Refused("N4N0's settings are not as they are written: how many VRChat profiles this computer uses is not known")
-    return sorted(int(k) for k in profiles if k.strip().isdigit())  # (a key that is no number is none of VRChat's)
+    if not isinstance(profiles, dict) or not all(isinstance(account, str) for account in profiles.values()):
+        raise Refused(f"N4N0's settings are not as they are written: {unknown}")
+    numbers = [profile_number(key) for key in profiles]
+    if None in numbers:
+        raise Refused(f"N4N0's settings name a VRChat profile that is no number: {unknown}")
+    return sorted(numbers)
 
 
 def profile_arguments():
@@ -238,13 +289,14 @@ class Slot:
     """The one slot for a start of VRChat on this computer, as every N4N0 takes it (obelisk_cli.rs: a lock on obelisk-start-gate.lock, held
     from before a start is decided until how it ended is known), and the gate beside it. While it is held no N4N0 starts VRChat."""
 
-    def __init__(self):
-        self.file = None
+    def __init__(self, recovery=False):
+        """recovery: to put the released generation back (real_session.py), whatever is noted in it; nothing may be started with it."""
+        self.file, self.recovery, self.noted = None, recovery, ""
 
     def __enter__(self):
-        os.makedirs(N4N0, exist_ok=True)
         path = f"{N4N0}/obelisk-start-gate.lock"
         try:
+            os.makedirs(N4N0, exist_ok=True)
             self.file = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o644), "r+")
             fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -254,33 +306,44 @@ class Slot:
             self.let_go()
             raise Refused(f"the lock that keeps two VRChats from starting at once cannot be taken ({e.strerror})") from None
         try:
-            if self.file.read().strip():
-                raise Refused("a start of VRChat that N4N0 or this program made is not settled: open Orbiters - N4N0, which settles it, and wait")
-            self.gate()
+            self.noted = self.file.read().strip()
+            if not self.recovery:
+                if self.noted:
+                    raise Refused("a start of VRChat that N4N0 or this program made is not settled: open Orbiters - N4N0, which settles it, and wait")
+                self.gate()
+        except (OSError, ValueError) as e:
+            self.let_go()
+            raise Refused(f"N4N0's note of a start of VRChat cannot be read ({type(e).__name__})") from None
         except BaseException:
             self.let_go()
             raise
         return self
 
     def gate(self):
+        # (its schema is N4N0's read_kept: what that takes for uncertain, or writes again in another form, starts nothing here)
         boot, at = boot_clock()
+        number = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
         try:
-            with open(f"{N4N0}/obelisk-start-gate.json") as f:
-                kept = json.load(f)
-            until, of = kept.get("until"), kept["boot"]
-            if not isinstance(of, str) or not (until is None or isinstance(until, (int, float))):
+            text = read_file(f"{N4N0}/obelisk-start-gate.json")
+            if text is None:
+                return
+            kept = strict_json(text)
+            until, of, seen = kept.get("until"), kept["boot"], kept["seen"]
+            if not (kept["version"] == 2 and kept["version"] is not True and isinstance(of, str) and (len(of) == 36 or of.startswith("process-")) and (until is None or number(until))
+                    and isinstance(seen, dict) and all(number(x) for x in seen.values()) and len(boot) == 36):
                 raise ValueError
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError, KeyError, AttributeError):
+        except (OSError, ValueError, KeyError, AttributeError, RecursionError):
             raise Refused("N4N0's gate for a start of VRChat cannot be read: open Orbiters - N4N0, which writes it again, and wait") from None
         if of.upper() == boot and until is not None and until > at:
             raise Refused(f"the last VRChat ended early: {min(until - at, 80):.0f} s are left of the wait after it")
 
-    def say(self, session):
+    def say(self, session, program=None):
         """A start of this program's is in flight (N4N0's InFlight): whoever finds it here, this program gone, waits as after an early end."""
         boot, at = boot_clock()
         self.write(json.dumps(dict(boot=boot, started=at, session=session, program=None, until=None)))
+
+    def held(self):
+        pass
 
     def settled(self):
         self.write("")
@@ -291,6 +354,7 @@ class Slot:
             self.file.write(text)
             self.file.truncate()
             self.file.flush()
+            self.noted = text
 
     def let_go(self):
         if self.file:
@@ -302,18 +366,63 @@ class Slot:
 
 
 class HeldByCaller:
-    """The slot is held by the program that started this one (real_session.py), which says and settles what is in it."""
+    """The slot is held by the program that started this one (real_session.py), which says and settles what is in it. `note`: the file in
+    which that program, or the one that comes after it was killed, finds what was started: nothing is, where it is not there."""
+
+    def __init__(self, note=None, caller=None):
+        self.note, self.caller, self.told = note, caller, {}
 
     def __enter__(self):
+        self.held()
         return self
+
+    def held(self):
+        if self.caller and os.getppid() != self.caller:
+            raise Refused("the program that held the slot for a start is gone")
 
     def __exit__(self, *_):
         pass
 
-    def say(self, session):
-        pass
+    def say(self, session, program=None):
+        self.told = dict(session=session, program=program or self.told.get("program"))
+        if self.note:
+            with open(os.open(self.note + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                json.dump(self.told, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(self.note + ".new", self.note)
 
     settled = let_go = lambda self: None
+
+
+def born(pid):
+    """When a process was made, as ps tells it ("" for none): with its pid, which process it is."""
+    return run(["/bin/ps", "-o", "lstart=", "-p", str(pid)], 5).strip()
+
+
+class Cut:
+    """Told to stop: once, and never between a program's start and its being known, nor while what was started is ended."""
+
+    def __init__(self):
+        self.asked, self.armed = False, True
+
+    def __call__(self, *_):
+        self.asked = True
+        if self.armed:
+            self.armed = False
+            raise KeyboardInterrupt
+
+    def hold(self):
+        self.armed = False
+
+    def let(self):
+        self.armed = True
+        if self.asked:
+            self.armed = False
+            raise KeyboardInterrupt
+
+
+cut = Cut()
 
 
 JOINING = re.compile(r"\[Behaviour\] Joining (wrld_\S+)")
@@ -696,6 +805,8 @@ def main():
     except Refused as e:
         print(f"Not started: {e}", file=sys.stderr)
         return 6
+    except KeyboardInterrupt:
+        status = 7
     return status if ending["resolved"] else 5
 
 
@@ -716,6 +827,8 @@ def measure(ending):
     ap.add_argument("--picture-at", type=float, default=100, help="seconds after the arrival")
     ap.add_argument("--out", required=True)
     ap.add_argument("--slot-held", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--note", help=argparse.SUPPRESS)
+    ap.add_argument("--caller", type=int, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.percent is not None and not 1 <= a.percent <= 100:
         ap.error("--percent is the engine's percent, 1 to 100")
@@ -723,7 +836,7 @@ def measure(ending):
     wanted = destination(a.link)
     if wanted is None:
         ap.error("--link names no world and instance")
-    with (HeldByCaller() if a.slot_held else Slot()) as slot:
+    with (HeldByCaller(a.note, a.caller) if a.slot_held else Slot()) as slot:
         # Decided with the slot held: nobody else starts VRChat from here on.
         return started(a, cli, play_command(cli, a.percent, a.arg, a.link), wanted, slot, ending)
 
@@ -745,13 +858,27 @@ def started(a, cli, command, wanted, slot, ending):
         old_log = (st.st_ino, st.st_dev)
     except FileNotFoundError:
         old_log = None
-    slot.say(None)
-    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     session = {"id": None, "running_at": None}
     state = {"gpu": [], "cpu": [], "look": [], "fronted": [], "programs": {}}
     stop = threading.Event()
     status = 4
-    eng = vrc = None
+    eng = vrc = reader = None
+    cut.hold()  # (until what is started is known, and what ends it is at hand)
+    slot.held()
+    slot.say(None)
+    ending["resolved"] = False
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        ending["resolved"] = True
+        slot.settled()
+        raise
+
+    def noted(*what):
+        try:
+            slot.say(*what)
+        except OSError:
+            pass  # (what is noted stays less than what is known: whoever reads it waits)
 
     def read_events():
         for line in proc.stdout:
@@ -762,11 +889,13 @@ def started(a, cli, command, wanted, slot, ending):
             events.append((now(), e))
             told(session, e, now())
             if e.get("event") == "starting" and session["id"]:
-                slot.say(session["id"])
+                noted(session["id"])
     reader = threading.Thread(target=read_events, daemon=True)
-    reader.start()
     t_start = now()
     try:
+        noted(None, dict(pid=proc.pid, born=born(proc.pid)))
+        reader.start()
+        cut.let()
         # The game's own session: admitted (with its id), then running, an error or an exit, within a deadline, the program
         # alive.
         while session["running_at"] is None and now() - t_start < START_DEADLINE:
@@ -837,9 +966,16 @@ def started(a, cli, command, wanted, slot, ending):
         res["samples"] = samples
         return status
     finally:
+        cut.hold()
+        until = now() + CLOSE_DEADLINE
+        while cut.asked and session["id"] is None and proc.poll() is None and now() < until:
+            time.sleep(0.2)  # (its session's name, without which nothing can be asked to quit)
+        if cut.asked and session["id"] is None and proc.poll() is None:
+            proc.send_signal(signal.SIGINT)  # (it never said that it started anything)
+            time.sleep(1)
         # Always: this launch's own session, whether or not the program that started it lives, is asked to quit (never
         # forced) until its own record says how it ended, and what happened is written.
-        if proc.poll() is not None:
+        if proc.poll() is not None and reader.is_alive():
             # Its last words are read.
             reader.join(5)
         res["session"] = session["id"]
@@ -850,6 +986,8 @@ def started(a, cli, command, wanted, slot, ending):
             resolved = close(cli, None, proc, res)
         else:
             resolved = close(cli, session["id"], proc, res, refused(said))
+        # Whatever becomes of what is written below: nothing more may be started while this one may still run.
+        ending["resolved"] = resolved
         stop.set()
         for f in (eng, vrc):
             if f:
@@ -872,11 +1010,11 @@ def started(a, cli, command, wanted, slot, ending):
         for w in res["windows"]:
             print(("valid " if w["valid"] else "INVALID ") + "; ".join(w["invalid_because"]), "| submitted/s", w["guest_present"]["submitted_per_second_counted"], "interval", w["guest_present"]["interval_ms_median"], "shown/s", w["wsd_shown"]["per_second"])
         print("outcome:", res["outcome"])
-        # Whatever is returned above: nothing more may be started while this one may still run.
-        ending["resolved"] = resolved
         if resolved:
             slot.settled()
 
 
 if __name__ == "__main__":
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, cut)
     sys.exit(main())
