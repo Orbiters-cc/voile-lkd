@@ -150,6 +150,18 @@ int SetFp(lkd_task* t, int Kind, const void* Buf, size_t Len) {
 // locked under it. The host signal's handler takes no lock.
 os_unfair_lock KickLock = OS_UNFAIR_LOCK_INIT;
 std::atomic<uint32_t> KickEpoch {0}; // what KickBoostThread waits on
+GuestThread* KickedThreads {};       // KickLock
+
+// Takes a thread out of that list; with KickLock held.
+void ForgetKicked(GuestThread* T) {
+  for (GuestThread** P = &KickedThreads; *P; P = &(*P)->NextKicked) {
+    if (*P == T) {
+      *P = T->NextKicked;
+      break;
+    }
+  }
+  T->Kicked = false;
+}
 
 // Guest threads that ended, waiting for their host thread to be joined and their FEX state freed. Each thread owns a
 // FEX lookup cache (about 260 MiB of reserved address space), JIT buffers, a call-ret stack and an 8 MiB host stack; a
@@ -216,6 +228,7 @@ void EndKickBoost(GuestThread* T, pthread_t P) {
   // A kick of the task may still be on its way (LKD keeps it in wake sets): from here on it finds no thread.
   os_unfair_lock_lock(&KickLock);
   lkd_task_set_engine_data(Task, nullptr);
+  ForgetKicked(T);
   os_unfair_lock_unlock(&KickLock);
   fexdarwin_lkd_task_put(Task);
   // The main guest thread is joined by RunWithLkd itself; every other thread is reaped by a later thread creation.
@@ -253,6 +266,11 @@ void Kick(lkd_task* t) {
       T->KickBoostOver.store(false);
     }
     G->Signals->RequestStop(T);
+    if (!T->Kicked) {
+      T->Kicked = true;
+      T->NextKicked = KickedThreads;
+      KickedThreads = T;
+    }
     if (T->PThread) pthread_kill(T->PThread, KickSignal);
     if (First) {
       KickEpoch.fetch_add(1);
@@ -276,28 +294,32 @@ void* KickBoostThread(void*) {
     Seen = KickEpoch.load();
     for (bool Again = true; Again;) {
       usleep(KickBoostNs / 1000);
-      Again = !G->ThreadsLock.try_lock();
-      if (Again) continue;
-      for (GuestThread* T : G->Threads) {
+      // Under KickLock alone, which nobody holds for long: the thread to boost may hold any other lock of the engine.
+      os_unfair_lock_lock(&KickLock);
+      for (GuestThread** P = &KickedThreads; *P;) {
+        GuestThread* T = *P;
         const uint64_t Now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         const uint64_t Since = T->KickBoosted.load();
         const bool Boost = !Since && T->KickRequested.load() && !T->KickBoostOver.load();
-        if (!Since && !Boost) continue;
-        Again = true;
-        if (Now - (Boost ? T->KickNs.load(std::memory_order_relaxed) : Since) < (Boost ? KickBoostNs : KickBoostMaxNs)) continue;
-        os_unfair_lock_lock(&KickLock);
-        if (!T->PThread) {
-          // (not started yet)
-        } else if (Boost) {
+        if (!Since && !Boost) { // it has seen its kick, or was boosted for it
+          T->Kicked = false;
+          *P = T->NextKicked;
+          continue;
+        }
+        P = &T->NextKicked;
+        if (!T->PThread || Now - (Boost ? T->KickNs.load(std::memory_order_relaxed) : Since) < (Boost ? KickBoostNs : KickBoostMaxNs)) {
+          continue;
+        }
+        if (Boost) {
           SetRealTime(T->PThread, true);
           T->KickBoosted.store(Now);
         } else {
           T->KickBoostOver.store(true); // (one that waits in a system call the host signal does not end: once is enough)
           EndKickBoost(T, T->PThread);
         }
-        os_unfair_lock_unlock(&KickLock);
       }
-      G->ThreadsLock.unlock();
+      Again = KickedThreads != nullptr;
+      os_unfair_lock_unlock(&KickLock);
     }
   }
   return nullptr;
@@ -641,6 +663,7 @@ int SpawnThread(lkd_task* Child, const lkd_regs* Start) {
     // LKD drops the task on this error: forget it and free what was made for it.
     os_unfair_lock_lock(&KickLock);
     lkd_task_set_engine_data(Child, nullptr);
+    ForgetKicked(C);
     os_unfair_lock_unlock(&KickLock);
     DestroyGuestThread(C);
     return -LX_EAGAIN;
@@ -811,6 +834,8 @@ void ForkChild(lkd_task* t) {
   T->Tid = lkd_task_tid(t);
   T->PThread = pthread_self();
   KickLock = OS_UNFAIR_LOCK_INIT; // held across the fork by this thread, as another host thread
+  KickedThreads = nullptr;
+  T->Kicked = false;
   G->Signals->WithdrawStop(T);
   EndKickBoost(T, pthread_self());
   G->Threads.assign(1, T);

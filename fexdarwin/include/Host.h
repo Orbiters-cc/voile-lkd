@@ -50,6 +50,8 @@ struct GuestThread {
   std::atomic<uint64_t> KickNs {0};        // since when (CLOCK_UPTIME_RAW)
   std::atomic<uint64_t> KickBoosted {0};   // since when it is scheduled before others, 0 when it is not: LkdGlue's KickBoostThread
   std::atomic<bool> KickBoostOver {false}; // it was, for this kick, and is so no more
+  GuestThread* NextKicked {};              // in the list KickBoostThread goes through, when Kicked (KickLock)
+  bool Kicked {};
   // A guarded host page (LKD mm) opened for one instruction that reads it: DarwinSignalDelegator::BeginGuardStep.
   uint64_t GuardPages[4] {};
   int GuardN {};
