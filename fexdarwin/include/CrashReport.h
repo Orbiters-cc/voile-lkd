@@ -37,4 +37,8 @@ struct ThreadLabel {
 // thread is suspended only while its registers and frame chain are copied, and every one runs again before any symbol
 // is looked up (dladdr takes dyld's lock), so a process whose threads hold engine locks forever can still be read.
 void HostThreads(int Fd, const ThreadLabel* Labels, size_t NLabels);
+
+// Thread dump: calls F with the address of every data symbol of fexdarwin-run of that name (static ones of several files share one).
+// From the symbol table, which releases keep.
+void ForEachSymbol(const char* Name, void (*F)(const char* Name, void* Addr, void* Arg), void* Arg);
 } // namespace CrashReport

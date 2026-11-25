@@ -28,6 +28,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 thread_local GuestThread* CurrentGuestThread = nullptr;
@@ -106,10 +107,6 @@ void Say(const char* Fmt, ...) {
 // ELDEN RING's and Halloween's EAC modules keep a virtual machine's registers in the same host page as its code, and use
 // `pop [rbx]` to write them.
 bool RestartReplaysPop(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
-  uint64_t Boundary;
-  if (G->CTX->IsHostPCAtGuestInstructionBoundary(Thread, HostPC, &Boundary)) {
-    return false; // nothing of the guest instruction has run
-  }
   const uint64_t Rip = G->CTX->RestoreRIPFromHostPC(Thread, HostPC);
   const uint8_t* Code = reinterpret_cast<const uint8_t*>(FEXCore::G2H(Rip));
   size_t I = 0;
@@ -189,6 +186,7 @@ void DarwinSignalDelegator::Install() {
   // inside the handler forever, so HandleFault lets SIGBUS through where its own stores may fault. SA_ONSTACK keeps the
   // handler off the (possibly overflowed) guest-thread stack.
   Sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  SafepointPage = reinterpret_cast<uint64_t>(::mmap(nullptr, FEXCore::Utils::FEX_HOST_PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0));
   for (int S : {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE}) {
     if (sigaction(S, &Sa, nullptr) != 0) {
       fprintf(stderr, "[fexdarwin] sigaction(%d) failed: %s\n", S, strerror(errno));
@@ -235,6 +233,7 @@ void DarwinSignalDelegator::UnregisterThread(GuestThread* T) {
 void DarwinSignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, ucontext_t* Uc, uint32_t IgnoreMask) {
   bool CarryNotInverted;
   const uint64_t Rip = G->CTX->RestoreRIPFromHostPC(Thread, DarwinCtx::GetPc(Uc), &CarryNotInverted);
+  G->CTX->RestoreX87FromHostPC(Thread, DarwinCtx::GetPc(Uc));
   SpillSRAAt(Thread, Uc, IgnoreMask, Rip, CarryNotInverted);
   if (!IgnoreMask) {
     CommitRepProgress(Thread, Uc);
@@ -283,34 +282,77 @@ void DarwinSignalDelegator::InvalidateGuestCodeRange(FEXCore::Core::InternalThre
   }
 }
 
-bool DarwinSignalDelegator::RedirectFromJit(GuestThread* T, ucontext_t* Uc, uint64_t Target) {
+void DarwinSignalDelegator::RequestStop(GuestThread* T) {
+  // Released: the thread that faults on it sees what was queued before.
+  std::atomic_ref<uint64_t>(T->State->CurrentFrame->SafepointPtr).store(SafepointPage, std::memory_order_release);
+}
+
+void DarwinSignalDelegator::WithdrawStop(GuestThread* T) {
+  auto* Frame = T->State->CurrentFrame;
+  // An exchange, not a store: if it overwrites a request, what was queued before that request is seen after it. If the request
+  // comes after it, it stays.
+  std::atomic_ref<uint64_t>(Frame->SafepointPtr).exchange(reinterpret_cast<uint64_t>(&Frame->State.InlineJITBlockHeader), std::memory_order_acq_rel);
+  // (A kick between the two leaves the request without the mark: KickBoostThread passes it over, nothing else.)
+  if (T->KickRequested.exchange(false)) {
+    // FEXDARWIN_KICK_LOG=<ms>: a line for every stop that came later.
+    static const char* Log = getenv("FEXDARWIN_KICK_LOG");
+    static const uint64_t LogNs = Log ? strtoull(Log, nullptr, 10) * 1000000 : 0;
+    if (Log) {
+      const uint64_t Ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - T->KickNs.load(std::memory_order_relaxed);
+      if (Ns >= LogNs) {
+        Say("[fexdarwin] pid %d tid %d: stopped %llu us after the kick%s\n", static_cast<int>(getpid()), T->Tid,
+            (unsigned long long)(Ns / 1000), T->KickBoosted.load() ? ", boosted" : "");
+      }
+    }
+  }
+}
+
+bool DarwinSignalDelegator::StopRequested(const GuestThread* T) const {
+  return std::atomic_ref<uint64_t>(T->State->CurrentFrame->SafepointPtr).load(std::memory_order_relaxed) == SafepointPage;
+}
+
+bool DarwinSignalDelegator::PeekRegisters(const GuestThread* T, uint64_t HostPc, const uint64_t* HostGprs, uint64_t* Rip, uint64_t Gregs[16]) const {
+  if (!G->CTX->IsAddressInCodeBuffer(T->State, HostPc) || HostGprs[28] != reinterpret_cast<uint64_t>(T->State->CurrentFrame)) {
+    return false;
+  }
+  *Rip = G->CTX->RestoreRIPFromHostPC(T->State, HostPc);
+  for (size_t i = 0; i < Config.SRAGPRCount; i++) Gregs[i] = HostGprs[Config.SRAGPRMapping[i]];
+  return true;
+}
+
+bool DarwinSignalDelegator::HandleSafepoint(GuestThread* T, ucontext_t* Uc) {
   auto* Th = T->State;
   auto* Frame = Th->CurrentFrame;
-  if (!G->CTX->IsAddressInCodeBuffer(Th, DarwinCtx::GetPc(Uc))) {
-    return false; // dispatcher or host C++: the guest state is not in the host registers
+  const uint64_t PC = DarwinCtx::GetPc(Uc);
+  uint64_t Rip;
+  if (!G->CTX->IsAddressInCodeBuffer(Th, PC) || !G->CTX->SafepointAt(Th, PC, DarwinCtx::GPRs(Uc), &Rip)) {
+    return false; // nothing else accesses the page
   }
-  if (Frame->State.DeferredSignalRefCount.Load() != 0 || Frame->InSyscallInfo != 0) {
-    return false;
+  // Not in the middle of anything of the host's. None of it is open in translated code at a safe point; were it, the request stays
+  // for the next one.
+  const bool MayStop = T->Task && !T->InLkd.load() && Frame->State.DeferredSignalRefCount.Load() == 0 && Frame->InSyscallInfo == 0;
+  if (MayStop) {
+    WithdrawStop(T);
+    if (lkd_signal_pending(T->Task)) {
+      // The block is abandoned: the thread goes on from the dispatcher's own stack position, as after a synchronous fault.
+      SpillSRAAt(Th, Uc, 0, Rip, false);
+      Frame->State.callret_sp = DarwinCtx::GetReg(Uc, 25); // the calls made so far are still to return
+      DarwinCtx::SetSp(Uc, Frame->ReturningStackLocation);
+      DarwinCtx::SetReg(Uc, 0, reinterpret_cast<uint64_t>(T));
+      DarwinCtx::SetPc(Uc, reinterpret_cast<uint64_t>(&fexdarwin_kick_trampoline));
+      return true;
+    }
   }
-  // Only at the first host instruction of a guest instruction, and only where the state there is exactly x86's before it:
-  // anywhere else the translation of an x86 instruction may be half done (a register already written, flags not yet), merged
-  // with its neighbour's or still to be written to the context, and FEX's RIP reconstruction ("as close as FEX can get")
-  // would restart the instruction after the handler and apply it twice, or without what came before it. The caller retries
-  // until the thread is at a boundary (the kick retry thread resends the host signal every millisecond).
-  uint64_t BoundaryRip;
-  bool CarryNotInverted;
-  if (!G->CTX->IsHostPCAtGuestInstructionBoundary(Th, DarwinCtx::GetPc(Uc), &BoundaryRip, &CarryNotInverted)) {
-    return false;
-  }
-  SpillSRAAt(Th, Uc, 0, BoundaryRip, CarryNotInverted);
-  // The interrupted block is abandoned: restart from the dispatcher's own stack position, like a synchronous fault.
-  DarwinCtx::SetSp(Uc, Frame->ReturningStackLocation);
-  DarwinCtx::SetReg(Uc, 0, reinterpret_cast<uint64_t>(T));
-  DarwinCtx::SetPc(Uc, Target);
+  DarwinCtx::SetPc(Uc, PC + 4); // the access has no other effect than SafepointAt's
   return true;
 }
 
 void DarwinSignalDelegator::Handler(int Sig, siginfo_t* Info, void* Uctx) {
+  if (const uint64_t Addr = reinterpret_cast<uint64_t>(Info->si_addr), Page = G->Signals->SafepointPage;
+      (Sig == SIGSEGV || Sig == SIGBUS) && Addr >= Page && Addr < Page + FEXCore::Utils::FEX_HOST_PAGE_SIZE && CurrentGuestThread &&
+      G->Signals->HandleSafepoint(CurrentGuestThread, static_cast<ucontext_t*>(Uctx))) {
+    return;
+  }
   // LKD's fault-safe user copies run on guest threads and on host-only threads: let LKD recover its own faults first
   // (contract of lkd_fault_try_recover in lkd.h; our handler is installed after lkd_init).
   if ((Sig == SIGSEGV || Sig == SIGBUS) && LkdEnabled() && lkd_fault_try_recover(Uctx)) {

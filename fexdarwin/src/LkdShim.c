@@ -60,6 +60,22 @@ void fexdarwin_lkd_task_comm(lkd_task* t, char* out, unsigned long len) {
   if (len) out[i] = 0;
 }
 
+// Signal state of a task (thread dump). Read without locks: each word is right by itself.
+void fexdarwin_lkd_signal_words(const lkd_task* t, uint64_t* blocked, uint64_t* pending, uint32_t* flags, int64_t* cur_nr) {
+  *blocked = atomic_load(&t->sigmask);
+  *pending = atomic_load(&t->pending.bits);
+  *flags = atomic_load(&t->flags);
+  *cur_nr = atomic_load(&t->cur_nr);
+}
+
+// A reference on a task that is ending, for as long as its engine data is to be cleared.
+void fexdarwin_lkd_task_get(lkd_task* t) {
+  (void)lkd_task_get(t);
+}
+void fexdarwin_lkd_task_put(lkd_task* t) {
+  lkd_task_put(t);
+}
+
 // fs module (src/lkd/src/fs/lkd_fs.h): the host stdin, stdout and stderr become guest fds 0, 1, 2 of the first task.
 int lkd_fs_install_stdio(lkd_task* t);
 int fexdarwin_lkd_install_stdio(lkd_task* t) {

@@ -243,6 +243,16 @@ void CrashReport::Host(ucontext_t* Uc, uint64_t FaultAddr, CodeRegionFn Region) 
   }
 }
 
+void CrashReport::ForEachSymbol(const char* Name, void (*F)(const char* Name, void* Addr, void* Arg), void* Arg) {
+  const MainImage M = LoadMainImage();
+  for (uint32_t I = 0; I < M.NSyms; I++) {
+    const nlist_64& N = M.Syms[I];
+    if ((N.n_type & N_STAB) || (N.n_type & N_TYPE) != N_SECT || N.n_un.n_strx >= M.StrSize) continue;
+    const char* S = M.Strs + N.n_un.n_strx;
+    if (S[0] == '_' && strcmp(S + 1, Name) == 0) F(Name, reinterpret_cast<void*>(N.n_value + M.Slide), Arg);
+  }
+}
+
 void CrashReport::HostThreads(int Fd, const ThreadLabel* Labels, size_t NLabels) {
   constexpr int MaxFrames = 48;
   constexpr uint64_t NoPac = 0x0000'7fff'ffff'ffffull;

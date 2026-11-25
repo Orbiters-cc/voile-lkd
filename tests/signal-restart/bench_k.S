@@ -213,3 +213,66 @@ BEGIN b_x87copy
     fldl 8(%r14)
     fstpl 32(%r14)
 END
+/* the shortest loops: what a check of every round costs */
+BEGIN b_empty
+END
+BEGIN b_sum
+    addq (%r14),%rax
+END
+BEGIN b_bytes
+    movzbl 7(%r14),%eax
+    leaq 1(%r14),%r14
+    testl %eax,%eax
+    leaq -1(%r14),%r14
+    je 1b
+END
+BEGIN b_copy8
+    movq (%r14),%rax
+    movq %rax,0x1000(%r14)
+    movq 8(%r14),%rcx
+    movq %rcx,0x1008(%r14)
+END
+BEGIN b_nest
+    movl $4,%ecx
+2:  addl $3,%eax
+    decl %ecx
+    jnz 2b
+END
+BEGIN b_spinread
+    cmpl $0x7fffffff,0x8000(%r14)
+    je 1b
+END
+bl_empty:
+    retq
+BEGIN b_vcall
+    leaq bl_empty(%rip),%rax
+    movq %rax,0x8000(%r14)
+    callq *0x8000(%r14)
+END
+.macro REPS name op n
+BEGIN \name
+    movq %r14,%rsi
+    leaq 0x4000(%r14),%rdi
+    movl $\n,%ecx
+    \op
+END
+.endm
+REPS b_rep0 "rep movsb" 0
+REPS b_rep16 "rep movsb" 16
+REPS b_rep100 "rep movsb" 100
+REPS b_rep4k "rep movsb" 4096
+REPS b_stos100 "rep stosb" 100
+REPS b_stos4k "rep stosb" 4096
+BEGIN b_scas100
+    movl $0x55,%eax
+    movq %r14,%rdi
+    movl $100,%ecx
+    repne scasb
+END
+BEGIN b_mmx
+    movq (%r14),%mm0
+    movq 8(%r14),%mm1
+    paddd %mm1,%mm0
+    movq %mm0,16(%r14)
+END
+.section .note.GNU-stack,"",@progbits

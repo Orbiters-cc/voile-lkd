@@ -37,23 +37,31 @@ public:
   // interrupted translated code). Returns false when the guest has no usable handler for the signal.
   bool DeliverGuestSignal(GuestThread* T, ucontext_t* Uc, const GuestFault& F, bool StateIsSpilled);
 
-  // LKD kick: when the thread was interrupted inside translated code, outside any deferred-signal section and outside a
-  // syscall sequence, spill the guest registers (exact guest state at the interrupted instruction, as FEX does for
-  // asynchronous signals on Linux) and resume the host thread at Target with x0 = T. Returns false (nothing changed)
-  // in every other case; the caller retries later.
-  bool RedirectFromJit(GuestThread* T, ucontext_t* Uc, uint64_t Target);
+  // Asynchronous stops of a thread that runs translated code. RequestStop, from any thread for as long as T lives, makes it fault at
+  // its next safe point (FEXCore::Context::SafepointAt): the entry of a unit, the head of a loop, the next part of a repeated string
+  // instruction. The fault handler resumes it at the kick trampoline if a signal is pending. WithdrawStop, on the thread itself,
+  // before it looks whether one is: what is queued after that look requests a stop again.
+  void RequestStop(GuestThread* T);
+  void WithdrawStop(GuestThread* T);
+  bool StopRequested(const GuestThread* T) const;
+  // Thread dump: the guest registers of a thread whose host thread is suspended in translated code. Best effort: RIP is the start of the
+  // guest instruction the host instruction belongs to. False when it is somewhere else. Takes no lock, allocates nothing.
+  bool PeekRegisters(const GuestThread* T, uint64_t HostPc, const uint64_t* HostGprs, uint64_t* Rip, uint64_t Gregs[16]) const;
   uint64_t LoopTopFillSRA() const {
     return Config.AbsoluteLoopTopAddressFillSRA;
   }
 
 private:
   static void Handler(int Sig, siginfo_t* Info, void* Uc);
+  bool HandleSafepoint(GuestThread* T, ucontext_t* Uc);
   bool HandleFault(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc);
   bool HandleSmcWrite(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc);
   bool HandleGuestFault(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc);
   bool BeginGuardStep(GuestThread* T, ucontext_t* Uc, uint64_t Page);
   void EndGuardStep(GuestThread* T, ucontext_t* Uc);
   bool ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, uint64_t Addr, bool Write, bool InJit);
+  // What CpuStateFrame::SafepointPtr is while a stop is requested: one host page that nothing may access.
+  uint64_t SafepointPage {};
   [[noreturn]] void Crash(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc, const char* Why);
 };
 

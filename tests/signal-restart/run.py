@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Whether a signal, a suspension or a fault that is restarted leaves the interrupted program as it was, on a given engine.
-  run.py <fexdarwin-run | released> [--only TEXT] [--soak SECONDS] [--seeds N] [--work FOLDER] [--no-wine]
+  run.py <fexdarwin-run | released> [--only TEXT] [--group correct|latency|world|quit] [--soak SECONDS] [--seeds N] [--rounds N] [--load N]
+         [--work FOLDER] [--no-wine]
+Groups: correct (nothing is lost or done twice), latency (how long a stop takes: every loop shape of shapes_k.S, and through Wine's
+SuspendThread), world (a collector's stop-the-world rounds), quit (the ways a program ends, with threads running). --load N keeps N
+threads busy meanwhile: a late round is then tried once more, since the scheduler may take the thread off its core after its stop.
 Reads the other files of the installed release in place, under the library's shared lock (owned.py); writes to the work folder
 alone (a scratch folder by default). The last column is what is to be known: `pass` or `FAIL`. Exit status 0: everything passed.
 Controls are marked so: they pass on an engine that has the defects too."""
@@ -11,7 +15,8 @@ import owned
 HERE = Path(__file__).resolve().parent
 p = argparse.ArgumentParser()
 p.add_argument('engine'); p.add_argument('--only', default=''); p.add_argument('--soak', type=int, default=20); p.add_argument('--seeds', type=int, default=1)
-p.add_argument('--work', default=None); p.add_argument('--no-wine', action='store_true')
+p.add_argument('--work', default=None); p.add_argument('--no-wine', action='store_true'); p.add_argument('--group', default='')
+p.add_argument('--rounds', type=int, default=200); p.add_argument('--load', type=int, default=0)
 a = p.parse_args()
 engine = owned.released_engine() if a.engine == 'released' else Path(a.engine).resolve()
 work = Path(a.work or tempfile.mkdtemp(prefix='signal-restart.')).resolve(); bins = work / 'bin'
@@ -19,7 +24,7 @@ work = Path(a.work or tempfile.mkdtemp(prefix='signal-restart.')).resolve(); bin
 def build(seed):
     subprocess.run([str(HERE / 'build.sh'), str(bins)], check=True, env=os.environ | {'SOAK_SEED': str(seed)}, stdout=subprocess.DEVNULL)
 
-# (name, control, wine, program and arguments, engine options, least number of signals handled)
+# (name, control, wine, program and arguments, engine options, least number of signals handled, seed, group, time limit)
 KERNELS = dict(c='call/ret epilogues', p='pairs of stack operations', b='a large function with far branches', k='moves and exchanges', a='carry and flags',
                v='256-bit registers', x='x87', m='MMX', d='direction flag', i='SSE, shifts, bit tests, jcc')
 T = []
@@ -41,6 +46,7 @@ T.append(('faults that are restarted: 76 cases', False, False, ['syncfault'], []
 T.append(('faults, control: without carry, pairs, AVX...', True, False, ['syncfault', 'push_mem', 'mov_load', 'xchg_store', 'add_mem', 'neg_mem', 'shl_mem', 'xchg_mem', 'xadd_mem',
           'lock_xadd_mem', 'lock_add_mem', 'cmpxchg_mem', 'mul_mem', 'rep_lodsb', 'rep_stosb', 'rep_movsb', 'sse_load', 'bigctl'], [], 0))
 for s in range(a.seeds):
+    T.append((f'x87 stacks at a fault: 400 programs, seed {s + 1}', False, False, ['x87fault'], [], 0, s + 1))
     T.append((f'soak {s + 1}: programs, no signals', True, False, ['soak', 4, 4, '-'], [], 0, s + 1))
     T.append((f'soak {s + 1}: programs, signals, {a.soak} s', False, False, ['soak', 4, a.soak, 150], [], 50, s + 1))
 if not a.no_wine:
@@ -50,21 +56,49 @@ if not a.no_wine:
     T.append(('SuspendThread: 32-bit stack operations', False, True, ['susp32', 'p', 1500, 300, 2, 30], [], 0))
     for s in range(a.seeds):
         T.append((f'SuspendThread: soak {s + 1}, {a.soak} s', False, True, ['susp_soak', 's', 1000000, 300, 4, a.soak], [], 0, s + 1))
+SEEDED = len(T)
+names = re.findall(r'^SHAPE s_(\w+)', (HERE / 'shapes_k.S').read_text(), re.M)
+for n in names:
+    T.append((f'latency: {n}', n in ('getpid', 'sleep', 'futex'), False, ['shapes', n, 1000, 8000, 1000, 100000 if a.load else 50000], [], 0, 1, 'latency', 40))
+if not a.no_wine:
+    for n in re.findall(r'\{"(\w+)", l_', (HERE / 'shut.c').read_text()):
+        T.append((f'SuspendThread latency: {n}', False, True, ['shut', 'lat', n, 500, 8000, 10000 if a.load else 1000, 100000 if a.load else 50000], [], 0, 1, 'latency', 50))
+    for n in (20, 40):
+        T.append((f'stop the world: {n} threads, {a.rounds * 2} rounds', False, True, ['stw', a.rounds * 2, n, 1000, 120], [], 0, 1, 'world', 150))
+    T.append((f'quit: {a.rounds} times, 8 ways', False, True, ['shut', 'drv', a.rounds, 'EKRMTCPS', 20000, 2000], [], 0, 1, 'quit', a.rounds * 4 + 400))
+    T.append((f'quit after stop-the-world rounds: {a.rounds // 4} times', False, True, ['shut', 'drv', a.rounds // 4, 'G', 20000, 2000], [], 0, 1, 'quit', a.rounds * 2 + 400))
+
+def burn(n):
+    """n host threads that compute for as long as this script runs"""
+    src = work / 'burn.c'; src.write_text('#include <stdlib.h>\n#include <unistd.h>\n#include <pthread.h>\nstatic volatile double x; static void *w(void *p) { for (;;) x += 1; return p; }\n'
+        'int main(int c, char **v) { pid_t p = getppid(); for (int i = atoi(v[1]); i--;) { pthread_t t; pthread_create(&t, 0, w, 0); } while (getppid() == p) sleep(1); return 0; }\n')
+    subprocess.run(['/usr/bin/cc', '-O1', '-o', str(work / 'burn'), str(src)], check=True)
+    return subprocess.Popen([str(work / 'burn'), str(n)])
+work.mkdir(parents=True, exist_ok=True)
+burner = burn(a.load) if a.load else None
 
 print(f'engine {engine}\nwork   {work}')
 seed, bad = None, 0
 for t in T:
-    name, control, wine, argv, options, least = t[:6]; want = t[6] if len(t) > 6 else 1
-    if a.only and a.only not in name: continue
+    name, control, wine, argv, options, least = t[:6]; want = t[6] if len(t) > 6 else 1; group = t[7] if len(t) > 7 else 'correct'
+    if (a.only and a.only not in name) or (a.group and a.group != group): continue
     if seed != want: build(want); seed = want
-    limit = (a.soak + 60) if 'soak' in name else 90
+    limit = t[8] if len(t) > 8 else (a.soak + 60) if 'soak' in name else 90
     for again in (0, 1):  # a first Windows program makes its prefix
         rc, out = owned.run(engine, work, bins, argv, wine=wine, timeout=limit, options=options, out=work / (re.sub(r'\W+', '-', name) + '.log'))
-        if not (wine and rc in (142, 124) and not 'WITNESS' in out and not again): break
+        late = a.load and group == 'latency' and rc == 1
+        if not ((wine and rc in (142, 124) and not 'WITNESS' in out or late) and not again): break
     said = [l for l in out.splitlines() if l.startswith('WITNESS')]
+    if 'A loop without a safe point' in out: said, rc = ['WITNESS a loop without a safe point was compiled'], 1
     n = re.search(r'handled=(\d+)', said[-1] if said else '')
     ok = rc == 0 and bool(said) and (not least or (n and int(n[1]) >= least))
     bad += not ok
-    print(f"{'pass' if ok else 'FAIL'}  {'control ' if control else '        '}{name:48} exit {rc:3}  {said[-1][8:150] if said else '(said nothing)'}", flush=True)
+    if group == 'quit':
+        for l in out.splitlines():
+            if l.startswith(('HANG', 'BAD', 'UNKILLABLE')): print('      ' + l, flush=True)
+        frozen = len(re.findall(r'lkd: sig: signal 19 .* stops process', out))
+        if frozen: print(f'      processes stopped by a late attach SIGSTOP (lkd): {frozen}', flush=True)
+    print(f"{'pass' if ok else 'FAIL'}  {'control ' if control else '        '}{name:48} exit {rc:3}  {said[-1][8:260] if said else '(said nothing)'}", flush=True)
+if burner: burner.kill()
 print(f'{bad} failed')
 sys.exit(1 if bad else 0)

@@ -16,6 +16,9 @@ void LkdHandleSyscall(GuestThread* T, FEXCore::Core::CpuStateFrame* Frame);
 // x0 = GuestThread*, x28 = its state frame, the host stack at ReturningStackLocation and the guest registers spilled.
 extern "C" void fexdarwin_kick_trampoline();
 
+// fexdarwin-run --dump [pid...] (thread dump of processes that run, LkdGlue.cpp). Returns the exit status.
+int LkdDumpProcesses(int Argc, char** Argv);
+
 // FP state helpers shared with GuestSignals.cpp (Linux XSAVE layout, GuestSignalAbi.h).
 namespace Linux {
 struct XState;

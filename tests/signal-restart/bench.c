@@ -1,6 +1,7 @@
 /* The price of the fixes on code they touch: ns per round, the least of 15 runs. bench [NAME] */
 #include "nolibc.h"
-#define L(X) X(callret) X(prologue) X(pushpop) X(fib) X(movalu) X(div) X(carry) X(avxcopy) X(avxmath) X(avxregs) X(sse) X(x87) X(x87copy)
+#define L(X) X(callret) X(prologue) X(pushpop) X(fib) X(movalu) X(div) X(carry) X(avxcopy) X(avxmath) X(avxregs) X(sse) X(x87) X(x87copy) \
+ X(empty) X(sum) X(bytes) X(copy8) X(nest) X(spinread) X(vcall) X(rep0) X(rep16) X(rep100) X(rep4k) X(stos100) X(stos4k) X(scas100) X(mmx)
 #define D(n) void b_##n(u64, void *);
 L(D)
 static const struct { const char *n; void (*f)(u64, void *); } B[] = {

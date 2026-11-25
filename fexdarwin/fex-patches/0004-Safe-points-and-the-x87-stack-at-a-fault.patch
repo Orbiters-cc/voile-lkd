@@ -1,0 +1,1075 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 25 Nov 2026 02:30:00 +0100
+Subject: [PATCH] Safe points, and the x87 stack at a fault
+
+Safe points. An asynchronous signal stopped a thread only when it happened to interrupt it at the first host instruction of a guest
+instruction, which loops of loads, indirect jumps, helpers or string instructions hardly ever are. Now a thread that is to stop
+does so at safe points, and nowhere else: the entry of a unit and the head of every loop in it, where the guest's state is in the
+static registers and the context by the translator's own rules for blocks. A unit's entry stores the address of its header through
+CpuStateFrame::SafepointPtr, and a loop's head reads there; a stop is asked for by making that pointer one that faults.
+ - REP MOVS and STOS of 32 KiB and more run in parts of 32 KiB, with RCX, RSI and RDI as x86 has them between two. REP CMPS, SCAS
+   and LODS stop between two elements.
+ - No entry of the RIP table is a boundary to stop at any more (GuestOpcodeFlags::Exact is gone).
+ - A loop without a safe point is said when a unit is compiled.
+ - The (unused) caches of translated code get another format.
+
+The x87 stack. It was written to the context before every instruction, which converted what was only copied to 80 bits. Now what
+is not in the context is kept where the fault handler finds it, as the guest loaded it, before instructions that can fault alone
+(IR::X87Pending).
+---
+ FEXCore/Source/Interface/Context/Context.h         |   5 +-
+ FEXCore/Source/Interface/Core/CPUBackend.h         |   2 +-
+ FEXCore/Source/Interface/Core/CodeCache.cpp        |   2 +-
+ FEXCore/Source/Interface/Core/Core.cpp             |  93 ++++++++++++---
+ FEXCore/Source/Interface/Core/DiskCache.h          |   2 +-
+ FEXCore/Source/Interface/Core/JIT/DebugData.h      |   1 +
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp          |  99 ++++++++++++++--
+ FEXCore/Source/Interface/Core/JIT/JITClass.h       |   9 +-
+ FEXCore/Source/Interface/Core/JIT/MiscOps.cpp      |   6 +-
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp | 128 +++++++++++++++------
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.h   |  20 +++-
+ FEXCore/Source/Interface/IR/IR.h                   |  45 +++++++-
+ FEXCore/Source/Interface/IR/IR.json                |  12 +-
+ .../Interface/IR/Passes/RegisterAllocationPass.cpp |  33 ++----
+ .../IR/Passes/x87StackOptimizationPass.cpp         |  74 +++++++++---
+ FEXCore/include/FEXCore/Core/Context.h             |  20 ++--
+ FEXCore/include/FEXCore/Core/CoreState.h           |   7 ++
+ 17 files changed, 429 insertions(+), 129 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index da8af49..07c0aef 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -152,8 +152,9 @@ public:
+   uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) override;
+ 
+   uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, bool* CarryNotInverted = nullptr) override;
+-  bool IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t* RIP,
+-                                          bool* CarryNotInverted = nullptr) override;
++  uint64_t RIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, bool* CarryNotInverted, uint32_t* X87Pending);
++  void RestoreX87FromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
++  bool SafepointAt(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, const uint64_t* HostGPRs, uint64_t* RIP) override;
+   uint32_t ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) override;
+   void SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) override;
+ 
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 02fac99..19b1d69 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -87,7 +87,7 @@ namespace CPU {
+       uint32_t NumberOfRIPEntries;
+ 
+       // Offset after this block to the start of the RIP entries. Darwin port: their flags, two bits each, are right after
+-      // this object.
++      // this object, then the IR::X87Pending of those that have one.
+       uint32_t OffsetToRIPEntries;
+ 
+       // Shared-code modification spin-loop futex.
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index f1f7fca..4519e3b 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -278,7 +278,7 @@ struct CodeCacheHeader {
+   // Version history:
+   // 1: Initial version
+   // 2: Padding code buffer data to enable direct mapping
+-  uint32_t FormatVersion = 2;
++  uint32_t FormatVersion = 1002; // Darwin port: the 1000s
+   uint8_t FEXVersion[20] = {};
+   uint32_t NumBlocks;
+   uint32_t NumCodePages;
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 320cc7c..dc805fe 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -12,6 +12,7 @@ $end_info$
+ #ifdef ZYDIS_DISASSEMBLER
+ #include <Zydis/Zydis.h>
+ #endif
++#include "Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h"
+ #include "Interface/Core/ArchHelpers/Arm64Emitter.h"
+ #include "Interface/Core/LookupCache.h"
+ #include "Interface/Core/CPUBackend.h"
+@@ -149,12 +150,13 @@ uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thr
+   return InlineTail ? InlineTail->RIP : 0;
+ }
+ 
+-// Darwin port: walks the RIP entries of the block the thread is in. F(HostPC, RIP, Flags) of each one, until it returns false.
++// Darwin port: walks the RIP entries of a unit. F(HostPC, RIP, Flags, X87Pending) of each one, until it returns false.
+ template<typename Fn>
+ static void ForEachRIPEntry(const GetFrameBlockInfoResult& Info, uint64_t BlockBegin, Fn&& F) {
+   auto [InlineHeader, InlineTail] = Info;
+   const auto Tail = reinterpret_cast<const uint8_t*>(InlineTail);
+   const uint8_t* Flags = Tail + sizeof(*InlineTail);
++  const uint8_t* X87 = Flags + (InlineTail->NumberOfRIPEntries + 3) / 4;
+   const uint8_t* RIPEntry = Tail + InlineTail->OffsetToRIPEntries;
+   uint64_t EntryHostPC = BlockBegin;
+   uint64_t EntryGuestRIP = InlineTail->RIP;
+@@ -164,13 +166,23 @@ static void ForEachRIPEntry(const GetFrameBlockInfoResult& Info, uint64_t BlockB
+     RIPEntry += Offset.Size;
+     EntryHostPC += Offset.IntegerARMPC;
+     EntryGuestRIP += Offset.IntegerX86RIP;
+-    if (!F(EntryHostPC, EntryGuestRIP, (Flags[i / 4] >> ((i & 3) * 2)) & IR::GuestOpcodeFlags::TableMask)) {
++    const unsigned EntryFlags = (Flags[i / 4] >> ((i & 3) * 2)) & IR::GuestOpcodeFlags::TableMask;
++    uint32_t X87Pending {};
++    if (EntryFlags & IR::GuestOpcodeFlags::HasX87Pending) {
++      memcpy(&X87Pending, X87, sizeof(X87Pending));
++      X87 += sizeof(X87Pending);
++    }
++    if (!F(EntryHostPC, EntryGuestRIP, EntryFlags, X87Pending)) {
+       return;
+     }
+   }
+ }
+ 
+ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, bool* CarryNotInverted) {
++  return RIPFromHostPC(Thread, HostPC, CarryNotInverted, nullptr);
++}
++
++uint64_t ContextImpl::RIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, bool* CarryNotInverted, uint32_t* X87Pending) {
+   const auto Frame = Thread->CurrentFrame;
+   const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
+   const auto Info = GetFrameBlockInfo(Frame);
+@@ -185,7 +197,7 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
+     if (HostPC >= BlockBegin && HostPC < BlockBegin + Info.InlineTail->Size) {
+       // Reconstruct RIP from JIT entries for this block.
+       uint64_t StartingGuestRIP = Info.InlineTail->RIP;
+-      ForEachRIPEntry(Info, BlockBegin, [&](uint64_t EntryHostPC, uint64_t EntryGuestRIP, unsigned Flags) {
++      ForEachRIPEntry(Info, BlockBegin, [&](uint64_t EntryHostPC, uint64_t EntryGuestRIP, unsigned Flags, uint32_t Pending) {
+         if (HostPC < EntryHostPC) {
+           // Passed where the Host PC is at. Break now.
+           return false;
+@@ -195,6 +207,9 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
+         if (CarryNotInverted) {
+           *CarryNotInverted = (Flags & IR::GuestOpcodeFlags::CarryNotInverted) != 0;
+         }
++        if (X87Pending) {
++          *X87Pending = Pending;
++        }
+         return true;
+       });
+       return StartingGuestRIP;
+@@ -205,25 +220,72 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
+   return Frame->State.rip;
+ }
+ 
+-bool ContextImpl::IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t* RIP,
+-                                                     bool* CarryNotInverted) {
++void ContextImpl::RestoreX87FromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
++  uint32_t Desc {};
++  RIPFromHostPC(Thread, HostPC, nullptr, &Desc);
++  if (!Desc) {
++    return;
++  }
++
+   const auto Frame = Thread->CurrentFrame;
+-  const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
+-  const auto Info = GetFrameBlockInfo(Frame);
+-  if (!Info.InlineHeader || HostPC < BlockBegin || HostPC >= BlockBegin + Info.InlineTail->Size) {
++  auto& State = Frame->State;
++  const uint32_t Pushed = IR::X87Pending::Top(Desc);
++  const uint32_t Top = (State.flags[X86State::X87FLAG_TOP_LOC] + 8 - Pushed) & 7;
++  State.flags[X86State::X87FLAG_TOP_LOC] = Top;
++
++  for (uint32_t i = 0; i < 8; ++i) {
++    const auto Kind = IR::X87Pending::KindOf(Desc, i);
++    const uint32_t Reg = (Top + i) & 7;
++    const auto& Saved = Frame->X87Pending[IR::X87Pending::SlotOf(Pushed, i)];
++    switch (Kind) {
++    case IR::X87Pending::Unchanged: continue;
++    case IR::X87Pending::Empty: State.AbridgedFTW &= ~(1U << Reg); continue;
++    case IR::X87Pending::F80: memcpy(State.mm[Reg], Saved, sizeof(State.mm[Reg])); break;
++    case IR::X87Pending::Reduced: memcpy(State.mm[Reg], Saved, sizeof(uint64_t)); break;
++    case IR::X87Pending::F64: {
++      double Value;
++      memcpy(&Value, Saved, sizeof(Value));
++      const auto Wide = CPU::OpHandlers<IR::OP_F80CVTTO>::handle8(State.FCW, Value, Frame);
++      memcpy(State.mm[Reg], &Wide, sizeof(State.mm[Reg]));
++      break;
++    }
++    case IR::X87Pending::F32: {
++      float Value;
++      memcpy(&Value, Saved, sizeof(Value));
++      const auto Wide = CPU::OpHandlers<IR::OP_F80CVTTO>::handle4(State.FCW, Value, Frame);
++      memcpy(State.mm[Reg], &Wide, sizeof(State.mm[Reg]));
++      break;
++    }
++    }
++    State.AbridgedFTW |= 1U << Reg;
++  }
++}
++
++bool ContextImpl::SafepointAt(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, const uint64_t* HostGPRs, uint64_t* RIP) {
++  // What Arm64JITCore::EmitEntryPoint and EmitSafepoint end with: str TMP1, [TMP2] and ldr xzr, [TMP1].
++  constexpr uint32_t Entry = 0xF900'0000U | (CPU::TMP2.Idx() << 5) | CPU::TMP1.Idx();
++  constexpr uint32_t Loop = 0xF940'0000U | (CPU::TMP1.Idx() << 5) | 31;
++
++  auto& Header = Thread->CurrentFrame->State.InlineJITBlockHeader;
++  const uint32_t Inst = *reinterpret_cast<const uint32_t*>(HostPC);
++  if (Inst == Entry) {
++    // The header's address does not reach the context without the store.
++    Header = HostGPRs[CPU::TMP1.Idx()];
++  } else if (Inst != Loop) {
++    return false;
++  }
++
++  const auto Info = GetFrameBlockInfo(Thread->CurrentFrame);
++  if (!Info.InlineHeader || HostPC < Header || HostPC >= Header + Info.InlineTail->Size) {
+     return false;
+   }
+   bool Found = false;
+-  ForEachRIPEntry(Info, BlockBegin, [&](uint64_t EntryHostPC, uint64_t EntryGuestRIP, unsigned Flags) {
+-    if (EntryHostPC == HostPC && (Flags & IR::GuestOpcodeFlags::Exact)) {
++  ForEachRIPEntry(Info, Header, [&](uint64_t EntryHostPC, uint64_t EntryGuestRIP, unsigned, uint32_t) {
++    if (EntryHostPC == HostPC) {
+       *RIP = EntryGuestRIP;
+-      if (CarryNotInverted) {
+-        *CarryNotInverted = (Flags & IR::GuestOpcodeFlags::CarryNotInverted) != 0;
+-      }
+       Found = true;
+-      return false;
+     }
+-    return EntryHostPC <= HostPC;
++    return EntryHostPC < HostPC;
+   });
+   return Found;
+ }
+@@ -657,6 +719,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+       // Reset any block-specific state
+       Thread->OpDispatcher->EndGuestInstruction();
+       Thread->OpDispatcher->StartNewBlock();
++      Thread->OpDispatcher->SafepointIfLoopHead(Block.Entry);
+ 
+       const uint64_t InstsInBlock = Block.NumInstructions;
+       if (InstsInBlock == 0) {
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index 4899cd2..8852c48 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -249,7 +249,7 @@ namespace DiskCache {
+   // The current version of the diskcache.
+   // This must be changed any time codegen changes occur!
+   // Be aware of the impact of changing this frequently!
+-  static constexpr uint16_t FormatVersion = 43;
++  static constexpr uint16_t FormatVersion = 1043; // Darwin port: the 1000s, for what only this port emits
+ 
+   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/DebugData.h b/FEXCore/Source/Interface/Core/JIT/DebugData.h
+index 9df5514..0195423 100644
+--- a/FEXCore/Source/Interface/Core/JIT/DebugData.h
++++ b/FEXCore/Source/Interface/Core/JIT/DebugData.h
+@@ -20,6 +20,7 @@ struct DebugDataGuestOpcode {
+   uint64_t GuestEntryOffset;
+   ptrdiff_t HostEntryOffset;
+   uint8_t Flags; // IR::GuestOpcodeFlags
++  uint32_t X87Pending; // IR::X87Pending
+ };
+ 
+ /**
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 8b05104..200af5c 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -22,6 +22,7 @@ $end_info$
+ #include "Utils/MemberFunctionToPointer.h"
+ #include "Utils/variable_length_integer.h"
+ 
++#include <algorithm>
+ #include <FEXCore/Core/X86Enums.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/Utils/Allocator.h>
+@@ -822,16 +823,30 @@ void Arm64JITCore::EmitSuspendInterruptCheck() {
+ #endif
+ }
+ 
+-void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF) {
+-  // Get the address of the JITCodeHeader and store in to the core state.
+-  // Two instruction cost, each 1 cycle.
+-  adr_OrRestart(TMP1, &HeaderLabel);
+-  str(TMP1, STATE, offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader));
++// Darwin port: a thread that is to stop faults at the access through SafepointPtr, and goes on at the guest address its entry of
++// the RIP table has. Context::SafepointAt knows the two accesses by their encoding: nothing else in translated code uses TMP1 and
++// TMP2 so on that address.
++void Arm64JITCore::EmitSafepoint(uint32_t GuestEntryOffset) {
++  ldr(TMP1, STATE_PTR(CpuStateFrame, SafepointPtr));
++  DebugData->GuestOpcodes.push_back({GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin, 0, 0});
++  ldr(ARMEmitter::XReg::zr, TMP1, 0);
++}
+ 
++void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF, uint32_t GuestEntryOffset) {
++  // Darwin port: before the safe point. The trap of the instruction before this one comes before a signal, and a thread that stops
++  // and starts again here has its trap flag blocked for one instruction again (SetFlagsFromCompactedEFLAGS).
+   if (CheckTF) {
+     EmitTFCheck();
+   }
+ 
++  // Get the address of the JITCodeHeader and store in to the core state.
++  // Darwin port: through SafepointPtr, which makes it a safe point. Before anything else: the thread starts again at the unit's
++  // address, where no effect of the guest has happened and nothing is on the host stack.
++  adr_OrRestart(TMP1, &HeaderLabel);
++  ldr(TMP2, STATE_PTR(CpuStateFrame, SafepointPtr));
++  DebugData->GuestOpcodes.push_back({GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin, 0, 0});
++  str(TMP1, TMP2, 0);
++
+   if (SpillSlots) {
+     const auto TotalSpillSlotsSize = SpillSlots * MaxSpillSlotSize;
+ 
+@@ -847,6 +862,39 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
+ }
+ 
+ 
++// Darwin port: no signal, suspension or exit of the process would reach a thread in a loop of the unit without a safe point.
++bool Arm64JITCore::HasLoopWithoutSafepoint() const {
++  enum : uint8_t { Unseen, Open, Done };
++  fextl::vector<uint8_t> State(BlockHasSafepoint.size(), Unseen);
++  fextl::vector<std::pair<uint32_t, uint8_t>> Path;
++  for (uint32_t Start = 0; Start < State.size(); ++Start) {
++    if (State[Start] != Unseen || BlockHasSafepoint[Start]) {
++      continue;
++    }
++    Path.push_back({Start, 0});
++    State[Start] = Open;
++    while (!Path.empty()) {
++      auto& [Block, Next] = Path.back();
++      if (Next == 2) {
++        State[Block] = Done;
++        Path.pop_back();
++        continue;
++      }
++      const uint32_t To = Next ? BlockSuccessors[Block].second : BlockSuccessors[Block].first;
++      ++Next;
++      if (To == ~0U || BlockHasSafepoint[To] || State[To] == Done) {
++        continue;
++      }
++      if (State[To] == Open) {
++        return true;
++      }
++      State[To] = Open;
++      Path.push_back({To, 0});
++    }
++  }
++  return false;
++}
++
+ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(size_t Size) {
+   CodeBuffer::CodeBufferAllocation AllocatedInfo {};
+   LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
+@@ -906,6 +954,9 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+   CallReturnTargets.clear();
+   PendingJumpThunks.clear();
+   JumpTargets.resize(IR->GetHeader()->BlockCount, {});
++  BlockHasSafepoint.assign(IR->GetHeader()->BlockCount, false);
++  BlockSuccessors.assign(IR->GetHeader()->BlockCount, {~0U, ~0U});
++  bool HasBackwardBranch = false;
+   Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
+ 
+   CodeData.EntryPoints.clear();
+@@ -1002,10 +1053,9 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+ 
+         BindOrRestart(&IsReturnTarget->second);
+         CodeData.EntryPoints.emplace(BlockStartRIP, GetCursorAddress<uint8_t*>());
+-        DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin,
+-                                           IR::GuestOpcodeFlags::Exact});
++        DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin, 0, 0});
+ 
+-        EmitEntryPoint(JITCodeHeaderLabel, CheckTF);
++        EmitEntryPoint(JITCodeHeaderLabel, CheckTF, BlockIROp->GuestEntryOffset);
+       }
+ 
+       if (PendingCallReturnTargetLabel) {
+@@ -1019,6 +1069,19 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+     }
+ 
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
++      if (IROp->Op == IR::OP_SAFEPOINT) {
++        BlockHasSafepoint[BlockIROp->ID] = true;
++      } else if (IROp->Op == IR::OP_JUMP || IROp->Op == IR::OP_CONDJUMP) {
++        auto& [To, Else] = BlockSuccessors[BlockIROp->ID];
++        if (IROp->Op == IR::OP_JUMP) {
++          To = IR->GetOp<IR::IROp_CodeBlock>(IROp->C<IR::IROp_Jump>()->TargetBlock)->ID;
++        } else {
++          To = IR->GetOp<IR::IROp_CodeBlock>(IROp->C<IR::IROp_CondJump>()->TrueBlock)->ID;
++          Else = IR->GetOp<IR::IROp_CodeBlock>(IROp->C<IR::IROp_CondJump>()->FalseBlock)->ID;
++        }
++        // (to one that is emitted already, or itself)
++        HasBackwardBranch |= JumpTargets[To].Backward.Location || (Else != ~0U && JumpTargets[Else].Backward.Location);
++      }
+       switch (IROp->Op) {
+ #define REGISTER_OP(op, x) \
+   case FEXCore::IR::IROps::OP_##op: Op_##x(IROp, CodeNode); break
+@@ -1044,6 +1107,10 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+   }
+   PendingTargetLabel = nullptr;
+ 
++  if (HasBackwardBranch && HasLoopWithoutSafepoint()) {
++    LogMan::Msg::EFmt("A loop without a safe point in the unit at {:X}", Entry);
++  }
++
+   ARMEmitter::ForwardLabel l_ExitLink;
+   for (auto& PendingJumpThunk : PendingJumpThunks) {
+     // Align as 64-bit atomics are used on the HostCode field.
+@@ -1105,9 +1172,13 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+   //   FEXCore::Utils::vl64 GuestRIPOffset;
+   // };
+ 
+-  // Darwin port: the entries' flags come first, two bits each (IR::GuestOpcodeFlags::Exact and CarryNotInverted).
++  // Darwin port: the entries' flags come first, two bits each (IR::GuestOpcodeFlags::TableMask), then the IR::X87Pending of those
++  // that have one, then the entries.
+   const auto JITRIPFlagsBegin = JITBlockTailLocation + sizeof(JITBlockTail);
+-  const auto JITRIPEntriesBegin = JITRIPFlagsBegin + (DebugData->GuestOpcodes.size() + 3) / 4;
++  auto JITX87PendingLocation = JITRIPFlagsBegin + (DebugData->GuestOpcodes.size() + 3) / 4;
++  const auto JITRIPEntriesBegin = JITX87PendingLocation + sizeof(uint32_t) * std::ranges::count_if(DebugData->GuestOpcodes, [](const auto& GuestOpcode) {
++    return GuestOpcode.X87Pending != 0;
++  });
+   auto JITRIPEntriesLocation = JITRIPEntriesBegin;
+ 
+   {
+@@ -1130,7 +1201,13 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+       if ((i & 3) == 0) {
+         JITRIPFlagsBegin[i / 4] = 0;
+       }
+-      JITRIPFlagsBegin[i / 4] |= (GuestOpcode.Flags & IR::GuestOpcodeFlags::TableMask) << ((i & 3) * 2);
++      uint8_t Flags = GuestOpcode.Flags & IR::GuestOpcodeFlags::CarryNotInverted;
++      if (GuestOpcode.X87Pending) {
++        Flags |= IR::GuestOpcodeFlags::HasX87Pending;
++        memcpy(JITX87PendingLocation, &GuestOpcode.X87Pending, sizeof(GuestOpcode.X87Pending));
++        JITX87PendingLocation += sizeof(GuestOpcode.X87Pending);
++      }
++      JITRIPFlagsBegin[i / 4] |= Flags << ((i & 3) * 2);
+     }
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 52008b2..c045bc4 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -102,6 +102,12 @@ private:
+     return &JumpTargets[Block->ID];
+   }
+ 
++  // Darwin port: of each block, whether it has a safe point, and the blocks it goes to.
++  fextl::vector<bool> BlockHasSafepoint;
++  fextl::vector<std::pair<uint32_t, uint32_t>> BlockSuccessors;
++  [[nodiscard]]
++  bool HasLoopWithoutSafepoint() const;
++
+   fextl::map<IR::NodeID, ARMEmitter::BiDirectionalLabel> CallReturnTargets;
+ 
+   struct PendingJumpThunk {
+@@ -669,8 +675,9 @@ private:
+                   ARMEmitter::Register Divisor);
+ 
+   void EmitSuspendInterruptCheck();
++  void EmitSafepoint(uint32_t GuestEntryOffset);
+ 
+-  void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
++  void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF, uint32_t GuestEntryOffset);
+ 
+   [[nodiscard]] CodeBuffer::CodeBufferAllocation AllocateCodeBufferInSharedCache(size_t Size);
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 7a5e7ae..18c4ced 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -47,7 +47,11 @@ DEF_OP(WFET) {
+ DEF_OP(GuestOpcode) {
+   auto Op = IROp->C<IR::IROp_GuestOpcode>();
+   // metadata
+-  DebugData->GuestOpcodes.push_back({Op->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin, Op->Flags});
++  DebugData->GuestOpcodes.push_back({Op->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin, Op->Flags, Op->X87Pending});
++}
++
++DEF_OP(Safepoint) {
++  EmitSafepoint(IROp->C<IR::IROp_Safepoint>()->GuestEntryOffset);
+ }
+ 
+ DEF_OP(Fence) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index f9823c5..ff405c9 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3460,20 +3460,51 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
+     // FEX doesn't support partial faulting REP instructions.
+     // Converting this to a `MemSet` IR op optimizes this quite significantly in our codegen.
+     // If FEX is to gain support for faulting REP instructions, then this implementation needs to change significantly.
+-    Ref Src = LoadGPRRegister(X86State::REG_RAX, Size);
+-    Ref Dest = LoadGPRRegister(X86State::REG_RDI, AddrSize);
++    RepeatInParts(Op, Size, AddrSize, [&](Ref Counter) {
++      Ref Src = LoadGPRRegister(X86State::REG_RAX, Size);
++      Ref Dest = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+ 
+-    // Only ES prefix
+-    auto Segment = GetSegment(0, FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+-
+-    Ref Counter = LoadGPRRegister(X86State::REG_RCX, AddrSize);
++      // Only ES prefix
++      auto Segment = GetSegment(0, FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+ 
+-    auto Result = _MemSet(CTX->IsAtomicTSOEnabled(), Size, Segment ?: InvalidNode, Dest, Src, Counter, LoadDir(1));
+-    StoreGPRRegister(X86State::REG_RCX, Constant(0));
+-    StoreGPRResultWithZExtSemantics(X86State::REG_RDI, Result, AddrSize);
++      auto Result = _MemSet(CTX->IsAtomicTSOEnabled(), Size, Segment ?: InvalidNode, Dest, Src, Counter, LoadDir(1));
++      StoreGPRResultWithZExtSemantics(X86State::REG_RDI, Result, AddrSize);
++    });
+   }
+ }
+ 
++// Darwin port: REP MOVS and STOS run as one operation of the JIT, which a thread that is to stop would sit in for as long as it
++// takes. A long one is made of parts: each writes RCX, RSI and RDI as x86 has them when it stops there, and there is a safe point
++// between two. No flag changes. Body(Counter) does Counter elements and stores all but RCX.
++template<typename F>
++void OpDispatchBuilder::RepeatInParts(OpcodeArgs, IR::OpSize Size, IR::OpSize AddrSize, F&& Body) {
++  constexpr uint32_t PartBytesLog2 = 15;
++  const uint32_t PartLog2 = PartBytesLog2 - FEXCore::ilog2(IR::OpSizeToSize(Size));
++
++  Ref Parts = _Lshr(AddrSize, LoadGPRRegister(X86State::REG_RCX, AddrSize), Constant(PartLog2));
++  auto LongJump = CondJump(Parts);
++
++  auto ShortBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++  SetFalseJumpTarget(LongJump, ShortBlock);
++
++  auto LongBlock = CreateNewCodeBlockAtEnd();
++  SetTrueJumpTarget(LongJump, LongBlock);
++  SetCurrentCodeBlock(LongBlock);
++  StartNewBlock();
++  Safepoint(Op->PC);
++  Body(Constant(1U << PartLog2));
++  Ref Left = Sub(AddrSize, LoadGPRRegister(X86State::REG_RCX, AddrSize), 1U << PartLog2);
++  StoreGPRResultWithZExtSemantics(X86State::REG_RCX, Left, AddrSize);
++  auto AgainJump = CondJump(_Lshr(AddrSize, Left, Constant(PartLog2)));
++  SetTrueJumpTarget(AgainJump, LongBlock);
++  SetFalseJumpTarget(AgainJump, ShortBlock);
++
++  SetCurrentCodeBlock(ShortBlock);
++  StartNewBlock();
++  Body(LoadGPRRegister(X86State::REG_RCX, AddrSize));
++  StoreGPRRegister(X86State::REG_RCX, Constant(0));
++}
++
+ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
+   const bool Repeat = Op->Flags & (FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX | FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX);
+   if ((!Is64BitMode || Repeat) && (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE)) {
+@@ -3488,36 +3519,36 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
+   const auto AddrSize = GetStringOpSize(Op);
+ 
+   if (Repeat) {
+-    auto SrcAddr = LoadGPRRegister(X86State::REG_RSI);
+-    auto DstAddr = LoadGPRRegister(X86State::REG_RDI);
+-    auto Counter = LoadGPRRegister(X86State::REG_RCX);
++    RepeatInParts(Op, Size, GetGPROpSize(), [&](Ref Counter) {
++      auto SrcAddr = LoadGPRRegister(X86State::REG_RSI);
++      auto DstAddr = LoadGPRRegister(X86State::REG_RDI);
+ 
+-    auto DstSegment = GetSegment(0, FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+-    auto SrcSegment = GetSegment(Op->Flags, FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX);
++      auto DstSegment = GetSegment(0, FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
++      auto SrcSegment = GetSegment(Op->Flags, FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+ 
+-    if (DstSegment) {
+-      DstAddr = Add(OpSize::i64Bit, DstAddr, DstSegment);
+-    }
++      if (DstSegment) {
++        DstAddr = Add(OpSize::i64Bit, DstAddr, DstSegment);
++      }
+ 
+-    if (SrcSegment) {
+-      SrcAddr = Add(OpSize::i64Bit, SrcAddr, SrcSegment);
+-    }
++      if (SrcSegment) {
++        SrcAddr = Add(OpSize::i64Bit, SrcAddr, SrcSegment);
++      }
+ 
+-    Ref Result_Src = _AllocateGPR(false);
+-    Ref Result_Dst = _AllocateGPR(false);
+-    _MemCpy(CTX->IsAtomicTSOEnabled(), Size, DstAddr, SrcAddr, Counter, LoadDir(1), Result_Dst, Result_Src);
++      Ref Result_Src = _AllocateGPR(false);
++      Ref Result_Dst = _AllocateGPR(false);
++      _MemCpy(CTX->IsAtomicTSOEnabled(), Size, DstAddr, SrcAddr, Counter, LoadDir(1), Result_Dst, Result_Src);
+ 
+-    if (DstSegment) {
+-      Result_Dst = Sub(OpSize::i64Bit, Result_Dst, DstSegment);
+-    }
++      if (DstSegment) {
++        Result_Dst = Sub(OpSize::i64Bit, Result_Dst, DstSegment);
++      }
+ 
+-    if (SrcSegment) {
+-      Result_Src = Sub(OpSize::i64Bit, Result_Src, SrcSegment);
+-    }
++      if (SrcSegment) {
++        Result_Src = Sub(OpSize::i64Bit, Result_Src, SrcSegment);
++      }
+ 
+-    StoreGPRRegister(X86State::REG_RCX, Constant(0));
+-    StoreGPRRegister(X86State::REG_RDI, Result_Dst);
+-    StoreGPRRegister(X86State::REG_RSI, Result_Src);
++      StoreGPRRegister(X86State::REG_RDI, Result_Dst);
++      StoreGPRRegister(X86State::REG_RSI, Result_Src);
++    });
+   } else {
+     Ref RSI = AppendSegmentOffset(LoadGPRRegister(X86State::REG_RSI, AddrSize), Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+     Ref RDI = AppendSegmentOffset(LoadGPRRegister(X86State::REG_RDI, AddrSize), 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+@@ -3607,6 +3638,8 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
+       SetCurrentCodeBlock(LoopHeader);
+       StartNewBlock();
+       SetJumpTarget(JumpIntoLoop, LoopHeader);
++      // Darwin port: RCX is not 0 here, so the instruction compares again and sets every flag after a stop.
++      Safepoint(Op->PC);
+ 
+       // Working loop
+       {
+@@ -3714,7 +3747,7 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
+     // Calculate flags early. because end of block
+     CalculateDeferredFlags();
+ 
+-    ForeachDirection([this, Size, AddrSize](int32_t PtrDir) {
++    ForeachDirection([this, Op, Size, AddrSize](int32_t PtrDir) {
+       // XXX: Theoretically LODS could be optimized to
+       // RSI += {-}(RCX * Size)
+       // RAX = [RSI - Size]
+@@ -3727,6 +3760,7 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
+       SetJumpTarget(JumpStart, LoopStart);
+       SetCurrentCodeBlock(LoopStart);
+       StartNewBlock();
++      Safepoint(Op->PC);
+ 
+       Ref Counter = LoadGPRRegister(X86State::REG_RCX);
+ 
+@@ -3819,6 +3853,7 @@ void OpDispatchBuilder::SCASOp(OpcodeArgs) {
+       SetJumpTarget(JumpStart, LoopStart);
+       SetCurrentCodeBlock(LoopStart);
+       StartNewBlock();
++      Safepoint(Op->PC);
+ 
+       Ref Counter = LoadGPRRegister(X86State::REG_RCX);
+ 
+@@ -4234,6 +4269,33 @@ void OpDispatchBuilder::CreateJumpBlocks(const fextl::vector<FEXCore::Frontend::
+ 
+     PrevCodeBlock = CodeNode;
+   }
++
++  // Darwin port: a loop of the unit goes through the target of a branch to itself or backwards (the blocks follow each other in
++  // the order of their addresses).
++  for (auto& Block : *Blocks) {
++    if (!Block.NumInstructions) {
++      continue;
++    }
++    const auto& Last = Block.DecodedInstructions[Block.NumInstructions - 1];
++    if (!Last.TableInfo || !(Last.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP) ||
++        (Last.TableInfo->Flags & X86Tables::InstFlags::FLAGS_CALL) || // leaves the unit
++        !(Last.Src[0].IsLiteral() || Last.Src[0].IsLiteralPatchable())) {
++      continue;
++    }
++    uint64_t Target = Last.PC + Last.InstSize + Last.Src[0].Literal();
++    if (!Is64BitMode) {
++      Target &= 0xFFFFFFFFU;
++    }
++    if (auto It = JumpTargets.find(Target); Target <= Last.PC && It != JumpTargets.end()) {
++      It->second.IsLoopHead = true;
++    }
++  }
++}
++
++void OpDispatchBuilder::SafepointIfLoopHead(uint64_t RIP) {
++  if (auto It = JumpTargets.find(RIP); It != JumpTargets.end() && It->second.IsLoopHead) {
++    Safepoint(RIP);
++  }
+ }
+ 
+ void OpDispatchBuilder::BeginFunction(uint64_t RIP, const fextl::vector<FEXCore::Frontend::Decoder::DecodedBlocks>* Blocks,
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 88a9f0a..7c8a65f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -146,6 +146,14 @@ public:
+     SetCurrentCodeBlock(it->second.BlockEntry);
+   }
+ 
++  // Darwin port: at the start of a block that is gone back to. The block's start is the guest's state before the instruction at
++  // RIP: all of it is in the static registers and the context between blocks (FlushRegisterCache), the carry inverted.
++  void Safepoint(uint64_t RIP) {
++    _Safepoint(RIP - Entry);
++  }
++  // Darwin port: the same at the start of the block of RIP, if a branch of the unit goes back there.
++  void SafepointIfLoopHead(uint64_t RIP);
++
+   void StartNewBlock() {
+     // The host bases of the previous block's values are not visible here.
+     ForgetHostBases();
+@@ -465,6 +473,8 @@ public:
+   void IMUL2SrcOp(OpcodeArgs);
+   void IMULOp(OpcodeArgs);
+   void STOSOp(OpcodeArgs);
++  template<typename F>
++  void RepeatInParts(OpcodeArgs, IR::OpSize Size, IR::OpSize AddrSize, F&& Body);
+   void MOVSOp(OpcodeArgs);
+   void CMPSOp(OpcodeArgs);
+   void LODSOp(OpcodeArgs);
+@@ -1330,22 +1340,21 @@ public:
+     RegCache.Partial = Partial;
+   }
+ 
+-  // Darwin port: the marker of a guest instruction, after the flush of the static registers. A thread may be stopped by a
+-  // signal or a fault and start again at the instruction, from the static registers and the context alone
+-  // (Context::IsHostPCAtGuestInstructionBoundary, Context::RestoreRIPFromHostPC).
++  // Darwin port: the marker of a guest instruction, after the flush of the static registers. A thread starts again at the
++  // instruction after a fault in it, from the static registers and the context alone (Context::RestoreRIPFromHostPC).
+   void BeginGuestInstruction(uint32_t EntryOffset, bool CanFault) {
+     if (CanFault) {
+       WritePendingContext();
+     }
+     CurrentGuestInstruction = EntryOffset;
+-    _GuestOpcode(EntryOffset, (RegCache.Written == 0 ? GuestOpcodeFlags::Exact : 0) | (CFInverted ? 0 : GuestOpcodeFlags::CarryNotInverted));
++    _GuestOpcode(EntryOffset, (CanFault ? GuestOpcodeFlags::CanFault : 0) | (CFInverted ? 0 : GuestOpcodeFlags::CarryNotInverted));
+   }
+ 
+   // Darwin port: the same instruction goes on where the form of the carry has changed, so that a fault in the rest of it finds
+   // the one there.
+   void ContinueGuestInstruction() {
+     if (CurrentGuestInstruction) {
+-      _GuestOpcode(*CurrentGuestInstruction, CFInverted ? 0 : GuestOpcodeFlags::CarryNotInverted);
++      _GuestOpcode(*CurrentGuestInstruction, GuestOpcodeFlags::Continued | (CFInverted ? 0 : GuestOpcodeFlags::CarryNotInverted));
+     }
+   }
+   void EndGuestInstruction() {
+@@ -1411,6 +1420,7 @@ private:
+     Ref BlockEntry;
+     bool HaveEmitted;
+     bool IsEntryPoint;
++    bool IsLoopHead {}; // Darwin port: the target of a backward branch
+   };
+ 
+   FEXCore::Context::ContextImpl* CTX {};
+diff --git a/FEXCore/Source/Interface/IR/IR.h b/FEXCore/Source/Interface/IR/IR.h
+index 60c5dbb..4358fa4 100644
+--- a/FEXCore/Source/Interface/IR/IR.h
++++ b/FEXCore/Source/Interface/IR/IR.h
+@@ -19,18 +19,51 @@
+ 
+ namespace FEXCore::IR {
+ 
+-// Darwin port: what a GuestOpcode says of the point where a guest instruction begins.
++// Darwin port: what a GuestOpcode says of the point where a guest instruction begins, from which a thread starts again after a
++// fault in the instruction that the guest resolves (Context::RestoreRIPFromHostPC).
+ namespace GuestOpcodeFlags {
+   enum : uint8_t {
+-    // All effects of the instructions before it have happened there, in the static registers and the context, and none of its
+-    // own: a thread stopped there can start again at the instruction. Passes that move effects over it take this away.
+-    Exact = 1 << 0,
+     // The host's carry is the guest's, not its opposite (OpDispatchBuilder::CFInverted is not set).
+-    CarryNotInverted = 1 << 1,
++    CarryNotInverted = 1 << 0,
++    // The entry has an X87Pending.
++    HasX87Pending = 1 << 1,
+     // What the RIP table keeps.
+-    TableMask = Exact | CarryNotInverted,
++    TableMask = CarryNotInverted | HasX87Pending,
++
++    // A fault in the instruction can be reported: the context is to hold there what a thread needs to start again.
++    CanFault = 1 << 2,
++    // The instruction has begun before, only the form of the carry has changed.
++    Continued = 1 << 3,
+   };
+ } // namespace GuestOpcodeFlags
++
++// Darwin port: the x87 stack at a guest instruction that can fault, where the context does not hold it yet (the x87 pass keeps
++// it in registers and forgets most of the 80 bit values). Written to the context when the fault comes
++// (Context::RestoreRIPFromHostPC), from CpuStateFrame::X87Pending, which holds the values as the guest loaded them.
++//  - Bits 2 to 0: how often the stack was pushed since the context's top, modulo 8.
++//  - Bits 5 to 3 for the new top, 8 to 6 for the register after it...: its Kind.
++namespace X87Pending {
++  enum Kind : uint32_t {
++    Unchanged = 0,
++    Empty = 1,
++    F80 = 2,
++    F64 = 3,
++    F32 = 4,
++    // Reduced precision, where the context holds doubles.
++    Reduced = 5,
++  };
++  constexpr uint32_t Is = 1U << 31;
++  constexpr uint32_t Top(uint32_t Desc) {
++    return Desc & 7;
++  }
++  constexpr uint32_t KindOf(uint32_t Desc, uint32_t i) {
++    return (Desc >> (3 + 3 * i)) & 7;
++  }
++  // Where in CpuStateFrame::X87Pending the value of register i from the top is. The same for as long as it stays in its register.
++  constexpr uint32_t SlotOf(uint32_t Top, uint32_t i) {
++    return (i + 8 - Top) & 7;
++  }
++} // namespace X87Pending
+ // Darwin port: bit 7 of the OffsetScale of LoadMem, StoreMem, LoadMemTSO and StoreMemTSO marks an Addr that is already a host
+ // address (OpDispatchBuilder::HostBase): the backend does not add the guest base to it. It is on the memory operation, not
+ // on the address value, because the register allocator replaces a spilled value by a fill that no longer says what it was.
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index fd91c41..94a5aa9 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -190,9 +190,17 @@
+         "JITDispatchOverride": "NoOp"
+       },
+ 
+-      "GuestOpcode u32:$GuestEntryOffset, u8:$Flags": {
++      "GuestOpcode u32:$GuestEntryOffset, u8:$Flags, u32:$X87Pending{0}": {
+         "Desc": ["Marks the beginning of a guest opcode",
+-                 "Darwin port: Flags is IR::GuestOpcodeFlags"
++                 "Darwin port: Flags is IR::GuestOpcodeFlags, X87Pending IR::X87Pending"
++                ],
++        "HasSideEffects": true
++      },
++
++      "Safepoint u32:$GuestEntryOffset": {
++        "Desc": ["Darwin port: where a thread that is to stop does (Context::SafepointAt), first in a block that is gone back to",
++                 "Every effect of the guest up to GuestEntryOffset has happened there, in the static registers and the context,",
++                 "and none after it"
+                 ],
+         "HasSideEffects": true
+       },
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index 4e13c1c..b061f9d 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -65,7 +65,6 @@ public:
+   void AddRegisters(IR::RegClass Class, uint32_t RegisterCount) override;
+   bool TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp, bool SameInstruction);
+   bool RestCannotFault(Ref Node);
+-  void MarkInexactBetween(Ref LastNode, Ref CodeNode);
+ 
+ private:
+   RegisterClassData Classes[IR::NumClasses];
+@@ -557,30 +556,17 @@ bool ConstrainedRAPass::RestCannotFault(Ref Node) {
+   }
+ }
+ 
+-// Darwin port: the guest instructions that begin after LastNode, up to CodeNode, begin no more where the state is theirs.
+-void ConstrainedRAPass::MarkInexactBetween(Ref LastNode, Ref CodeNode) {
+-  for (Ref Node = IR->GetNode(CodeNode->Header.Previous); Node != LastNode; Node = IR->GetNode(Node->Header.Previous)) {
+-    auto Header = IR->GetOp<IROp_Header>(Node);
+-    if (Header->Op == OP_GUESTOPCODE) {
+-      Header->CW<IROp_GuestOpcode>()->Flags &= ~GuestOpcodeFlags::Exact;
+-    }
+-  }
+-}
+-
+-// Darwin port: SameInstruction is false when a guest instruction begins between the two operations. A guest instruction is a
+-// point where an asynchronous signal may be delivered, and from which the thread starts again after it
+-// (Context::IsHostPCAtGuestInstructionBoundary), and the point where a fault in it is reported, from which the thread may
+-// start again too. A merge that moves an effect over it makes it no such point: the `ret` of `pop rbx; ret`, merged into the
+-// pop before it, returned twice when a signal came between the two.
++// Darwin port: SameInstruction is false when a guest instruction begins between the two operations. A fault in an instruction is
++// reported where it begins, from where the thread may start again (Context::RestoreRIPFromHostPC); a merge must not move an effect
++// over the beginning of an instruction where a fault can be reported.
+ //
+-//  - Two pushes or pops become one operation at the place of the first, so the second instruction begins with its stack effect
+-//    done. It loses its Exact flag. A fault in the merged operation is reported at the first instruction with neither effect
+-//    done (Push, Pop and their pairs access memory before they write a register). Nothing after it in the second instruction
+-//    may fault, which would be reported there.
+-//  - A move merged into the next operation, which overwrites its result, happens late: the second instruction begins without
+-//    it and loses its Exact flag. If the first one is the move alone, its own entry is at the same place and is still true.
++//  - Two pushes or pops become one operation at the place of the first. A fault in the merged operation is reported at the first
++//    instruction with neither effect done (Push, Pop and their pairs access memory before they write a register). Nothing after it
++//    in the second instruction may fault, which would be reported there.
++//  - A move merged into the next operation, which overwrites its result, happens late: the second instruction begins without it.
+ //    The operation may not fault, which would be reported there. Nothing is left undone after it.
+ //  - The rest moves no effect and keeps the first instruction's.
++// A signal stops no thread there: that happens at safe points alone, which begin a block.
+ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp, bool SameInstruction) {
+   auto LastOp = IR->GetOp<IROp_Header>(LastNode);
+ 
+@@ -594,7 +580,6 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+         SP != PhysicalRegister(LastOp->Args[0]) && Push->ValueSize >= OpSize::i32Bit &&
+         (SameInstruction || RestCannotFault(CodeNode))) {
+ 
+-      MarkInexactBetween(LastNode, CodeNode);
+       IREmit->SetWriteCursorBefore(LastNode);
+       IREmit->_PushTwo(IROp->Size, Push->ValueSize, IROp->Args[0], LastOp->Args[0], IROp->Args[1]);
+       IREmit->RemovePostRA(CodeNode);
+@@ -605,7 +590,6 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+ 
+     if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0]) &&
+         (SameInstruction || RestCannotFault(CodeNode))) {
+-      MarkInexactBetween(LastNode, CodeNode);
+       IREmit->SetWriteCursorBefore(LastNode);
+       IREmit->_PopTwo(IROp->Size, IROp->Args[0], LastOp->Args[1], IROp->Args[1]);
+       IREmit->RemovePostRA(CodeNode);
+@@ -643,7 +627,6 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+   // Note we rely on the short-circuiting here.
+   if ((SameInstruction || CannotFault(IROp->Op)) && PhysicalRegister(LastNode) == PhysicalRegister(CodeNode) &&
+       KillMove(LastOp, IROp, LastNode, CodeNode)) {
+-    MarkInexactBetween(LastNode, CodeNode);
+     LOGMAN_THROW_A_FMT(!PhysicalRegister(CodeNode).IsInvalid(), "invariant");
+ 
+     int NumArgs = IR::GetRAArgs(IROp->Op);
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index a4d00b7..db17ea1 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -68,7 +68,7 @@ public:
+ 
+   FixedSizeStack() = default;
+ 
+-  // Darwin port: whether it has changed since the context last held it (X87StackOptimization::IsPending).
++  // Darwin port: whether it has changed since the context last held it.
+   bool Dirty = false;
+ 
+   void push(const T& Value) {
+@@ -286,8 +286,12 @@ private:
+   // Returns a new value for Top, that's synchronized between the simulated stack
+   // and the actual FPU stack.
+   Ref SynchronizeStackValues();
+-  // Darwin port: whether the context does not hold the x87 state of this point.
+-  bool IsPending() const;
++  // Darwin port: stores the values of the stack that are not in the context in CpuStateFrame::X87Pending, as cheaply as they are
++  // known. Returns their IR::X87Pending.
++  uint32_t SavePendingValues();
++  std::array<Ref, 8> SavedPending {};
++  // The IR::X87Pending of the guest instruction that is being translated.
++  uint32_t PendingHere = 0;
+   // Moves us from the fast to the slow path if ShouldMigrate is true.
+   void MigrateToSlowPathIf(bool ShouldMigrate);
+   // Top Cache Management
+@@ -372,9 +376,40 @@ private:
+ 
+ inline const X87StackOptimization::StackMemberInfo X87StackOptimization::StackMemberInfo::Invalid {nullptr};
+ 
+-inline bool X87StackOptimization::IsPending() const {
+-  return FlushTopPending || FlushValidPending || std::any_of(FlushValuesPending.begin(), FlushValuesPending.end(), [](bool P) { return P; }) ||
+-         (!SlowPath && StackData.Dirty);
++inline uint32_t X87StackOptimization::SavePendingValues() {
++  const uint32_t Top = StackData.TopOffset & 7;
++  uint32_t Desc = X87Pending::Is | Top;
++
++  for (uint32_t i = 0; i < StackData.size; ++i) {
++    const auto& [Type, Member] = StackData.top(i);
++    uint32_t Kind = X87Pending::Unchanged;
++
++    if (Type == StackSlot::INVALID) {
++      Kind = X87Pending::Empty;
++    } else if (Type == StackSlot::VALID) {
++      Ref Value = Member.StackDataNode;
++      auto Size = OpSize::i128Bit;
++      Kind = X87Pending::F80;
++      if (ReducedPrecisionMode) {
++        Size = OpSize::i64Bit;
++        Kind = X87Pending::Reduced;
++      } else if (Member.Source && (Member.Source->Size == OpSize::i64Bit || Member.Source->Size == OpSize::i32Bit)) {
++        // Without the conversion to 80 bits, which nothing may need.
++        Value = Member.Source->Node;
++        Size = Member.Source->Size;
++        Kind = Size == OpSize::i64Bit ? X87Pending::F64 : X87Pending::F32;
++      }
++
++      const auto Slot = X87Pending::SlotOf(Top, i);
++      if (SavedPending[Slot] != Value) {
++        IREmit->_StoreContextFPR(Size, Value, offsetof(FEXCore::Core::CpuStateFrame, X87Pending) + Slot * 16);
++        SavedPending[Slot] = Value;
++      }
++    }
++    Desc |= Kind << (3 + 3 * i);
++  }
++
++  return Desc;
+ }
+ 
+ inline void X87StackOptimization::InvalidateCaches() {
+@@ -394,6 +429,8 @@ inline void X87StackOptimization::InvalidateCachedRegs() {
+ inline void X87StackOptimization::Reset() {
+   SlowPath = false;
+   StackData.clear();
++  SavedPending.fill(nullptr);
++  PendingHere = 0;
+   InvalidateCaches();
+ }
+ 
+@@ -772,13 +809,18 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+     IREmit->SetCurrentCodeBlock(BlockNode);
+     for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
+-      // Darwin port: a thread may start again at a guest instruction from what the context holds (GuestOpcodeFlags::Exact).
+-      // Written before every one, whether it can fault or not: most of the time of x87 code is spent in the helpers, where no
+-      // signal is delivered, and a thread that has few places where one is waits long for it.
+-      if (IROp->Op == OP_GUESTOPCODE && IsPending()) {
+-        IREmit->SetWriteCursorBefore(CodeNode);
+-        SynchronizeStackValues();
+-        FlushCachedRegs();
++      // Darwin port: a thread may start again at a guest instruction that faults, so what is not in the context there is made
++      // known. On the slow path it is written: it holds the values as the context does.
++      if (IROp->Op == OP_GUESTOPCODE) {
++        auto Op = IROp->CW<IROp_GuestOpcode>();
++        if (Op->Flags & GuestOpcodeFlags::CanFault) {
++          IREmit->SetWriteCursorBefore(CodeNode);
++          FlushCachedRegs();
++          PendingHere = !SlowPath && StackData.Dirty ? SavePendingValues() : 0;
++        } else if (!(Op->Flags & GuestOpcodeFlags::Continued)) {
++          PendingHere = 0;
++        }
++        Op->X87Pending = PendingHere;
+       }
+ 
+       if (!LoweredX87(IROp->Op)) {
+@@ -1264,10 +1306,8 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+     auto [LastCodeNode, LastIROp] = Last();
+     LOGMAN_THROW_A_FMT(IsBlockExit(LastIROp->Op), "must be exit");
+     IREmit->SetWriteCursorBefore(LastCodeNode);
+-    if (IsPending()) {
+-      SynchronizeStackValues();
+-      FlushCachedRegs();
+-    }
++    SynchronizeStackValues();
++    FlushCachedRegs();
+   }
+ }
+ 
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 648546b..a1086eb 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -89,14 +89,18 @@ public:
+   // blocks, which ReconstructCompactedEFLAGS expects, but not between every two instructions of one.
+   FEX_DEFAULT_VISIBILITY virtual uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC,
+                                                                bool* CarryNotInverted = nullptr) = 0;
+-  // Darwin port: true when HostPC is the first host instruction of the translation of a guest instruction, and the guest state
+-  // held in the host registers and the context there is exactly the one x86 has before that instruction (but for flags that
+-  // are never read): everything the instructions before it do has been done and nothing of its own. *RIP is the address of
+-  // that instruction. Only then may an asynchronous signal interrupt translated code, since the thread starts again at *RIP
+-  // after it. Instructions whose effects were merged with a neighbour's, and those before which something is still to be
+-  // written to the context, are no such points (IR::GuestOpcodeFlags::Exact).
+-  FEX_DEFAULT_VISIBILITY virtual bool IsHostPCAtGuestInstructionBoundary(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC,
+-                                                                         uint64_t* RIP, bool* CarryNotInverted = nullptr) = 0;
++  // Darwin port: writes the part of the x87 stack to the context that it does not hold at the guest instruction the thread faulted
++  // in (IR::X87Pending). Once, before the thread leaves the block.
++  FEX_DEFAULT_VISIBILITY virtual void RestoreX87FromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) = 0;
++  // Darwin port: where a thread running translated code stops for an asynchronous signal. Nowhere else: the state in the middle of
++  // a block is not x86's. The frontend makes CpuStateFrame::SafepointPtr an address that faults, from any thread. Every unit's entry
++  // and every block of it that is gone back to (a loop, a repeated string instruction) accesses it; the access faults at HostPC and
++  // this says that it is one. *RIP is then the address of the guest instruction the thread starts again at: the state in the static
++  // registers and the context is the one x86 has before it (but for flags that are never read), the carry as
++  // ReconstructCompactedEFLAGS expects it. A thread that is not to stop goes on after the access, with no other effect of it needed
++  // than the one this has had (State.InlineJITBlockHeader).
++  FEX_DEFAULT_VISIBILITY virtual bool
++  SafepointAt(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, const uint64_t* HostGPRs, uint64_t* RIP) = 0;
+   /**
+    * @brief Reconstructs a compacted EFLAGS from FEX's internal EFLAG representation.
+    *
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 2112073..f485bd6 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -474,6 +474,13 @@ struct CpuStateFrame {
+ 
+   InternalThreadState* Thread;
+ 
++  // Darwin port: the x87 stack at an instruction that faults, where the context does not hold it (IR::X87Pending).
++  alignas(16) uint64_t X87Pending[8][2];
++
++  // Darwin port: where a unit stores the address of its header on entry. It is State.InlineJITBlockHeader, or an address that
++  // faults when the thread is to stop; the safe points in a unit read there. Written by any thread. Context::SafepointAt.
++  uint64_t SafepointPtr {reinterpret_cast<uint64_t>(&State.InlineJITBlockHeader)};
++
+ #ifdef _WIN32
+   // Set by the kernel on ARM64EC whenever the JIT should cooperatively suspend running guest code.
+   uint32_t SuspendDoorbell {};
+-- 
+2.0

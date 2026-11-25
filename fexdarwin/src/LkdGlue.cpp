@@ -22,18 +22,27 @@
 #include <cstdlib>
 #include <cstring>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/mach_vm.h>
+#include <os/lock.h>
 #include <os/os_sync_wait_on_address.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <libproc.h>
+#include <sys/event.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
+extern "C" void fexdarwin_lkd_task_get(lkd_task* t);
+extern "C" void fexdarwin_lkd_task_put(lkd_task* t);
+extern "C" void fexdarwin_lkd_signal_words(const lkd_task* t, uint64_t* blocked, uint64_t* pending, uint32_t* flags, int64_t* cur_nr);
+
 namespace X = FEXCore::X86State;
 using FEXCore::Core::CPUState;
 
-// The kick handler resumes a thread taken out of translated code here, with x0 = its GuestThread, x28 = its FEX state
+// The fault handler resumes a thread taken out of translated code here, with x0 = its GuestThread, x28 = its FEX state
 // frame (callee-saved, untouched) and the host stack pointer of the interrupted block. The C part delivers the signals and
 // returns the dispatcher entry that refills the static registers; x1 = 0 asks that entry for a normal block.
 extern "C" void fexdarwin_kick_trampoline();
@@ -128,15 +137,19 @@ int SetFp(lkd_task* t, int Kind, const void* Buf, size_t Len) {
 }
 
 // ---- kick ----
-// A kicked thread is in one of four places:
-//   - blocked in a host system call inside LKD: the signal makes it return EINTR and LKD re-checks on its way out;
-//   - inside LKD otherwise (InLkd): LkdHandleSyscall checks lkd_signal_pending before resuming guest code;
-//   - in translated code: the handler spills the guest registers and resumes the host thread at the kick trampoline,
-//     which runs lkd_signal_next on the ordinary thread stack (it may block in a ptrace or job-control stop) and then
-//     re-enters the dispatcher loop;
-//   - in the dispatcher, in a deferred-signal section or in host C++: the guest registers are not exact there, so the
-//     retry thread sends the kick again 1 ms later until the thread is in one of the three places above.
-std::atomic<uint32_t> KickEpoch {0};
+// A kicked thread is in one of these places:
+//   - blocked in a host system call inside LKD: the host signal makes it return EINTR and LKD re-checks on its way out;
+//   - inside LKD otherwise (InLkd): LkdHandleSyscall checks lkd_signal_pending before resuming guest code. A kick that comes after
+//     that check stops the thread at its first safe point;
+//   - in translated code, the dispatcher or a helper: it stops at the next safe point (DarwinSignalDelegator::RequestStop), where
+//     the guest registers are exact. The fault handler resumes it at the kick trampoline, which runs lkd_signal_next on the
+//     ordinary thread stack (it may block in a ptrace or job-control stop) and then re-enters the dispatcher loop.
+// Nothing has to be tried again: the request stays until the thread has seen it. KickBoostThread sees to it that the thread runs.
+
+// Guards what Kick needs of a thread that is ending: its host thread (PThread) and the task's engine data. A leaf: nothing else is
+// locked under it. The host signal's handler takes no lock.
+os_unfair_lock KickLock = OS_UNFAIR_LOCK_INIT;
+std::atomic<uint32_t> KickEpoch {0}; // what KickBoostThread waits on
 
 // Guest threads that ended, waiting for their host thread to be joined and their FEX state freed. Each thread owns a
 // FEX lookup cache (about 260 MiB of reserved address space), JIT buffers, a call-ret stack and an 8 MiB host stack; a
@@ -161,19 +174,34 @@ void ReapDeadThreads() {
   }
 }
 
+void SetRealTime(pthread_t P, bool On);
+void EndKickBoost(GuestThread* T, pthread_t P) {
+  if (T->KickBoosted.exchange(0)) SetRealTime(P, false);
+}
+
 [[noreturn]] void EndGuestThread(GuestThread* T) {
+  lkd_task* Task = T->Task;
   pthread_t Host;
   {
     std::lock_guard<std::mutex> Lk(G->ThreadsLock);
     std::erase(G->Threads, T);
-    Host = T->PThread;
-    T->PThread = nullptr; // no more kicks: the host thread is going away
   }
+  os_unfair_lock_lock(&KickLock);
+  Host = T->PThread;
+  T->PThread = nullptr; // no more host signals: the host thread is going away
+  os_unfair_lock_unlock(&KickLock);
+  EndKickBoost(T, pthread_self());
   int Status = 0;
   G->Signals->UnregisterThread(T);
-  if (lkd_task_release(T->Task, &Status)) {
+  fexdarwin_lkd_task_get(Task);
+  if (lkd_task_release(Task, &Status)) {
     ExitProcess(Status);
   }
+  // A kick of the task may still be on its way (LKD keeps it in wake sets): from here on it finds no thread.
+  os_unfair_lock_lock(&KickLock);
+  lkd_task_set_engine_data(Task, nullptr);
+  os_unfair_lock_unlock(&KickLock);
+  fexdarwin_lkd_task_put(Task);
   // The main guest thread is joined by RunWithLkd itself; every other thread is reaped by a later thread creation.
   if (!T->IsMain && Host) {
     std::lock_guard<std::mutex> Lk(DeadLock);
@@ -184,8 +212,10 @@ void ReapDeadThreads() {
 
 // Loops lkd_signal_next until nothing is left. The guest registers must be current in the thread state.
 void DeliverPendingSignals(GuestThread* T) {
-  T->KickRequested.store(false);
-  while (lkd_signal_pending(T->Task)) {
+  for (;;) {
+    // Before the look: what is queued after it requests a stop again.
+    if (T->KickRequested.load()) G->Signals->WithdrawStop(T);
+    if (!lkd_signal_pending(T->Task)) break;
     const int R = lkd_signal_next(T->Task);
     if (G->Opt.TraceSignals) fprintf(stderr, "[fexdarwin] tid %d lkd_signal_next = %d, rip now %#llx\n", T->Tid, R,
                                      (unsigned long long)T->State->CurrentFrame->State.rip);
@@ -194,25 +224,83 @@ void DeliverPendingSignals(GuestThread* T) {
   }
 }
 
-void KickHandler(int, siginfo_t*, void* Uctx) {
-  GuestThread* T = CurrentGuestThread;
-  if (!T || !T->Task || T->InLkd.load()) return;
-  if (!lkd_signal_pending(T->Task)) {
-    T->KickRequested.store(false);
-    return;
-  }
-  G->Signals->RedirectFromJit(T, static_cast<ucontext_t*>(Uctx), reinterpret_cast<uint64_t>(&fexdarwin_kick_trampoline));
-}
+// The host signal has one purpose: a host system call that waits returns EINTR.
+void KickHandler(int) {}
 
 void Kick(lkd_task* t) {
+  os_unfair_lock_lock(&KickLock);
   auto* T = GT(t);
-  if (!T || T == CurrentGuestThread) return;
-  pthread_t P = T->PThread;
-  if (!P) return;
-  T->KickRequested.store(true);
-  pthread_kill(P, KickSignal);
-  KickEpoch.fetch_add(1);
-  os_sync_wake_by_address_any(&KickEpoch, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+  if (T && T != CurrentGuestThread) {
+    const bool First = !T->KickRequested.exchange(true);
+    if (First) {
+      T->KickNs.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), std::memory_order_relaxed);
+      T->KickBoostOver.store(false);
+    }
+    G->Signals->RequestStop(T);
+    if (T->PThread) pthread_kill(T->PThread, KickSignal);
+    if (First) {
+      KickEpoch.fetch_add(1);
+      os_sync_wake_by_address_any(&KickEpoch, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+    }
+  }
+  os_unfair_lock_unlock(&KickLock);
+}
+
+// A thread that computes reaches a safe point within microseconds, when it runs. On a machine with more to run than it has cores it
+// may be off its core for tens of milliseconds, and a collector that suspends every thread waits for the last of them. What has not
+// seen its kick after KickBoostNs runs before everything else, until the first system call after its handler has begun (Wine's writes
+// its context to the server), at the latest for KickBoostMaxNs. This thread runs so itself.
+constexpr uint64_t KickBoostNs = 250 * 1000, KickBoostMaxNs = 5 * 1000 * 1000;
+void SetRealTime(pthread_t P, bool On) {
+  if (On) {
+    static const mach_timebase_info_data_t Tb = [] { mach_timebase_info_data_t V; mach_timebase_info(&V); return V; }();
+    const auto Ticks = [](uint64_t Ns) { return static_cast<uint32_t>(Ns * Tb.denom / Tb.numer); };
+    thread_time_constraint_policy_data_t D {.period = 0, .computation = Ticks(200 * 1000), .constraint = Ticks(1000 * 1000), .preemptible = 1};
+    thread_policy_set(pthread_mach_thread_np(P), THREAD_TIME_CONSTRAINT_POLICY, reinterpret_cast<thread_policy_t>(&D), THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+  } else {
+    thread_standard_policy_data_t D {};
+    thread_policy_set(pthread_mach_thread_np(P), THREAD_STANDARD_POLICY, reinterpret_cast<thread_policy_t>(&D), THREAD_STANDARD_POLICY_COUNT);
+  }
+}
+
+void* KickBoostThread(void*) {
+  pthread_setname_np("lkd-kick-boost");
+  SetRealTime(pthread_self(), true);
+  uint32_t Seen = KickEpoch.load();
+  for (;;) {
+    os_sync_wait_on_address(&KickEpoch, Seen, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_NONE);
+    Seen = KickEpoch.load();
+    for (bool Again = true; Again;) {
+      usleep(KickBoostNs / 1000);
+      Again = !G->ThreadsLock.try_lock();
+      if (Again) continue;
+      for (GuestThread* T : G->Threads) {
+        const uint64_t Now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        const uint64_t Since = T->KickBoosted.load();
+        const bool Boost = !Since && T->KickRequested.load() && !T->KickBoostOver.load();
+        if (!Since && !Boost) continue;
+        Again = true;
+        if (Now - (Boost ? T->KickNs.load(std::memory_order_relaxed) : Since) < (Boost ? KickBoostNs : KickBoostMaxNs)) continue;
+        os_unfair_lock_lock(&KickLock);
+        if (!T->PThread) {
+          // (not started yet)
+        } else if (Boost) {
+          SetRealTime(T->PThread, true);
+          T->KickBoosted.store(Now);
+        } else {
+          T->KickBoostOver.store(true); // (one that waits in a system call the host signal does not end: once is enough)
+          EndKickBoost(T, T->PThread);
+        }
+        os_unfair_lock_unlock(&KickLock);
+      }
+      G->ThreadsLock.unlock();
+    }
+  }
+  return nullptr;
+}
+void StartKickBoostThread() {
+  pthread_t P;
+  if (pthread_create(&P, nullptr, KickBoostThread, nullptr) == 0) pthread_detach(P);
 }
 
 // ---- supervisor watchdog (machine safety) ----
@@ -241,11 +329,15 @@ uint64_t CountOwnRegions(uint64_t Limit) {
 }
 
 // ---- thread dump (diagnostics) ----
-// FEXDARWIN_DUMP_DIR=<host dir>: when <dir>/dump-request appears or changes, every guest process of the family writes
-// <dir>/dump-<host pid>-<n>.txt: first the backtrace of every host thread (CrashReport::HostThreads), then per guest
-// thread its tid, the system call it is in (number and arguments) or "running", its registers and the stack words that
-// point into executable mappings (module name and offset). Read-only for the guest: memory is read with
-// mach_vm_read_overwrite (no fault), nothing is changed, nothing is sent to the guest. It never waits for a lock: a
+// What a hung process shows without a debugger. `fexdarwin-run --dump [pid...]` asks for it: the host signal SIGINFO, which a process
+// without this ignores; SupervisorWatchThread sees it (no handler runs, no thread is interrupted) and writes
+// <the user's temporary folder>/fexdarwin-dump-<host pid>-<n>.txt. FEXDARWIN_DUMP_DIR=<host dir>, set at start, is the other way: when
+// <dir>/dump-request appears or changes, every guest process of the family writes <dir>/dump-<host pid>-<n>.txt.
+// First the backtrace of every host thread (CrashReport::HostThreads), the engine's and LKD's locks that are held, then per guest
+// thread its tid, the system call it is in (number and arguments) or where it runs, the stop that is requested of it and since when,
+// its signal words, its registers (of a thread in translated code: those of the host thread) and the stack words that point into
+// executable mappings (module name and offset). Read-only for the guest: memory is read with mach_vm_read_overwrite (no fault), nothing
+// is sent to the guest; a host thread is suspended for as long as its registers are copied. It never waits for a lock: a
 // process frozen by an engine lock held forever (ELDEN RING's world loading) still writes its dump.
 extern "C" int fexdarwin_lkd_vma_describe_nowait(lkd_task* t, uint64_t gva, uint64_t* start, uint64_t* end, uint32_t* prot,
                                                  uint64_t* off, char* name, unsigned long name_len);
@@ -277,10 +369,56 @@ static bool TryLockThreads() {
   return false;
 }
 
-static void DumpThreads(const char* Dir, unsigned Seq) {
-  char Path[1024];
-  snprintf(Path, sizeof Path, "%s/dump-%d-%u.txt", Dir, static_cast<int>(getpid()), Seq);
-  FILE* F = fopen(Path, "a"); // appends: HostThreads writes to the same file through its descriptor
+// The static mutexes of LKD, by their names there.
+static const char* const LkdMutexes[] = {"g_tasks", "g_mutex", "g_create_mutex", "g_kids_lock", "g_lazy", "g_svc_lock", "g_dir_lock", "g_pool_lock",
+                                         "g_map_lock", "g_files_lock", "g_shm_lock", "g_mu", "g_attach_mu", "g_net_lock", "g_mount_add_lock",
+                                         "g_fsctx_lock", "g_tables_lock", "g_side_lock", "wlk", "reg_lock"};
+
+// Held or free, by trying: a free one is held for a moment. Who holds a lock is in the backtraces: the thread that is past its
+// acquisition and not in the wait for it.
+static void DumpLocks(FILE* F, GuestThread* AnyThread) {
+  fprintf(F, "\nlocks held:");
+  unsigned Held = 0;
+  auto Note = [&](const char* Name, bool Free) {
+    if (!Free) {
+      ++Held;
+      fprintf(F, " %s", Name);
+    }
+  };
+  auto TryMutex = [](std::mutex& M) {
+    const bool Free = M.try_lock();
+    if (Free) M.unlock();
+    return Free;
+  };
+  Note("ThreadsLock", TryMutex(G->ThreadsLock));
+  Note("SigLock", TryMutex(G->SigLock));
+  Note("DeadLock", TryMutex(DeadLock));
+  if (os_unfair_lock_trylock(&KickLock)) os_unfair_lock_unlock(&KickLock);
+  else Note("KickLock", false);
+  auto& Code = G->CTX->GetCodeInvalidationMutex();
+  if (Code.try_lock()) Code.unlock();
+  else Note(Code.try_lock_shared() ? (Code.unlock_shared(), "CodeInvalidationMutex(shared)") : "CodeInvalidationMutex(exclusive)", false);
+  for (const char* Name : LkdMutexes) {
+    CrashReport::ForEachSymbol(Name, [](const char* N, void* Addr, void* Arg) {
+      auto* Mu = static_cast<pthread_mutex_t*>(Addr);
+      if (pthread_mutex_trylock(Mu) == 0) pthread_mutex_unlock(Mu);
+      else (*static_cast<decltype(Note)*>(Arg))(N, false);
+    }, &Note);
+  }
+  if (AnyThread && AnyThread->Task) {
+    uint64_t S, E, Off;
+    uint32_t P;
+    char N[2];
+    Note("mm(VMA table)", fexdarwin_lkd_vma_describe_nowait(AnyThread->Task, AnyThread->State->CurrentFrame->State.rip, &S, &E, &P, &Off, N, sizeof N) != -LX_EBUSY);
+  }
+  fprintf(F, "%s\n", Held ? "" : " none");
+}
+
+static void DumpThreads(const char* Dir, const char* Prefix, unsigned Seq) {
+  char Path[1024], Tmp[1024];
+  snprintf(Path, sizeof Path, "%s/%sdump-%d-%u.txt", Dir, Prefix, static_cast<int>(getpid()), Seq);
+  snprintf(Tmp, sizeof Tmp, "%s.part", Path); // renamed when it is whole
+  FILE* F = fopen(Tmp, "a"); // appends: HostThreads writes to the same file through its descriptor
   if (!F) return;
   std::vector<CrashReport::ThreadLabel> Labels;
   const bool Listed = TryLockThreads();
@@ -295,8 +433,17 @@ static void DumpThreads(const char* Dir, unsigned Seq) {
   fflush(F);
   CrashReport::HostThreads(fileno(F), Labels.data(), Labels.size());
   if (!TryLockThreads()) {
+    DumpLocks(F, nullptr);
     fprintf(F, "\nguest threads not listed: ThreadsLock busy for 1 s\n");
     fclose(F);
+    rename(Tmp, Path);
+    return;
+  }
+  G->ThreadsLock.unlock();
+  DumpLocks(F, nullptr);
+  if (!TryLockThreads()) {
+    fclose(F);
+    rename(Tmp, Path);
     return;
   }
   fprintf(F, "\n%zu guest threads\n", G->Threads.size());
@@ -304,7 +451,25 @@ static void DumpThreads(const char* Dir, unsigned Seq) {
     if (!T->State || !T->State->CurrentFrame) continue;
     const auto& St = T->State->CurrentFrame->State;
     const bool In = T->InLkd.load();
-    fprintf(F, "\n== tid %d %s", T->Tid, In ? "in syscall" : "running (registers may be stale)");
+    // Of a thread that runs translated code the registers are in the host's. Nothing is allocated and no lock is taken while it is
+    // suspended.
+    uint64_t Rip = St.rip, Gregs[16];
+    memcpy(Gregs, St.gregs, sizeof Gregs);
+    const char* Where = "in the engine (registers of when it entered it)";
+    if (const pthread_t P = T->PThread; !In && P) {
+      const thread_t Port = pthread_mach_thread_np(P);
+      if (thread_suspend(Port) == KERN_SUCCESS) {
+        arm_thread_state64_t Hs {};
+        mach_msg_type_number_t C = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(Port, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&Hs), &C) == KERN_SUCCESS) {
+          uint64_t X[31];
+          memcpy(X, Hs.__x, 29 * sizeof(uint64_t));
+          if (G->Signals->PeekRegisters(T, arm_thread_state64_get_pc(Hs), X, &Rip, Gregs)) Where = "in translated code";
+        }
+        thread_resume(Port);
+      }
+    }
+    fprintf(F, "\n== tid %d %s", T->Tid, In ? "in syscall" : Where);
     if (In)
       fprintf(F, " nr %llu (%#llx, %#llx, %#llx, %#llx, %#llx, %#llx)", (unsigned long long)T->OrigRax,
               (unsigned long long)T->SysArgs[0], (unsigned long long)T->SysArgs[1], (unsigned long long)T->SysArgs[2],
@@ -314,14 +479,29 @@ static void DumpThreads(const char* Dir, unsigned Seq) {
       if (ReadGuest(T->SysArgs[0], W, sizeof W))
         fprintf(F, "\n   futex word %#x, next %#x, owner(+8) %u, +12 %#x", W[0], W[1], W[2], W[3]);
     }
+    if (T->KickRequested.load()) {
+      fprintf(F, "\n   STOP REQUESTED %llu ms ago%s%s", (unsigned long long)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - T->KickNs.load()) / 1000000),
+              G->Signals->StopRequested(T) ? ", its next safe point is armed" : ", NO safe point armed", T->KickBoosted.load() ? ", boosted" : "");
+    } else if (G->Signals->StopRequested(T)) {
+      fprintf(F, "\n   its next safe point is armed");
+    }
+    if (T->Task) {
+      uint64_t Blocked, Pending;
+      uint32_t Flags;
+      int64_t Nr;
+      fexdarwin_lkd_signal_words(T->Task, &Blocked, &Pending, &Flags, &Nr);
+      fprintf(F, "\n   signals: %s, pending %#llx, blocked %#llx, task flags %#x%s%s%s", lkd_signal_pending(T->Task) ? "one to deliver" : "none to deliver",
+              (unsigned long long)Pending, (unsigned long long)Blocked, Flags, T->Stopped.load() ? ", in a ptrace stop" : "",
+              (Flags & 2) ? ", to die" : "", (Flags & 8) ? ", to stop with its group" : "");
+    }
     fprintf(F, "\n   rip ");
-    DescribeCode(F, T->Task, St.rip);
-    const uint64_t Rsp = St.gregs[FEXCore::X86State::REG_RSP];
+    DescribeCode(F, T->Task, Rip);
+    const uint64_t Rsp = Gregs[FEXCore::X86State::REG_RSP];
     fprintf(F, "\n   rsp %#llx rbp %#llx rax %#llx rbx %#llx rcx %#llx rdx %#llx rsi %#llx rdi %#llx\n", (unsigned long long)Rsp,
-            (unsigned long long)St.gregs[FEXCore::X86State::REG_RBP], (unsigned long long)St.gregs[FEXCore::X86State::REG_RAX],
-            (unsigned long long)St.gregs[FEXCore::X86State::REG_RBX], (unsigned long long)St.gregs[FEXCore::X86State::REG_RCX],
-            (unsigned long long)St.gregs[FEXCore::X86State::REG_RDX], (unsigned long long)St.gregs[FEXCore::X86State::REG_RSI],
-            (unsigned long long)St.gregs[FEXCore::X86State::REG_RDI]);
+            (unsigned long long)Gregs[FEXCore::X86State::REG_RBP], (unsigned long long)Gregs[FEXCore::X86State::REG_RAX],
+            (unsigned long long)Gregs[FEXCore::X86State::REG_RBX], (unsigned long long)Gregs[FEXCore::X86State::REG_RCX],
+            (unsigned long long)Gregs[FEXCore::X86State::REG_RDX], (unsigned long long)Gregs[FEXCore::X86State::REG_RSI],
+            (unsigned long long)Gregs[FEXCore::X86State::REG_RDI]);
     // Stack words pointing into executable mappings: candidate return addresses, innermost first.
     uint64_t S, E, Off;
     uint32_t Prot;
@@ -347,6 +527,7 @@ static void DumpThreads(const char* Dir, unsigned Seq) {
   }
   G->ThreadsLock.unlock();
   fclose(F);
+  rename(Tmp, Path);
 }
 
 static void MaybeDumpThreads() {
@@ -360,7 +541,12 @@ static void MaybeDumpThreads() {
   if (stat(Req, &Sb) != 0) return;
   if (Sb.st_mtimespec.tv_sec == Last.tv_sec && Sb.st_mtimespec.tv_nsec == Last.tv_nsec) return;
   Last = Sb.st_mtimespec;
-  DumpThreads(Dir, ++Seq);
+  DumpThreads(Dir, "", ++Seq);
+}
+
+// Where `fexdarwin-run --dump` finds what a process wrote, whatever their environments are.
+static bool DumpFolder(char* Out, size_t Len) {
+  return confstr(_CS_DARWIN_USER_TEMP_DIR, Out, Len) > 1;
 }
 
 void* SupervisorWatchThread(void*) {
@@ -370,8 +556,21 @@ void* SupervisorWatchThread(void*) {
   // A guest process normally has a few hundred regions (measured: dash about 400, Wine processes about 400, wineserver
   // about 460). 200000 is far above that and far below what panicked the Mac (177 million entries in total).
   constexpr uint64_t MaxRegions = 200000;
+  // SIGINFO: LkdDumpProcesses. Its default is to do nothing; the kernel queue sees it all the same.
+  const int Kq = kqueue();
+  struct kevent Ev;
+  EV_SET(&Ev, SIGINFO, EVFILT_SIGNAL, EV_ADD, 0, 0, nullptr);
+  const bool Watched = Kq >= 0 && kevent(Kq, &Ev, 1, nullptr, 0, nullptr) == 0;
+  unsigned Asked = 0;
   for (unsigned Tick = 0;; ++Tick) {
-    usleep(getenv("FEXDARWIN_REGION_LOG") ? 50 * 1000 : 500 * 1000);
+    const long Ms = getenv("FEXDARWIN_REGION_LOG") ? 50 : 500;
+    const struct timespec Ts {.tv_sec = 0, .tv_nsec = Ms * 1000 * 1000};
+    if (!Watched) {
+      usleep(Ms * 1000);
+    } else if (kevent(Kq, nullptr, 0, &Ev, 1, &Ts) == 1 && Ev.filter == EVFILT_SIGNAL) {
+      if (char Dir[1024]; G && DumpFolder(Dir, sizeof Dir)) DumpThreads(Dir, "fexdarwin-", ++Asked);
+      continue;
+    }
     MaybeDumpThreads();
     static const bool LogRegions = getenv("FEXDARWIN_REGION_LOG") != nullptr;
     if (LogRegions || (Tick & 3) == 0) {
@@ -401,37 +600,6 @@ void* SupervisorWatchThread(void*) {
 void StartSupervisorWatch() {
   pthread_t W;
   if (pthread_create(&W, nullptr, SupervisorWatchThread, nullptr) == 0) pthread_detach(W);
-}
-
-void* KickRetryThread(void*);
-void StartKickRetryThread() {
-  pthread_t Retry;
-  if (pthread_create(&Retry, nullptr, KickRetryThread, nullptr) == 0) pthread_detach(Retry);
-}
-
-void* KickRetryThread(void*) {
-  pthread_setname_np("lkd-kick-retry");
-  uint32_t Seen = 0;
-  for (;;) {
-    const uint32_t E = KickEpoch.load();
-    if (E == Seen) {
-      os_sync_wait_on_address(&KickEpoch, E, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_NONE);
-      continue;
-    }
-    Seen = E;
-    for (bool Any = true; Any;) {
-      usleep(1000);
-      Any = false;
-      std::lock_guard<std::mutex> Lk(G->ThreadsLock);
-      for (GuestThread* T : G->Threads) {
-        if (T->KickRequested.load() && !T->InLkd.load() && T->PThread) {
-          Any = true;
-          pthread_kill(T->PThread, KickSignal);
-        }
-      }
-    }
-  }
-  return nullptr;
 }
 
 // ---- threads ----
@@ -467,7 +635,9 @@ int SpawnThread(lkd_task* Child, const lkd_regs* Start) {
   pthread_attr_destroy(&Attr);
   if (E != 0) {
     // LKD drops the task on this error: forget it and free what was made for it.
+    os_unfair_lock_lock(&KickLock);
     lkd_task_set_engine_data(Child, nullptr);
+    os_unfair_lock_unlock(&KickLock);
     DestroyGuestThread(C);
     return -LX_EAGAIN;
   }
@@ -619,8 +789,10 @@ int ExecImage(lkd_task* t, const struct lkd_exec_image* Img) {
 void ForkPrepare(lkd_task* t) {
   G->ThreadsLock.lock();
   G->CTX->LockBeforeFork(GT(t)->State);
+  os_unfair_lock_lock(&KickLock);
 }
 void ForkParent(lkd_task* t, pid_t) {
+  os_unfair_lock_unlock(&KickLock);
   G->CTX->UnlockAfterFork(GT(t)->State, false);
   G->ThreadsLock.unlock();
 }
@@ -634,7 +806,9 @@ void ForkChild(lkd_task* t) {
   // task has already switched the identity: this host thread is now the only thread of the child process.
   T->Tid = lkd_task_tid(t);
   T->PThread = pthread_self();
-  T->KickRequested.store(false);
+  KickLock = OS_UNFAIR_LOCK_INIT; // held across the fork by this thread, as another host thread
+  G->Signals->WithdrawStop(T);
+  EndKickBoost(T, pthread_self());
   G->Threads.assign(1, T);
   G->ThreadsLock.unlock();
   {
@@ -642,7 +816,7 @@ void ForkChild(lkd_task* t) {
     std::lock_guard<std::mutex> Lk(DeadLock);
     DeadThreads.clear();
   }
-  StartKickRetryThread();
+  StartKickBoostThread();
   StartSupervisorWatch(); // threads do not survive a host fork
   HitchLog::AfterFork();
 }
@@ -731,8 +905,8 @@ bool LkdEnabled() {
 
 int LkdSetup() {
   struct sigaction Sa {};
-  Sa.sa_sigaction = KickHandler;
-  Sa.sa_flags = SA_SIGINFO | SA_ONSTACK; // no SA_RESTART: blocking calls must see EINTR
+  Sa.sa_handler = KickHandler;
+  Sa.sa_flags = SA_ONSTACK; // no SA_RESTART: blocking calls must see EINTR
   sigemptyset(&Sa.sa_mask);
   sigaction(KickSignal, &Sa, nullptr);
   // The first process of a family becomes the supervisor when no wrapper set one.
@@ -742,7 +916,7 @@ int LkdSetup() {
     setenv("FEXDARWIN_SUPERVISOR_PID", B, 1);
   }
   StartSupervisorWatch(); // the first process watches itself only through the region guard (kill(self) succeeds)
-  StartKickRetryThread();
+  StartKickBoostThread();
   // A host pipe or socket the engine keeps must never kill the runtime; LKD sets F_SETNOSIGPIPE on guest ones.
   signal(SIGPIPE, SIG_IGN);
   return lkd_init(&Ops);
@@ -779,6 +953,7 @@ void LkdHandleSyscall(GuestThread* T, FEXCore::Core::CpuStateFrame* Frame) {
   case LKD_EXIT_GROUP: EndGuestThread(T);
   }
   // Deliver pending signals at this safe point; the frame saves the post-syscall context.
+  if (T->KickBoosted.load() && !T->KickRequested.load() && !lkd_signal_pending(T->Task)) EndKickBoost(T, pthread_self());
   DeliverPendingSignals(T);
   T->InLkd.store(false);
   T->SyscallSetsRip = true; // RIP is final, the generic path must not add 2 again
@@ -793,4 +968,56 @@ extern "C" int fexdarwin_cpuid(uint32_t Leaf, uint32_t Subleaf, int Cpu, uint32_
                           G->CTX->RunCPUIDFunction(Leaf, Subleaf);
   Out[0] = R.eax; Out[1] = R.ebx; Out[2] = R.ecx; Out[3] = R.edx;
   return 0;
+}
+
+// fexdarwin-run --dump [pid...]: asks the processes (without one, every fexdarwin-run of this user) for a thread dump, says where each one
+// wrote it.
+int LkdDumpProcesses(int Argc, char** Argv) {
+  std::vector<pid_t> Pids;
+  for (int I = 0; I < Argc; ++I) Pids.push_back(static_cast<pid_t>(strtol(Argv[I], nullptr, 10)));
+  if (Pids.empty()) {
+    std::vector<pid_t> All(8192);
+    const int N = proc_listpids(PROC_UID_ONLY, getuid(), All.data(), static_cast<int>(All.size() * sizeof(pid_t))) / static_cast<int>(sizeof(pid_t));
+    for (int I = 0; I < N; ++I) {
+      char P[PROC_PIDPATHINFO_MAXSIZE];
+      if (All[I] == getpid() || proc_pidpath(All[I], P, sizeof P) <= 0) continue;
+      const char* Base = strrchr(P, '/');
+      if (Base && strcmp(Base + 1, "fexdarwin-run") == 0) Pids.push_back(All[I]);
+    }
+  }
+  char Dir[1024];
+  if (!DumpFolder(Dir, sizeof Dir)) return 1;
+  auto Newest = [&](pid_t Pid, struct timespec Since) {
+    std::string Found;
+    char Prefix[64];
+    const int Len = snprintf(Prefix, sizeof Prefix, "fexdarwin-dump-%d-", static_cast<int>(Pid));
+    if (DIR* D = opendir(Dir)) {
+      while (dirent* E = readdir(D)) {
+        struct stat Sb;
+        const std::string Path = std::string(Dir) + E->d_name;
+        if (strncmp(E->d_name, Prefix, Len) == 0 && !strstr(E->d_name, ".part") && stat(Path.c_str(), &Sb) == 0 &&
+            (Sb.st_ctimespec.tv_sec > Since.tv_sec || (Sb.st_ctimespec.tv_sec == Since.tv_sec && Sb.st_ctimespec.tv_nsec >= Since.tv_nsec))) {
+          Found = Path;
+        }
+      }
+      closedir(D);
+    }
+    return Found;
+  };
+  struct timespec Now;
+  clock_gettime(CLOCK_REALTIME, &Now);
+  for (pid_t P : Pids) {
+    if (kill(P, SIGINFO) != 0) fprintf(stderr, "%d: %s\n", static_cast<int>(P), strerror(errno));
+  }
+  int Missing = 0;
+  for (pid_t P : Pids) {
+    std::string Path;
+    for (int I = 0; I < 100 && Path.empty(); ++I) {
+      Path = Newest(P, Now);
+      if (Path.empty()) usleep(100 * 1000);
+    }
+    if (Path.empty()) ++Missing;
+    printf("%d %s\n", static_cast<int>(P), Path.empty() ? "wrote no dump (not fexdarwin-run, or one that cannot)" : Path.c_str());
+  }
+  return Missing != 0;
 }

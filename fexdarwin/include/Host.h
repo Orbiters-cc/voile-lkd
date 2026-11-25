@@ -46,7 +46,10 @@ struct GuestThread {
   uint64_t OrigRax {};         // syscall number of the current or last syscall (ptrace orig_rax)
   uint64_t SysArgs[6] {};      // its arguments (thread dump)
   std::atomic<bool> Stopped {false};       // parked in a ptrace stop: registers are in memory
-  std::atomic<bool> KickRequested {false};
+  std::atomic<bool> KickRequested {false}; // a stop is requested: LkdGlue's Kick
+  std::atomic<uint64_t> KickNs {0};        // since when (CLOCK_UPTIME_RAW)
+  std::atomic<uint64_t> KickBoosted {0};   // since when it is scheduled before others, 0 when it is not: LkdGlue's KickBoostThread
+  std::atomic<bool> KickBoostOver {false}; // it was, for this kick, and is so no more
   // A guarded host page (LKD mm) opened for one instruction that reads it: DarwinSignalDelegator::BeginGuardStep.
   uint64_t GuardPages[4] {};
   int GuardN {};

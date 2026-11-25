@@ -79,6 +79,7 @@ void CleanupAfterFork() {}
 void Usage() {
   fprintf(stderr,
           "usage: fexdarwin-run [options] [--env K=V ...] ELF [args...]\n"
+          "       fexdarwin-run --dump [PID...]   write what the threads of running processes do (all of this user's without a PID)\n"
           "  --env K=V          add an environment variable for the guest (default: empty environment)\n"
           "  --inherit-env      pass the host environment to the guest\n"
           "  --trace            log every system call (same as FEXDARWIN_TRACE=1)\n"
@@ -348,6 +349,7 @@ int main(int argc, char** argv) {
     else if (S == "--trace") Opt.Trace = true;
     else if (S == "--trace-signals") Opt.TraceSignals = true;
     else if (S == "--features") OnlyFeatures = true;
+    else if (S == "--dump") return LkdDumpProcesses(argc - I - 1, argv + I + 1);
     else if (S == "--stats") A.Stats = true;
     else if (S.rfind("--smc=", 0) == 0) Opt.SmcMode = S.substr(6);
     else if (S == "--fex-config" && I + 1 < argc) Opt.ExtraConfig.push_back(argv[++I]);

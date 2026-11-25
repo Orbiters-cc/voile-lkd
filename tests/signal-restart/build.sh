@@ -19,10 +19,15 @@ SEP="" cc sigstorm_val sigstorm.c sigstorm_k.S audit_k.S
 python3 gen_soak.py "${SOAK_SEED:-1}" "${SOAK_COUNT:-60}" > "$BIN/soak_k.S"
 cc soak -I. soak.c "$BIN/soak_k.S"
 cc bench bench.c bench_k.S
+python3 gen_x87.py "${SOAK_SEED:-1}" "${X87_COUNT:-400}" > "$BIN/x87_k.S"
+cc x87fault x87fault.c "$BIN/x87_k.S"
 cc syncfault syncfault.c syncfault_k.S
 win() { out=$1; shift; "$MINGW" -O1 -mno-avx -Wall -DWIN -o "$BIN/$out.exe" "$@"; }
 win susp susp.c sigstorm_k.S
 win susp_split -DLEAFSPLIT susp.c sigstorm_k.S
 win susp_soak -DSOAK susp.c sigstorm_k.S "$BIN/soak_k.S"
+win stw stw.c
+win shut shut.c
 "${MINGW32:-i686-w64-mingw32-gcc}" -O1 -mno-avx -Wall -o "$BIN/susp32.exe" susp.c susp32_k.S
 cc latency latency.c bench_k.S
+cc shapes shapes.c shapes_k.S
