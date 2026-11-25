@@ -5,7 +5,7 @@ Nothing here needs a debugger, entitlements or `sudo`, and nothing is sent to th
 ## A process that hangs now
 
 ```sh
-E=<the engine folder>/fexdarwin-run          # any copy that knows --dump (8f57d4f and later); the processes must be of such a one too
+E=<the engine folder>/fexdarwin-run          # any copy that knows --dump (8f57d4f and later of fix-signal-restart); the processes must be of such a one too
 $E --dump                                    # every fexdarwin-run of this user; or: $E --dump <host pid>...
 sleep 3; $E --dump                           # again: what moved between the two
 for p in $(pgrep -x fexdarwin-run); do sample $p 3 -file sample-$p.txt; done   # the wineserver too
