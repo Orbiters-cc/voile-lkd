@@ -37,7 +37,7 @@ rules that the header cannot express.
 | 4 | WINDOW_SHOW | `wsd_window_flag` | 1: activate app, in front of the server's windows as the key window, then one `EV_RESIZE`; 2: in front without becoming key and without activating the app (Win32 `SWP_NOACTIVATE`); 0: `orderOut` |
 | 5 | WINDOW_FULLSCREEN | `wsd_window_flag` | 1: borderless, frame = screen frame, Dock and menu bar hidden, above the menu bar while the server is the active app (see Levels); 0: restore. Exactly one `EV_RESIZE` per transition, and one when the screen changes |
 | 6 | CURSOR_VISIBLE | `wsd_window_flag` (window ignored) | `[NSCursor hide]` / `unhide`, balanced |
-| 7 | CURSOR_CLIP | `wsd_cursor_clip` | absolute motion outside the rectangle (window pixels) is clamped (`EV_MOTION.flags` bit 0) and the real pointer is warped back with `CGWarpMouseCursorPosition` |
+| 7 | CURSOR_CLIP | `wsd_cursor_clip` | absolute motion outside the rectangle (window pixels) is clamped (`EV_MOTION.flags` bit 0) and the real pointer is warped back with `CGWarpMouseCursorPosition`. With `--free-unconfined-pointer`, whether the rectangle is smaller than the window also decides who has the pointer (see The pointer of a game that does not confine it) |
 | 8 | RELATIVE_MOUSE | `wsd_window_flag` | 1: `CGAssociateMouseAndMouseCursorPosition(false)`, only while the window is key and shows frames: a request made before waits until then, and the client is not told; motion is reported only as `EV_RELATIVE` raw deltas (`NSEvent.deltaX/Y`) |
 | 9 | BUFFER_ATTACH | `wsd_buffer_attach` + 1 fd | `mmap(MAP_SHARED)` of the fd from the page floor of `offset`, `newBufferWithBytesNoCopy`, linear `MTLTexture` at the remaining delta with `bytesPerRow = stride`. `stride` and the delta must be multiples of `minimumLinearTextureAlignmentForPixelFormat`. The fd is closed after mapping. Formats: 1 BGRA8, 2 RGBA8, 3 RGB10A2 (DXGI R10G10B10A2_UNORM, red in the low bits). Max 32 buffers |
 | 10 | BUFFER_DETACH | `wsd_buffer` | drops the server reference; the mapping is unmapped when the last in-flight GPU use ends |
@@ -124,6 +124,74 @@ gone, and is refused if a client is still there after 30 seconds. App Nap is off
 Coming back to the server (Cmd-Tab, the Dock) with none of its windows visible brings back the largest window in the
 Dock or minimized out of sight, which its client hears as `EV_MINIMIZE` 0: a game in exclusive fullscreen minimizes
 itself when it goes to the background.
+
+## The pointer of a game that does not confine it
+
+`wsd --free-unconfined-pointer` (off by default; the launcher gives it for VRChat alone). The Wine driver asks for
+RELATIVE_MOUSE whenever the cursor is hidden over a fullscreen window, whatever the game's clip, so a game that hides the
+cursor for good (VRChat draws its own) had the pointer held for the whole session, its menus included, while on Windows it
+frees the pointer there (`ClipCursor(NULL)`) and locks it again after (a clip of one pixel). The driver does tell the
+difference: the lock is a `CURSOR_CLIP` of 1x1, the release one of the whole window (win32u clips a fullscreen window to its
+monitor when the game clips to nothing), or no clip for a window that is not fullscreen.
+
+With the option, a window in relative mode *holds* the pointer only while its clip is smaller than the window in either
+direction (by more than two pixels):
+
+- **held**: exactly as relative mode without the option. macOS's pointer stands still and is hidden, the client gets
+  `EV_RELATIVE` alone. Only while the window is key and shows frames, as ever.
+- **free**: macOS's pointer is the person's. The client gets `EV_MOTION` (the same mapping as for a visible cursor) and the
+  buttons at their places; it still believes that it has relative mode, and takes places all the same. An `EV_MOTION` comes
+  before each `EV_BUTTON`, because the driver takes a button at the last place it was told while in relative mode.
+- **held to free** by the client's clip: the pointer is put back where the client's cursor is (the pixel of the clip; in a wider
+  clip, where the deltas led inside it, by the driver's own arithmetic), so the first place the client is sent is the one it
+  has. Moves queued before are dropped, as after CURSOR_WARP. macOS puts a warped pointer on a whole point: the pixel is exact
+  at one pixel a point or less, else it may be the one beside it.
+- **free to held**: the pointer stays where it is when it is over the game. Over another window above the game, or beside it, it
+  is first put on the pixel of the clip, since a button goes to the window under the pointer even while it stands still. The
+  moves of before, and of the display frame the change falls into (macOS joins a frame's moves into one event), are not sent.
+- leaving the window (focus lost, no frame for 5 s) gives the pointer back where it stood; coming back holds it again only if
+  the client still confines it then.
+
+The cursor: while the pointer is free and the client asked for no cursor (CURSOR_VISIBLE 0), macOS's cursor is hidden over the
+content of wsd's windows only, as Windows hides it for that window alone. Over any other window above the game (an overlay's
+panel) the arrow shows and works. macOS's own hide is for the whole app, so wsd looks 30 times a second, while this is so, at
+what a click under the pointer would go to.
+
+One line of the log for each change, and no other line changes:
+
+```
+wsd: the pointer is held only while the game confines it (--free-unconfined-pointer)
+wsd: client 4242: relative mouse on, the pointer stays free: the game does not confine it
+wsd: window 1: pointer held by the game (it clipped, clip 1x1 at 661,430)
+wsd: window 1: pointer freed by the game (it clipped, clip 1323x860 at 0,0), it is at 661,430
+wsd: window 1: pointer given back (focus lost)
+wsd: window 1: pointer held by the game (focus back, clip 1x1 at 661,430)
+```
+
+`held` says why: `it clipped`, `focus back`, `frames shown again`, `relative mouse on`, `window resized`; `given back`:
+`focus lost`, `no frame shown`, `relative mouse off`. Without the option every request and every line is what it was. Tests:
+`tests/graphics/wsd_pointer.py` (an owned client, the real pointer, both programs compared without the option) and
+`tests/graphics/pointer_game.py` (an owned Windows program on the engine).
+
+## Pointer channel
+
+`wsd --pointer-socket PATH` (off by default): a second socket, which tells any program of the same user that connects what the
+pointer does, and takes nothing. It is not part of the protocol above: the definitions are in `wsd_pointer.h`.
+
+- `PATH` lies in a folder of this user alone (mode 0700, refused otherwise); the socket is 0600. The launcher puts it in a folder the
+  game does not see, `<temporary folder>/obelisk-engine-<launcher's process>.host/pointer.sock`, where the launcher's process is the
+  Game session record's `game.pid` (`docs/CLI.md` of Obelisk). Peers of another user are closed at once. At most 8 readers.
+- Framing: `struct wsd_pointer_hdr { u32 type; u32 len; }` then `len` bytes, little-endian. A reader skips types it does not know
+  and what a payload holds after the fields it knows.
+- The reader only reads: one that sends a single byte is disconnected, and no request exists, so nothing can be injected or
+  taken away. A reader that leaves more than 256 KiB unread is dropped; nothing waits for a reader.
+- Nothing is computed while nobody reads.
+
+| type | name | payload |
+| --- | --- | --- |
+| 1 | HELLO | `wsd_pointer_hello`: version (1) and wsd's process, once |
+| 2 | STATE | `wsd_pointer_state`: after HELLO, then whenever anything in it changed (at once for the pointer, within 100 ms for the window's place): `state` (`NONE` the game does not capture the mouse, `FREE`, `HELD`, `AWAY` it would hold the pointer but its window is not key or shows no frames), `flags` (key, fullscreen, cursor hidden by the game, shown, stalled), the window's number at the window server and its client's process, the content's frame in global display points (top-left origin), the game's pixels per point, the clip in the game's pixels |
+| 3 | MOVE | `wsd_pointer_move`: the deltas of one `EV_RELATIVE`, as the game was sent them, and their time. Only while held |
 
 ## Render percent
 

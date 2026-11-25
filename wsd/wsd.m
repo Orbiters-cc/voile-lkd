@@ -9,7 +9,8 @@
  * Present path: shm fd -> mmap(MAP_SHARED) -> newBufferWithBytesNoCopy -> linear MTLTexture
  * (no CPU pixel copy) -> one render pass per display-link tick into the CAMetalLayer drawable.
  *
- * Usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N]
+ * Usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N] [--free-unconfined-pointer]
+ *            [--pointer-socket PATH]
  */
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
@@ -31,6 +32,7 @@
 #include <stdatomic.h>
 #include "wsd_protocol.h"
 #include "wsd_keymap.h"
+#include "wsd_pointer.h"
 
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
@@ -61,6 +63,13 @@ static NSTimeInterval g_warp_time; /* uptime of the last CURSOR_WARP: the mouse 
  * one turned the camera the wrong way. However late the first move comes, it carries the jump (a game centers the
  * pointer while a map loads), and turning relative mode on does not change which move that is. */
 static CGPoint g_warp_jump;
+/* --free-unconfined-pointer: a window in relative mode holds the pointer only while its client confines it to less than
+ * the window (-holds; PROTOCOL.md, "The pointer of a game that does not confine it"). Off, -holds is the relative mode,
+ * and every path below is the one of a wsd without the option. */
+static BOOL g_free_pointer;
+static NSTimeInterval g_hold_time;  /* with the option: uptime of the last hold; the moves queued before it were places */
+@class WsdWindow;
+static __weak WsdWindow *g_holder;  /* with the option: the window that holds the pointer */
 static uint64_t g_hide_gen;        /* the generation of the last -hideSoon, never 0 */
 static NSCursor *g_cursor;         /* the cursor over the windows (CURSOR_SET), nil for the arrow */
 static BOOL g_ever_active;         /* wsd has been the active app since it started */
@@ -205,6 +214,11 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property uint64_t statLastNs, statSumNs, statMaxNs, statMinNs;
 @property uint32_t statCount;
 @property BOOL relative, clip, fullscreen, transitioning;
+/* the window's client has the pointer: its relative mode, and with --free-unconfined-pointer only while it confines it */
+@property(readonly) BOOL holds;
+/* --free-unconfined-pointer, while held: where the client's cursor is, in its pixels (the moves go to the client, which
+ * keeps its cursor inside the clip rectangle), and what the driver keeps of a move's fraction */
+@property NSPoint heldPx, heldRest;
 /* the generation of a hide waiting HIDE_DELAY_NS for a show that would cancel it (-hideSoon), 0 for none */
 @property uint64_t pendingHide;
 /* visible as the client sees it: on screen, and no hide waiting */
@@ -239,6 +253,8 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 - (void)syncCapsLock:(BOOL)on;
 - (void)fitScreen:(BOOL)rescaled;
 - (void)keepPixelsFromScale:(WsdScale)old;
+- (void)settlePointer:(const char *)why;
+- (void)heldMovedBy:(NSPoint)d;
 @end
 
 static __weak WsdWindow *g_focus_wanted; /* WINDOW_FOCUS while wsd was not active: made key once it is */
@@ -607,12 +623,45 @@ static void app_icon_game(WsdClient *c) {
   apply_app_icon("its window presents");
 }
 
+/* Whether a click where the pointer is would go to the content of one of wsd's windows. */
+static BOOL pointer_over_game(void) {
+  NSPoint p = NSEvent.mouseLocation;
+  NSWindow *w = [NSApp windowWithWindowNumber:[NSWindow windowNumberAtPoint:p belowWindowWithWindowNumber:0]];
+  return [w isKindOfClass:WsdNSWindow.class] && NSPointInRect([w convertPointFromScreen:p], w.contentView.frame);
+}
+
+/* --free-unconfined-pointer: a hide is the whole app's, over every window of any app, while on Windows a game's hidden
+ * cursor is hidden over its window alone. While the game leaves the pointer free, where the pointer is decides, looked at
+ * 30 times a second (a window above the game is another app's: wsd hears of no move there). */
+static void sync_cursor(void);
+static void watch_free_cursor(BOOL on) {
+  static dispatch_source_t timer;
+  if (on == (timer != nil)) return;
+  if (!on) {
+    dispatch_source_cancel(timer);
+    timer = nil;
+    return;
+  }
+  timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+  dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 30, NSEC_PER_SEC / 100);
+  dispatch_source_set_event_handler(timer, ^{ sync_cursor(); });
+  dispatch_resume(timer);
+}
+
 /* The cursor is hidden while the client asks for it, unless one of its windows stopped showing frames. */
 static void sync_cursor(void) {
   BOOL hide = g_cursor_hide_wanted;
   for (WsdClient *c in g_clients)
     for (WsdWindow *w in c.windows.allValues)
       if (w.stalled) hide = NO;
+  if (g_free_pointer) {
+    if (!NSApp.active) hide = NO; /* the cursor is another app's to show */
+    watch_free_cursor(hide && !g_relative_global);
+    if (hide && !g_relative_global && !pointer_over_game()) {
+      hide = NO;
+      if (g_cursor_hidden) [NSCursor.arrowCursor set]; /* over another app's window: not the game's last cursor */
+    }
+  }
   if (hide && !g_cursor_hidden) { [NSCursor hide]; g_cursor_hidden = 1; }
   if (!hide && g_cursor_hidden) { [NSCursor unhide]; g_cursor_hidden = 0; }
 }
@@ -764,6 +813,25 @@ static NSCursor *system_cursor(uint32_t cursor) {
   return nil;
 }
 
+/* The pointer goes to `to` (global display points): CURSOR_WARP's way, see there. */
+static BOOL warp_pointer(CGPoint to) {
+  CGEventRef now_ev = CGEventCreate(NULL);
+  CGPoint from = now_ev ? CGEventGetLocation(now_ev) : to;
+  if (now_ev) CFRelease(now_ev);
+  CGSetLocalEventsSuppressionInterval(0);
+  CGError e = CGWarpMouseCursorPosition(to);
+  CGSetLocalEventsSuppressionInterval(0.25);
+  if (e != kCGErrorSuccess) return NO;
+  g_warp_time = NSProcessInfo.processInfo.systemUptime;
+  CGPoint jump = CGPointMake(to.x - from.x, to.y - from.y);
+  /* a warp before whose jump no move carried yet: the next one carries both (the pointer freed and held again at once) */
+  if (g_free_pointer) jump = CGPointMake(jump.x + g_warp_jump.x, jump.y + g_warp_jump.y);
+  BOOL keep = fabs(jump.x) + fabs(jump.y) >= 1 && [NSApp.keyWindow isKindOfClass:WsdNSWindow.class];
+  g_warp_jump = keep ? jump : CGPointZero;
+  CGAssociateMouseAndMouseCursorPosition(true);
+  return YES;
+}
+
 /* Shows g_cursor at once when the pointer is over the content of one of wsd's windows; anywhere else it comes with
  * the next -cursorUpdate:, when the pointer enters a window. */
 static void apply_cursor(void) {
@@ -785,6 +853,78 @@ static NSWindowStyleMask style_mask(uint32_t style) {
   if (style & WSD_STYLE_RESIZABLE) mask |= NSWindowStyleMaskResizable;
   if (style & WSD_STYLE_MINIATURIZABLE) mask |= NSWindowStyleMaskMiniaturizable;
   return mask;
+}
+
+/* ---------------------------------------------------------------- the pointer channel (wsd_pointer.h, PROTOCOL.md) */
+
+@interface WsdReader : NSObject
+@property int fd;
+@property pid_t pid;
+@property(strong) dispatch_source_t readSrc, writeSrc;
+@property(strong) NSMutableData *outbuf;
+@end
+static NSMutableArray<WsdReader *> *g_readers;       /* nil without --pointer-socket, and while nobody reads */
+static char g_pointer_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+#define POINTER_BACKLOG (256u << 10)                 /* a reader that leaves more unread is dropped: 8 s of a 1000 Hz mouse */
+static void pointer_changed(void);
+
+@implementation WsdReader
+- (void)close {
+  if (self.fd < 0) return;
+  dispatch_source_cancel(self.readSrc);
+  if (self.writeSrc) dispatch_source_cancel(self.writeSrc);
+  close(self.fd);
+  self.fd = -1;
+  LOG("pointer channel: reader %d left", self.pid);
+  [g_readers removeObjectIdenticalTo:self];
+  if (!g_readers.count) g_readers = nil;
+}
+- (void)flush {
+  while (self.fd >= 0 && self.outbuf.length) {
+    ssize_t r = write(self.fd, self.outbuf.bytes, self.outbuf.length);
+    if (r > 0) {
+      [self.outbuf replaceBytesInRange:NSMakeRange(0, (NSUInteger)r) withBytes:NULL length:0];
+      continue;
+    }
+    if (r < 0 && errno == EINTR) continue;
+    if (r < 0 && errno == EAGAIN) {
+      if (!self.writeSrc) {
+        self.writeSrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_WRITE, (uintptr_t)self.fd, 0, dispatch_get_main_queue());
+        __weak WsdReader *wr = self;
+        dispatch_source_set_event_handler(self.writeSrc, ^{
+          WsdReader *s = wr;
+          [s flush];
+          if (s && !s.outbuf.length && s.writeSrc) { dispatch_source_cancel(s.writeSrc); s.writeSrc = nil; }
+        });
+        dispatch_resume(self.writeSrc);
+      }
+      return;
+    }
+    [self close];
+  }
+}
+- (void)tell:(uint32_t)type payload:(const void *)p len:(uint32_t)n {
+  if (self.fd < 0) return;
+  struct wsd_pointer_hdr h = {type, n};
+  [self.outbuf appendBytes:&h length:sizeof(h)];
+  [self.outbuf appendBytes:p length:n];
+  if (self.outbuf.length > POINTER_BACKLOG) {
+    LOG("pointer channel: reader %d does not read, dropping it", self.pid);
+    [self close];
+    return;
+  }
+  [self flush];
+}
+@end
+
+static void pointer_tell(uint32_t type, const void *p, uint32_t n) {
+  for (WsdReader *r in [g_readers copy]) [r tell:type payload:p len:n];
+}
+
+static void pointer_move(float dx, float dy, uint64_t ns) {
+  if (!g_readers) return;
+  struct wsd_pointer_move m = {dx, dy, ns};
+  pointer_tell(WSD_POINTER_MOVE, &m, sizeof(m));
 }
 
 /* ---------------------------------------------------------------- view and input */
@@ -873,6 +1013,12 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)button:(NSEvent *)e which:(uint32_t)b down:(BOOL)down {
   struct wsd_ev_button m = {self.ww.windowId, b, down, (uint32_t)(e.modifierFlags >> 16), 0, 0, [self evNs:e]};
   [self pixelPoint:e x:&m.x y:&m.y];
+  if (g_free_pointer && self.ww.relative && !self.ww.holds) {
+    /* the driver, which believes the pointer is locked, takes a button where the last move was: a click that no move came
+     * before (the one that brings the app back) happens where the pointer is */
+    struct wsd_ev_motion at = {m.window_id, [self synth], m.x, m.y, m.time_ns};
+    [self.ww sendEvent:WSD_EV_MOTION payload:&at len:sizeof(at) extra:nil];
+  }
   [self.ww sendEvent:WSD_EV_BUTTON payload:&m len:sizeof(m) extra:nil];
 }
 - (void)mouseDown:(NSEvent *)e { [self button:e which:0 down:YES]; }
@@ -888,8 +1034,12 @@ static CAMetalLayer *make_metal_layer(void) {
     jump = g_warp_jump;
     g_warp_jump = CGPointZero;
   }
-  if (w.relative) {
+  if (w.holds) {
     if (w.stalled) return; /* the user's pointer, not the game's camera: a stopped game would get it all at once */
+    /* The moves of before the game took the pointer moved it over the menu: the camera does not turn by them. macOS joins
+     * the moves of a frame into one event, told when the frame ends: the one the hold falls into carries both, and is
+     * dropped whole. */
+    if (g_free_pointer && !g_injecting && e.timestamp <= g_hold_time + 1.0 / 60) return;
     double dx = e.deltaX, dy = e.deltaY;
     if (fabs(dx - jump.x) + fabs(dy - jump.y) < fabs(dx) + fabs(dy)) { /* never for a zero jump */
       LOG("window %u: first move after a pointer warp (%.0f,%.0f) taken as (%.0f,%.0f)", w.windowId, dx, dy,
@@ -899,6 +1049,8 @@ static CAMetalLayer *make_metal_layer(void) {
     }
     struct wsd_ev_relative r = {w.windowId, [self synth], (float)dx, (float)dy, [self evNs:e]};
     [w sendEvent:WSD_EV_RELATIVE payload:&r len:sizeof(r) extra:nil];
+    if (g_free_pointer) [w heldMovedBy:NSMakePoint(dx, dy)];
+    pointer_move(r.dx, r.dy, r.time_ns);
     return;
   }
   /* the mouse moves macOS queued before a CURSOR_WARP still carry the place the pointer left */
@@ -952,6 +1104,7 @@ static CAMetalLayer *make_metal_layer(void) {
   struct wsd_ev_resize r = {self.windowId, (uint32_t)lround(sz.width * s.x), (uint32_t)lround(sz.height * s.y),
                             (uint32_t)lround(s.x * 1000)};
   [self sendEvent:WSD_EV_RESIZE payload:&r len:sizeof(r) extra:nil];
+  [self settlePointer:"window resized"];
 }
 /* Client pixels per view point, per axis, for the pointer: the scale, unless the view shows a frame of another size.
  * The layer stretches the client's last frame over the view (kCAGravityResize), and a window can have another size
@@ -1024,10 +1177,92 @@ static CAMetalLayer *make_metal_layer(void) {
         ![self.heldKeys containsIndex:modifiers[i]])
       [self sendKey:modifiers[i] down:YES];
 }
+/* Whether the client confines the pointer to less than the window (two pixels, for a size that is no whole number of them).
+ * A fullscreen window's clip is never off: win32u clips to the whole monitor when the game clips to nothing. */
+- (BOOL)confines {
+  if (!self.clip) return NO;
+  WsdScale s = [self pointerScale];
+  NSSize v = self.view.bounds.size;
+  return self.clipPx.size.width < v.width * s.x - 2 || self.clipPx.size.height < v.height * s.y - 2;
+}
+- (BOOL)holds {
+  return self.relative && (!g_free_pointer || [self confines]);
+}
+- (NSPoint)insideClip:(NSPoint)px {
+  NSRect c = self.clipPx;
+  return NSMakePoint(MIN(MAX(px.x, c.origin.x), c.origin.x + c.size.width - 1),
+                     MIN(MAX(px.y, c.origin.y), c.origin.y + c.size.height - 1));
+}
+/* Follows the client's cursor while it only gets moves, by the driver's own arithmetic: whole pixels, what is left of a
+ * move kept for the next, inside the clip rectangle. */
+- (void)heldMovedBy:(NSPoint)d {
+  NSPoint r = NSMakePoint(self.heldRest.x + d.x, self.heldRest.y + d.y);
+  NSPoint whole = NSMakePoint(trunc(r.x), trunc(r.y));
+  self.heldRest = NSMakePoint(r.x - whole.x, r.y - whole.y);
+  self.heldPx = [self insideClip:NSMakePoint(self.heldPx.x + whole.x, self.heldPx.y + whole.y)];
+}
+/* The client pixel the pointer is over, clamped into the content. */
+- (NSPoint)pointerPx {
+  WsdScale s = [self pointerScale];
+  NSSize v = self.view.bounds.size;
+  NSPoint p = [self.view convertPoint:[self.window convertPointFromScreen:NSEvent.mouseLocation] fromView:nil];
+  return NSMakePoint(floor(MIN(MAX(p.x, 0), v.width - 1) * s.x), floor(MIN(MAX(v.height - p.y, 0), v.height - 1) * s.y));
+}
+/* A global display point over client pixel px: macOS puts a warped pointer on a whole point, so one inside the pixel when
+ * there is one (always, up to one pixel a point), else the one next to its middle. */
+- (CGPoint)wholePointForPixel:(NSPoint)px {
+  CGPoint a = [self screenPointForPixel:px], b = [self screenPointForPixel:NSMakePoint(px.x + 1, px.y + 1)];
+  CGPoint in = CGPointMake(ceil(a.x + 0.01), ceil(a.y + 0.01));
+  return CGPointMake(in.x < b.x - 0.01 ? in.x : round((a.x + b.x) / 2), in.y < b.y - 0.01 ? in.y : round((a.y + b.y) / 2));
+}
+/* --free-unconfined-pointer. */
+- (void)takePointer:(const char *)why {
+  self.heldPx = [self insideClip:[self pointerPx]];
+  self.heldRest = NSZeroPoint;
+  /* The pointer stands still from here on, and a button goes to the window under it: one that is above the game, or beside
+   * it, is left first. Over the game nothing is warped, so nothing has to be taken out of the next move. */
+  if (!pointer_over_game()) warp_pointer([self wholePointForPixel:self.heldPx]);
+  CGError e = CGAssociateMouseAndMouseCursorPosition(false);
+  g_relative_global = (e == kCGErrorSuccess);
+  g_holder = g_relative_global ? self : nil;
+  g_hold_time = NSProcessInfo.processInfo.systemUptime;
+  NSRect c = self.clipPx;
+  LOG("window %u: pointer held by the game (%s, clip %.0fx%.0f at %.0f,%.0f)%s", self.windowId, why, c.size.width,
+      c.size.height, c.origin.x, c.origin.y, g_relative_global ? "" : ": REFUSED by macOS");
+  sync_cursor();
+}
+- (void)letGo:(const char *)why byGame:(BOOL)game {
+  if (!g_relative_global || g_holder != self) return;
+  CGAssociateMouseAndMouseCursorPosition(true);
+  g_relative_global = NO;
+  g_holder = nil;
+  if (game) {
+    /* the pointer comes back where the client's cursor is, so the first place it is sent is the one it has */
+    warp_pointer([self wholePointForPixel:self.heldPx]);
+    NSRect c = self.clip ? self.clipPx : NSZeroRect;
+    LOG("window %u: pointer freed by the game (%s, clip %.0fx%.0f at %.0f,%.0f), it is at %.0f,%.0f", self.windowId, why,
+        c.size.width, c.size.height, c.origin.x, c.origin.y, self.heldPx.x, self.heldPx.y);
+  } else {
+    LOG("window %u: pointer given back (%s)", self.windowId, why);
+  }
+  sync_cursor();
+}
+/* The one place that decides, with --free-unconfined-pointer: called after anything it depends on changed. */
+- (void)settlePointer:(const char *)why {
+  if (g_free_pointer) {
+    BOOL has = g_relative_global && g_holder == self;
+    BOOL mayHold = !self.stalled && self.window.keyWindow;
+    if (has && !(mayHold && self.holds)) [self letGo:why byGame:mayHold && self.relative];
+    else if (!has && mayHold && self.holds) [self takePointer:why];
+    else if (has) self.heldPx = [self insideClip:self.heldPx]; /* another small clip */
+  }
+  pointer_changed();
+}
 - (void)windowDidBecomeKey:(NSNotification *)n {
   /* the window is key: a relative-mode window takes the pointer once it shows frames, whether it held it before or
    * its request came while the window was not key (see WSD_RELATIVE_MOUSE) */
-  if (self.relative && !g_relative_global && !self.stalled) {
+  if (g_free_pointer) [self settlePointer:"focus back"];
+  else if (self.relative && !g_relative_global && !self.stalled) {
     CGError e = CGAssociateMouseAndMouseCursorPosition(false);
     g_relative_global = (e == kCGErrorSuccess);
     LOG("window %u: focus back, relative mouse resumed (%d)", self.windowId, e);
@@ -1042,11 +1277,13 @@ static CAMetalLayer *make_metal_layer(void) {
   /* The pointer disassociation is global: leaving the window (Cmd+Tab, another app, a notification) must give the
    * user their cursor back at once, whatever the game does with the focus event (2026-10-03 session: the cursor
    * stayed captured and the user had to kill wsd). */
-  if (self.relative && g_relative_global) {
+  if (g_free_pointer) [self letGo:"focus lost" byGame:NO];
+  else if (self.relative && g_relative_global) {
     CGAssociateMouseAndMouseCursorPosition(true);
     g_relative_global = NO;
     LOG("window %u: focus lost, relative mouse suspended", self.windowId);
   }
+  pointer_changed();
   [self releaseHeldKeys];
   struct wsd_window_flag f = {self.windowId, 0};
   [self sendEvent:WSD_EV_FOCUS payload:&f len:sizeof(f) extra:nil];
@@ -1058,7 +1295,8 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)checkStalled:(uint64_t)now {
   if (self.stalled || !self.shownNs || now - self.shownNs < STALL_NS || (!self.relative && !self.clip)) return;
   self.stalled = YES;
-  if (self.relative && g_relative_global) {
+  if (g_free_pointer) [self letGo:"no frame shown" byGame:NO];
+  else if (self.relative && g_relative_global) {
     CGAssociateMouseAndMouseCursorPosition(true);
     g_relative_global = NO;
   }
@@ -1071,6 +1309,12 @@ static CAMetalLayer *make_metal_layer(void) {
   self.shownNs = ns;
   if (!self.stalled) return;
   self.stalled = NO;
+  if (g_free_pointer) {
+    LOG("window %u: frames shown again after %.1f s", self.windowId, gap / 1e9);
+    [self settlePointer:"frames shown again"];
+    sync_cursor();
+    return;
+  }
   CGError e = kCGErrorSuccess;
   BOOL take = self.relative && !g_relative_global && self.window.keyWindow;
   if (take) {
@@ -1918,6 +2162,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     NEED(wsd_window_flag);
     g_cursor_hide_wanted = !m->value;
     sync_cursor();
+    pointer_changed();
     break;
   }
   case WSD_CURSOR_CLIP: {
@@ -1926,6 +2171,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     if (!w) break;
     w.clip = m->enable && m->width && m->height;
     w.clipPx = NSMakeRect(m->x, m->y, m->width, m->height);
+    [w settlePointer:"it clipped"];
     break;
   }
   case WSD_RELATIVE_MOUSE: {
@@ -1933,6 +2179,14 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     WsdWindow *w = [self win:m->window_id req:type];
     if (!w) break;
     BOOL on = m->value != 0;
+    if (g_free_pointer) {
+      if (on == w.relative) break;
+      w.relative = on;
+      LOG("client %d: relative mouse %s%s", self.pid, on ? "on" : "off",
+          on && ![w holds] ? ", the pointer stays free: the game does not confine it" : "");
+      [w settlePointer:on ? "relative mouse on" : "relative mouse off"];
+      break;
+    }
     /* The pointer belongs to the game only while its window is key and shows frames, since disassociating it is
      * global: a request made before waits, and -windowDidBecomeKey: or the next frame shown takes the pointer. */
     if (on && (w.stalled || !w.window.keyWindow)) {
@@ -2235,19 +2489,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
      * pointer still, then the mouse moves already queued are dropped (-motion:). In a window, the pixel is the one
      * its moves report (warp_point). */
     if (!NSApp.active || g_relative_global) break;
-    CGPoint to = warp_point(self, m->x, m->y);
-    CGEventRef now_ev = CGEventCreate(NULL);
-    CGPoint from = now_ev ? CGEventGetLocation(now_ev) : to;
-    if (now_ev) CFRelease(now_ev);
-    CGSetLocalEventsSuppressionInterval(0);
-    CGError e = CGWarpMouseCursorPosition(to);
-    CGSetLocalEventsSuppressionInterval(0.25);
-    if (e != kCGErrorSuccess) { [self error:type code:-EIO]; break; }
-    g_warp_time = NSProcessInfo.processInfo.systemUptime;
-    CGPoint jump = CGPointMake(to.x - from.x, to.y - from.y);
-    BOOL keep = fabs(jump.x) + fabs(jump.y) >= 1 && [NSApp.keyWindow isKindOfClass:WsdNSWindow.class];
-    g_warp_jump = keep ? jump : CGPointZero;
-    CGAssociateMouseAndMouseCursorPosition(true);
+    if (!warp_pointer(warp_point(self, m->x, m->y))) [self error:type code:-EIO];
     break;
   }
   case WSD_CURSOR_DEFINE: {
@@ -2343,6 +2585,139 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   if (!self.dead) [self.inbuf replaceBytesInRange:NSMakeRange(0, off) withBytes:NULL length:0];
 }
 @end
+
+/* ---------------------------------------------------------------- the pointer channel's server */
+
+/* The window the channel tells of: the one whose client captures the mouse, else the game's (the one with an overlay
+ * plane), else the largest shown. */
+static WsdWindow *game_window(void) {
+  WsdWindow *best = nil;
+  double bestScore = 0;
+  for (WsdClient *c in g_clients)
+    for (WsdWindow *w in c.windows.allValues) {
+      NSSize v = w.view.bounds.size;
+      double score = (w.relative ? 1e12 : 0) + (w.overlay && w.shown ? 1e10 : 0) + (w.shown ? 1 + v.width * v.height : 0);
+      if (score > bestScore) { best = w; bestScore = score; }
+    }
+  return best;
+}
+
+static struct wsd_pointer_state pointer_state(void) {
+  struct wsd_pointer_state st;
+  memset(&st, 0, sizeof(st));
+  WsdWindow *w = game_window();
+  if (!w) return st;
+  BOOL held = g_relative_global && w.holds && w.window.keyWindow;
+  st.state = !w.relative ? WSD_POINTER_NONE : !w.holds ? WSD_POINTER_FREE : held ? WSD_POINTER_HELD : WSD_POINTER_AWAY;
+  st.flags = (w.window.keyWindow ? WSD_POINTER_WINDOW_KEY : 0) | (w.fullscreen ? WSD_POINTER_WINDOW_FULLSCREEN : 0) |
+             (g_cursor_hide_wanted ? WSD_POINTER_CURSOR_HIDDEN : 0) | (w.shown ? WSD_POINTER_WINDOW_SHOWN : 0) |
+             (w.stalled ? WSD_POINTER_STALLED : 0);
+  st.window_number = w.window.windowNumber > 0 ? (uint32_t)w.window.windowNumber : 0;
+  st.client_pid = (uint32_t)w.client.pid;
+  NSRect r = [w.window convertRectToScreen:[w.view convertRect:w.view.bounds toView:nil]];
+  WsdScale s = [w pointerScale];
+  st.x = r.origin.x;
+  st.y = NSMaxY(primary_screen().frame) - NSMaxY(r);
+  st.width = r.size.width;
+  st.height = r.size.height;
+  st.scale_x = s.x;
+  st.scale_y = s.y;
+  if (w.clip) {
+    st.clip_x = (int32_t)w.clipPx.origin.x;
+    st.clip_y = (int32_t)w.clipPx.origin.y;
+    st.clip_width = (uint32_t)w.clipPx.size.width;
+    st.clip_height = (uint32_t)w.clipPx.size.height;
+  }
+  return st;
+}
+
+/* Tells the readers of the state when it is another than the last one told; looked at by whatever changes the pointer, and ten
+ * times a second for the window's place. Nothing without a reader. */
+static struct wsd_pointer_state g_pointer_told;
+static void pointer_changed(void) {
+  if (!g_readers) return;
+  struct wsd_pointer_state st = pointer_state();
+  if (!memcmp(&st, &g_pointer_told, offsetof(struct wsd_pointer_state, time_ns))) return;
+  st.time_ns = now_ns();
+  g_pointer_told = st;
+  pointer_tell(WSD_POINTER_STATE, &st, sizeof(st));
+}
+
+static dispatch_source_t g_pointer_timer; /* while somebody reads */
+static void pointer_accept(int ls) {
+  int fd = accept(ls, NULL, NULL);
+  if (fd < 0) return;
+  uid_t uid; gid_t gid;
+  pid_t pid = -1;
+  socklen_t pl = sizeof(pid);
+  getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &pl);
+  if (getpeereid(fd, &uid, &gid) || uid != getuid() || g_readers.count >= 8) {
+    LOG("pointer channel: refusing peer pid %d", pid);
+    close(fd);
+    return;
+  }
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+  fcntl(fd, F_SETFL, O_NONBLOCK);
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
+  WsdReader *r = [WsdReader new];
+  r.fd = fd;
+  r.pid = pid;
+  r.outbuf = [NSMutableData data];
+  r.readSrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, dispatch_get_main_queue());
+  __weak WsdReader *wr = r;
+  dispatch_source_set_event_handler(r.readSrc, ^{
+    /* nothing is asked here, so nothing is read: the end of the connection and a byte sent end the reader alike */
+    [wr close];
+  });
+  dispatch_resume(r.readSrc);
+  if (!g_readers) g_readers = [NSMutableArray array];
+  [g_readers addObject:r];
+  LOG("pointer channel: reader %d", pid);
+  struct wsd_pointer_hello hello = {WSD_POINTER_VERSION, (uint32_t)getpid()};
+  [r tell:WSD_POINTER_HELLO payload:&hello len:sizeof(hello)];
+  pointer_changed(); /* the readers already there hear of what changed unseen first */
+  struct wsd_pointer_state st = pointer_state();
+  st.time_ns = now_ns();
+  g_pointer_told = st;
+  [r tell:WSD_POINTER_STATE payload:&st len:sizeof(st)];
+  if (g_pointer_timer) return;
+  g_pointer_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+  dispatch_source_set_timer(g_pointer_timer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 10, NSEC_PER_SEC / 50);
+  dispatch_source_set_event_handler(g_pointer_timer, ^{
+    pointer_changed();
+    if (g_readers) return;
+    dispatch_source_cancel(g_pointer_timer);
+    g_pointer_timer = nil;
+  });
+  dispatch_resume(g_pointer_timer);
+}
+
+/* --pointer-socket PATH, in a folder of this user alone. Without it, or when it cannot be made, wsd runs as without it. */
+static int pointer_listen(const char *path) {
+  struct sockaddr_un sa = {.sun_family = AF_UNIX};
+  const char *slash = strrchr(path, '/');
+  char dir[sizeof(sa.sun_path)] = ".";
+  if (strlen(path) >= sizeof(sa.sun_path) || slash == path) { LOG("pointer channel: refusing the path"); return -1; }
+  if (slash) snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+  struct stat st;
+  if (lstat(dir, &st) || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 0077)) {
+    LOG("pointer channel: refusing %s: must be a directory owned by uid %d with mode 0700", dir, getuid());
+    return -1;
+  }
+  strcpy(sa.sun_path, path);
+  unlink(path);
+  int s = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (s < 0 || bind(s, (struct sockaddr *)&sa, sizeof(sa)) || chmod(path, 0600) || listen(s, 8)) {
+    LOG("pointer channel: %s: %s", path, strerror(errno));
+    if (s >= 0) close(s);
+    return -1;
+  }
+  fcntl(s, F_SETFL, O_NONBLOCK);
+  fcntl(s, F_SETFD, FD_CLOEXEC);
+  strcpy(g_pointer_path, path);
+  return s;
+}
 
 /* ---------------------------------------------------------------- main */
 
@@ -2488,6 +2863,7 @@ static BOOL session_ending(void) {
  * was in. On request, wineobelisk.drv may keep a fullscreen game in the foreground instead; its window is no longer key
  * all the same, so the game does not take the user's pointer (see WSD_RELATIVE_MOUSE). */
 - (void)applicationDidResignActive:(NSNotification *)n {
+  if (g_free_pointer) sync_cursor();
   for (WsdClient *c in g_clients) [c send:WSD_EV_APP_DEACTIVATED payload:NULL len:0 extra:nil];
 }
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)app hasVisibleWindows:(BOOL)flag {
@@ -2497,6 +2873,7 @@ static BOOL session_ending(void) {
 - (void)applicationDidBecomeActive:(NSNotification *)n {
   if (g_ever_active) unminimize_if_none_visible();
   g_ever_active = YES;
+  if (g_free_pointer) sync_cursor();
   WsdWindow *w = g_focus_wanted;
   g_focus_wanted = nil;
   if (w.shown && !((WsdNSWindow *)w.window).noActivate) [w orderInFront:YES];
@@ -2584,15 +2961,18 @@ static int parse_render_percent(const char *arg) {
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    const char *dir = NULL, *render_percent = NULL;
+    const char *dir = NULL, *render_percent = NULL, *pointer_socket = NULL;
     for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--dir") && i + 1 < argc) dir = argv[++i];
       else if (!strcmp(argv[i], "--exit-on-disconnect")) g_exit_on_disconnect = YES;
+      else if (!strcmp(argv[i], "--free-unconfined-pointer")) g_free_pointer = YES;
+      else if (!strcmp(argv[i], "--pointer-socket") && i + 1 < argc) pointer_socket = argv[++i];
       else if (!strcmp(argv[i], "--render-percent")) /* a following option is not its value */
         render_percent = i + 1 < argc && strncmp(argv[i + 1], "--", 2) ? argv[++i] : "(no value)";
     }
     if (!dir) {
-      fprintf(stderr, "usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N]\n");
+      fprintf(stderr, "usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N] "
+                      "[--free-unconfined-pointer] [--pointer-socket PATH]\n");
       return 2;
     }
     setvbuf(stderr, NULL, _IOLBF, 0);
@@ -2642,6 +3022,7 @@ int main(int argc, char **argv) {
         LOG("signal %d, restoring input state and exiting", sn);
         restore_input_state();
         unlink(path);
+        if (g_pointer_path[0]) unlink(g_pointer_path);
         exit(0);
       });
       dispatch_resume(sigsrc[i]);
@@ -2690,6 +3071,16 @@ int main(int argc, char **argv) {
     acc = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)ls, 0, dispatch_get_main_queue());
     dispatch_source_set_event_handler(acc, ^{ accept_one(ls); });
     dispatch_resume(acc);
+
+    static dispatch_source_t pointer_acc;
+    int pointer_ls = pointer_socket ? pointer_listen(pointer_socket) : -1;
+    if (pointer_ls >= 0) {
+      pointer_acc = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)pointer_ls, 0, dispatch_get_main_queue());
+      dispatch_source_set_event_handler(pointer_acc, ^{ pointer_accept(pointer_ls); });
+      dispatch_resume(pointer_acc);
+      LOG("pointer channel: listening on %s", g_pointer_path);
+    }
+    if (g_free_pointer) LOG("the pointer is held only while the game confines it (--free-unconfined-pointer)");
 
     /* every second, not per frame: windows holding the pointer without new frames give it back */
     static dispatch_source_t stall_timer;
