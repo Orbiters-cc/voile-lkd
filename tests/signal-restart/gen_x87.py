@@ -38,25 +38,30 @@ class P:
         while self.st and not self.st[-1]: self.st.pop()
 def body(n, stop):
     R.seed(f'{sys.argv[1]}/{n}'); p = P()
-    w('fninit'); w('xorl %eax,%eax'); w('xorl %ecx,%ecx'); w('movl $0x1234,%eax')
+    w('fninit'); w('xorl %eax,%eax'); w('xorl %ecx,%ecx'); w('movl $0x1234,%eax'); w('movups 0x30(%rdx),%xmm1')
     for _ in range(R.randrange(1, 14)): p.op()
     # the instruction that faults
     top = bool(p.st) and p.st[0]; f = []
     if top: f += ['fstpl (%rdi)', 'fstl (%rdi)', 'fstps (%rdi)', 'fstpt (%rdi)', 'fstpl (%rdi)', 'fistpll (%rdi)', 'faddl (%rdi)', 'fmuls (%rdi)', 'fcoml (%rdi)']
     if p.room(): f += ['fldl (%rdi)', 'flds (%rdi)', 'fldt (%rdi)', 'fildll (%rdi)']
+    f += ['fxsave64 (%rdi)', 'fnstenv (%rdi)', 'fnsave (%rdi)', 'movq (%rdi),%mm0', 'paddd (%rdi),%mm2', 'fxsave64 (%rdi)']
     f += ['movq %rax,(%rdi)', 'addq %rax,(%rdi)', 'movq (%rdi),%rcx', 'movups %xmm1,(%rdi)', 'adcq $0,(%rdi)', 'fnstcw (%rdi)']
     i = R.choice(f)
+    mmx.append('mm' in i and 'xmm' not in i); image.append(1 if 'fxsave' in i else 2 if i.startswith(('fnsave', 'fnstenv')) else 0)
     if stop: w('fxsave64 (%rsi)'); w('fninit'); w('retq'); return
     print(f'.globl xf_{n}\nxf_{n}:'); w(i)
+    if 'mm' in i and 'xmm' not in i: w('emms'); p.st = []
+    if i == 'fnsave (%rdi)': p.st = []
     if i.startswith('fstp') or i.startswith('fistp'): p.pop()
     if i.startswith(('fld', 'fild')): p.push()
     for _ in range(R.randrange(0, 10)): p.op()
     w('fxsave64 (%rsi)'); w('fninit'); w('retq')
+mmx, image = [], []
 print('.text')
 for n in range(COUNT):
     for kind, stop in (('x', False), ('y', True)):
         print(f'.globl {kind}_{n}\n.p2align 4\n{kind}_{n}:'); body(n, stop)
 print('.section .rodata\n.globl x87_table, x87_count\n.p2align 3\nx87_table:')
-for n in range(COUNT): print(f'    .quad x_{n},y_{n},xf_{n}')
+for n in range(COUNT): print(f'    .quad x_{n},y_{n},xf_{n},{int(mmx[2 * n])},{image[2 * n]}')
 print(f'x87_count: .quad {COUNT}')
 print('.section .note.GNU-stack,"",@progbits')

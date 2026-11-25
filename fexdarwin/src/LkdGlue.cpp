@@ -174,7 +174,23 @@ void ReapDeadThreads() {
   }
 }
 
-void SetRealTime(pthread_t P, bool On);
+// Whether the thread runs before every other that is no real-time one. Back, it is scheduled as a thread is by default, which every
+// guest thread is (LKD keeps the guest's priorities to itself); the second call has its priority computed again from what it has used,
+// which otherwise counts only from its next quantum on: a thread that is kicked all the time would run before the others for ever.
+void SetRealTime(pthread_t P, bool On) {
+  const thread_t Port = pthread_mach_thread_np(P);
+  if (On) {
+    static const mach_timebase_info_data_t Tb = [] { mach_timebase_info_data_t V; mach_timebase_info(&V); return V; }();
+    const auto Ticks = [](uint64_t Ns) { return static_cast<uint32_t>(Ns * Tb.denom / Tb.numer); };
+    thread_time_constraint_policy_data_t D {.period = 0, .computation = Ticks(200 * 1000), .constraint = Ticks(1000 * 1000), .preemptible = 1};
+    thread_policy_set(Port, THREAD_TIME_CONSTRAINT_POLICY, reinterpret_cast<thread_policy_t>(&D), THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+  } else {
+    thread_standard_policy_data_t D {};
+    thread_policy_set(Port, THREAD_STANDARD_POLICY, reinterpret_cast<thread_policy_t>(&D), THREAD_STANDARD_POLICY_COUNT);
+    thread_precedence_policy_data_t Pr {.importance = 0};
+    thread_policy_set(Port, THREAD_PRECEDENCE_POLICY, reinterpret_cast<thread_policy_t>(&Pr), THREAD_PRECEDENCE_POLICY_COUNT);
+  }
+}
 void EndKickBoost(GuestThread* T, pthread_t P) {
   if (T->KickBoosted.exchange(0)) SetRealTime(P, false);
 }
@@ -249,20 +265,8 @@ void Kick(lkd_task* t) {
 // A thread that computes reaches a safe point within microseconds, when it runs. On a machine with more to run than it has cores it
 // may be off its core for tens of milliseconds, and a collector that suspends every thread waits for the last of them. What has not
 // seen its kick after KickBoostNs runs before everything else, until the first system call after its handler has begun (Wine's writes
-// its context to the server), at the latest for KickBoostMaxNs. This thread runs so itself.
+// its context to the server), at the latest for KickBoostMaxNs. This thread runs before everything itself.
 constexpr uint64_t KickBoostNs = 250 * 1000, KickBoostMaxNs = 5 * 1000 * 1000;
-void SetRealTime(pthread_t P, bool On) {
-  if (On) {
-    static const mach_timebase_info_data_t Tb = [] { mach_timebase_info_data_t V; mach_timebase_info(&V); return V; }();
-    const auto Ticks = [](uint64_t Ns) { return static_cast<uint32_t>(Ns * Tb.denom / Tb.numer); };
-    thread_time_constraint_policy_data_t D {.period = 0, .computation = Ticks(200 * 1000), .constraint = Ticks(1000 * 1000), .preemptible = 1};
-    thread_policy_set(pthread_mach_thread_np(P), THREAD_TIME_CONSTRAINT_POLICY, reinterpret_cast<thread_policy_t>(&D), THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-  } else {
-    thread_standard_policy_data_t D {};
-    thread_policy_set(pthread_mach_thread_np(P), THREAD_STANDARD_POLICY, reinterpret_cast<thread_policy_t>(&D), THREAD_STANDARD_POLICY_COUNT);
-  }
-}
-
 void* KickBoostThread(void*) {
   pthread_setname_np("lkd-kick-boost");
   SetRealTime(pthread_self(), true);

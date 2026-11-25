@@ -42,11 +42,13 @@ T.append(('signals: call/ret, MULTIBLOCK=0', False, False, ['sigstorm', 'cc', 8,
 T.append(('signals: a large function, MULTIBLOCK=0', True, False, ['sigstorm', 'bb', 6, 100], ['--fex-config', 'MULTIBLOCK=0'], 10))
 T.append(('signals: call/ret, carry, code beside data', False, False, ['sigstorm_val', 'ca', 8, 100], [], 20))
 T.append(('signals: AVX, pairs, code beside data', False, False, ['sigstorm_val', 'vp', 8, 100], [], 20))
+T.append(('string instructions, no signals', True, False, ['repstorm', 6, '-'], [], 0))
+T.append(('signals: string instructions', False, False, ['repstorm', 12, 100], [], 100))
 T.append(('faults that are restarted: 76 cases', False, False, ['syncfault'], [], 0))
 T.append(('faults, control: without carry, pairs, AVX...', True, False, ['syncfault', 'push_mem', 'mov_load', 'xchg_store', 'add_mem', 'neg_mem', 'shl_mem', 'xchg_mem', 'xadd_mem',
           'lock_xadd_mem', 'lock_add_mem', 'cmpxchg_mem', 'mul_mem', 'rep_lodsb', 'rep_stosb', 'rep_movsb', 'sse_load', 'bigctl'], [], 0))
 for s in range(a.seeds):
-    T.append((f'x87 stacks at a fault: 400 programs, seed {s + 1}', False, False, ['x87fault'], [], 0, s + 1))
+    T.append((f'x87 stacks at a fault: 1000 programs, seed {s + 1}', False, False, ['x87fault'], [], 0, s + 1))
     T.append((f'soak {s + 1}: programs, no signals', True, False, ['soak', 4, 4, '-'], [], 0, s + 1))
     T.append((f'soak {s + 1}: programs, signals, {a.soak} s', False, False, ['soak', 4, a.soak, 150], [], 50, s + 1))
 if not a.no_wine:

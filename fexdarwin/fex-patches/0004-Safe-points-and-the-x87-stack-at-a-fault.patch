@@ -31,10 +31,10 @@ is not in the context is kept where the fault handler finds it, as the guest loa
  FEXCore/Source/Interface/IR/IR.h                   |  45 +++++++-
  FEXCore/Source/Interface/IR/IR.json                |  12 +-
  .../Interface/IR/Passes/RegisterAllocationPass.cpp |  33 ++----
- .../IR/Passes/x87StackOptimizationPass.cpp         |  74 +++++++++---
+ .../IR/Passes/x87StackOptimizationPass.cpp         |  89 +++++++++++---
  FEXCore/include/FEXCore/Core/Context.h             |  20 ++--
  FEXCore/include/FEXCore/Core/CoreState.h           |   7 ++
- 17 files changed, 429 insertions(+), 129 deletions(-)
+ 17 files changed, 444 insertions(+), 129 deletions(-)
 
 diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
 index da8af49..07c0aef 100644
@@ -903,7 +903,7 @@ index 4e13c1c..b061f9d 100644
  
      int NumArgs = IR::GetRAArgs(IROp->Op);
 diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
-index a4d00b7..db17ea1 100644
+index a4d00b7..42ac8e9 100644
 --- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
 +++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
 @@ -68,7 +68,7 @@ public:
@@ -915,7 +915,7 @@ index a4d00b7..db17ea1 100644
    bool Dirty = false;
  
    void push(const T& Value) {
-@@ -286,8 +286,12 @@ private:
+@@ -286,8 +286,14 @@ private:
    // Returns a new value for Top, that's synchronized between the simulated stack
    // and the actual FPU stack.
    Ref SynchronizeStackValues();
@@ -925,12 +925,14 @@ index a4d00b7..db17ea1 100644
 +  // known. Returns their IR::X87Pending.
 +  uint32_t SavePendingValues();
 +  std::array<Ref, 8> SavedPending {};
-+  // The IR::X87Pending of the guest instruction that is being translated.
++  // The IR::X87Pending of the guest instruction that is being translated, and its marker.
 +  uint32_t PendingHere = 0;
++  uint32_t InstructionOffset = 0;
++  uint8_t InstructionFlags = 0;
    // Moves us from the fast to the slow path if ShouldMigrate is true.
    void MigrateToSlowPathIf(bool ShouldMigrate);
    // Top Cache Management
-@@ -372,9 +376,40 @@ private:
+@@ -372,9 +378,40 @@ private:
  
  inline const X87StackOptimization::StackMemberInfo X87StackOptimization::StackMemberInfo::Invalid {nullptr};
  
@@ -974,7 +976,7 @@ index a4d00b7..db17ea1 100644
  }
  
  inline void X87StackOptimization::InvalidateCaches() {
-@@ -394,6 +429,8 @@ inline void X87StackOptimization::InvalidateCachedRegs() {
+@@ -394,6 +431,8 @@ inline void X87StackOptimization::InvalidateCachedRegs() {
  inline void X87StackOptimization::Reset() {
    SlowPath = false;
    StackData.clear();
@@ -983,7 +985,31 @@ index a4d00b7..db17ea1 100644
    InvalidateCaches();
  }
  
-@@ -772,13 +809,18 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+@@ -631,6 +670,11 @@ inline void X87StackOptimization::UpdateTopForPush_Slow() {
+ }
+ 
+ void X87StackOptimization::FlushCachedRegs() {
++  // Darwin port: an instruction that writes the stack to the context itself and goes on (FXSAVE, an MMX one) faults with it there:
++  // what was saved for its beginning is true no more.
++  const bool Writes =
++    FlushTopPending || FlushValidPending || std::any_of(FlushValuesPending.begin(), FlushValuesPending.end(), [](bool P) { return P; });
++
+   if (FlushTopPending) {
+     IREmit->_StoreContextGPR(OpSize::i8Bit, TopOffsetCache[0], offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_TOP_LOC);
+     FlushTopPending = false;
+@@ -701,6 +745,11 @@ void X87StackOptimization::FlushCachedRegs() {
+ 
+     FlushValidPending = false;
+   }
++
++  if (Writes && PendingHere) {
++    PendingHere = 0;
++    IREmit->_GuestOpcode(InstructionOffset, GuestOpcodeFlags::Continued | (InstructionFlags & GuestOpcodeFlags::CarryNotInverted));
++  }
+ }
+ 
+ // We synchronize stack values in a few occasions but one of the most important of those,
+@@ -772,13 +821,21 @@ void X87StackOptimization::Run(IREmitter* Emit) {
  
      IREmit->SetCurrentCodeBlock(BlockNode);
      for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
@@ -998,18 +1024,21 @@ index a4d00b7..db17ea1 100644
 +      // known. On the slow path it is written: it holds the values as the context does.
 +      if (IROp->Op == OP_GUESTOPCODE) {
 +        auto Op = IROp->CW<IROp_GuestOpcode>();
++        if (!(Op->Flags & GuestOpcodeFlags::Continued)) {
++          PendingHere = 0;
++        }
 +        if (Op->Flags & GuestOpcodeFlags::CanFault) {
 +          IREmit->SetWriteCursorBefore(CodeNode);
 +          FlushCachedRegs();
 +          PendingHere = !SlowPath && StackData.Dirty ? SavePendingValues() : 0;
-+        } else if (!(Op->Flags & GuestOpcodeFlags::Continued)) {
-+          PendingHere = 0;
 +        }
++        InstructionOffset = Op->GuestEntryOffset;
++        InstructionFlags = Op->Flags;
 +        Op->X87Pending = PendingHere;
        }
  
        if (!LoweredX87(IROp->Op)) {
-@@ -1264,10 +1306,8 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+@@ -1264,10 +1321,8 @@ void X87StackOptimization::Run(IREmitter* Emit) {
      auto [LastCodeNode, LastIROp] = Last();
      LOGMAN_THROW_A_FMT(IsBlockExit(LastIROp->Op), "must be exit");
      IREmit->SetWriteCursorBefore(LastCodeNode);
