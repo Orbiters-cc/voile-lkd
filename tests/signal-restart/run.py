@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Whether a signal, a suspension or a fault that is restarted leaves the interrupted program as it was, on a given engine.
-  run.py <fexdarwin-run | released> [--only TEXT] [--group correct|latency|world|quit] [--soak SECONDS] [--seeds N] [--rounds N] [--load N]
+  run.py <fexdarwin-run | released> [--only TEXT] [--group correct|sched|latency|world|quit] [--soak SECONDS] [--seeds N] [--rounds N] [--load N]
          [--work FOLDER] [--no-wine]
-Groups: correct (nothing is lost or done twice), latency (how long a stop takes: every loop shape of shapes_k.S, and through Wine's
-SuspendThread), world (a collector's stop-the-world rounds), quit (the ways a program ends, with threads running). --load N keeps N
-threads busy meanwhile: a late round is then tried once more, since the scheduler may take the thread off its core after its stop.
+Groups: correct (nothing is lost or done twice), sched (every thread is scheduled as on the released engine, always), latency (how
+long a stop takes: every loop shape of shapes_k.S, and through Wine's SuspendThread), world (a collector's stop-the-world rounds), quit
+(the ways a program ends, with threads running). --load N keeps N threads busy meanwhile: the limits of `latency` are then those of a
+native thread at the same load (native.c), and a round that is late is tried once more.
 Reads the other files of the installed release in place, under the library's shared lock (owned.py); writes to the work folder
 alone (a scratch folder by default). The last column is what is to be known: `pass` or `FAIL`. Exit status 0: everything passed.
 Controls are marked so: they pass on an engine that has the defects too."""
 import argparse, os, re, subprocess, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import owned
+import owned, sched
 HERE = Path(__file__).resolve().parent
 p = argparse.ArgumentParser()
 p.add_argument('engine'); p.add_argument('--only', default=''); p.add_argument('--soak', type=int, default=20); p.add_argument('--seeds', type=int, default=1)
@@ -58,26 +59,39 @@ if not a.no_wine:
     T.append(('SuspendThread: 32-bit stack operations', False, True, ['susp32', 'p', 1500, 300, 2, 30], [], 0))
     for s in range(a.seeds):
         T.append((f'SuspendThread: soak {s + 1}, {a.soak} s', False, True, ['susp_soak', 's', 1000000, 300, 4, a.soak], [], 0, s + 1))
-SEEDED = len(T)
-names = re.findall(r'^SHAPE s_(\w+)', (HERE / 'shapes_k.S').read_text(), re.M)
-for n in names:
-    T.append((f'latency: {n}', n in ('getpid', 'sleep', 'futex'), False, ['shapes', n, 1000, 8000, 1000, 100000 if a.load else 50000], [], 0, 1, 'latency', 40))
-if not a.no_wine:
-    for n in re.findall(r'\{"(\w+)", l_', (HERE / 'shut.c').read_text()):
-        T.append((f'SuspendThread latency: {n}', False, True, ['shut', 'lat', n, 500, 8000, 10000 if a.load else 1000, 100000 if a.load else 50000], [], 0, 1, 'latency', 50))
-    for n in (20, 40):
-        T.append((f'stop the world: {n} threads, {a.rounds * 2} rounds', False, True, ['stw', a.rounds * 2, n, 1000, 120], [], 0, 1, 'world', 150))
-    T.append((f'quit: {a.rounds} times, 8 ways', False, True, ['shut', 'drv', a.rounds, 'EKRMTCPS', 20000, 2000], [], 0, 1, 'quit', a.rounds * 4 + 400))
-    T.append((f'quit after stop-the-world rounds: {a.rounds // 4} times', False, True, ['shut', 'drv', a.rounds // 4, 'G', 20000, 2000], [], 0, 1, 'quit', a.rounds * 2 + 400))
-
 def burn(n):
     """n host threads that compute for as long as this script runs"""
     src = work / 'burn.c'; src.write_text('#include <stdlib.h>\n#include <unistd.h>\n#include <pthread.h>\nstatic volatile double x; static void *w(void *p) { for (;;) x += 1; return p; }\n'
         'int main(int c, char **v) { pid_t p = getppid(); for (int i = atoi(v[1]); i--;) { pthread_t t; pthread_create(&t, 0, w, 0); } while (getppid() == p) sleep(1); return 0; }\n')
     subprocess.run(['/usr/bin/cc', '-O1', '-o', str(work / 'burn'), str(src)], check=True)
     return subprocess.Popen([str(work / 'burn'), str(n)])
+
+def native():
+    """The slowest p99 and the longest, in us, of five runs of native.c: what the scheduler makes a signal to a native thread wait."""
+    subprocess.run(['/usr/bin/cc', '-O1', '-o', str(work / 'native'), str(HERE / 'native.c')], check=True)
+    out = [subprocess.run([str(work / 'native'), '1000', '8000'], check=True, capture_output=True, text=True).stdout.strip() for _ in range(5)]
+    for l in out: print('native        ' + l, flush=True)
+    return tuple(max(float(re.search(rf'{k}=(\d+)', l)[1]) for l in out) for k in ('p99_us', 'max_us'))
+
 work.mkdir(parents=True, exist_ok=True)
 burner = burn(a.load) if a.load else None
+# The limits of p99 and of the longest, in us. Idle, a thread runs: a stop is a matter of microseconds. On a busy machine it waits for its turn
+# on a core as every other thread does, native ones too, and what is asked of the engine is that it adds nothing to that: no more than
+# twice (p99, and 1 ms) and three times (the longest one) what a signal to a native thread needs at the same time.
+LIMITS = [1000, 50000]
+if a.load and a.group in ('', 'latency'):
+    p99, longest = native(); LIMITS = [int(2 * p99 + 1000), int(max(3 * longest, 50000))]
+    print(f'limits        p99_us={LIMITS[0]} max_us={LIMITS[1]}', flush=True)
+names = re.findall(r'^SHAPE s_(\w+)', (HERE / 'shapes_k.S').read_text(), re.M)
+for n in names:
+    T.append((f'latency: {n}', n in ('getpid', 'sleep', 'futex'), False, ['shapes', n, 1000, 8000, *LIMITS], [], 0, 1, 'latency', 40))
+if not a.no_wine:
+    for n in re.findall(r'\{"(\w+)", l_', (HERE / 'shut.c').read_text()):
+        T.append((f'SuspendThread latency: {n}', False, True, ['shut', 'lat', n, 500, 8000, *LIMITS], [], 0, 1, 'latency', 50))
+    for n in (20, 40):
+        T.append((f'stop the world: {n} threads, {a.rounds * 2} rounds', False, True, ['stw', a.rounds * 2, n, 1000, 120], [], 0, 1, 'world', 150))
+    T.append((f'quit: {a.rounds} times, 8 ways', False, True, ['shut', 'drv', a.rounds, 'EKRMTCPS', 20000, 2000], [], 0, 1, 'quit', a.rounds * 4 + 400))
+    T.append((f'quit after stop-the-world rounds: {a.rounds // 4} times', False, True, ['shut', 'drv', a.rounds // 4, 'G', 20000, 2000], [], 0, 1, 'quit', a.rounds * 2 + 400))
 
 print(f'engine {engine}\nwork   {work}')
 seed, bad = None, 0
@@ -101,6 +115,23 @@ for t in T:
         frozen = len(re.findall(r'lkd: sig: signal 19 .* stops process', out))
         if frozen: print(f'      processes stopped by a late attach SIGSTOP (lkd): {frozen}', flush=True)
     print(f"{'pass' if ok else 'FAIL'}  {'control ' if control else '        '}{name:48} exit {rc:3}  {said[-1][8:260] if said else '(said nothing)'}", flush=True)
+
+def scheduling():
+    """The guest's threads are the game's: no priority, policy or QoS of theirs is ever another than on the released engine (sched.py). On a busy
+    machine, where an engine would be tempted to."""
+    global bad
+    build(1); sched.build(bins)
+    for name, argv, wine in (('how threads are scheduled: 14 threads, signals', ['sched', 4000, 9], False),  # busy by themselves
+                             ('how threads are scheduled: SuspendThread', ['susp', 'r', 2000, 300, 4, 60], True)):
+        if a.only not in name or (wine and a.no_wine): continue
+        if wine: owned.run(engine, work, bins, ['susp', 'r', 1, 300], wine=True, timeout=90)  # a first Windows program makes its prefix
+        own = burn(8) if wine and not a.load else None
+        ok, report, wrong, ways = sched.check(engine, owned.released_engine(), work, bins, argv, wine=wine)
+        if own: own.kill(); own.wait()
+        bad += not ok
+        print(f"{'pass' if ok else 'FAIL'}          {name}", *report, *('WRONG ' + w for w in wrong), *('as released: ' + w for w in ways), sep='\n        ', flush=True)
+
+if a.group in ('', 'sched'): scheduling()
 if burner: burner.kill()
 print(f'{bad} failed')
 sys.exit(1 if bad else 0)

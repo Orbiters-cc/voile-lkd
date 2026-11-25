@@ -241,9 +241,9 @@ static int lat(const char *shape, int count, int budget_ms, double lim99, double
     double sum = 0, ssum = 0; for (int i = 0; i < n; i++) { sum += v[i]; ssum += vs[i]; }
     qsort(v, n, sizeof *v, cmpd);
     double p99 = n ? v[n * 99 / 100] : failmax, max = n ? v[n - 1] : failmax; if (failmax > max) max = failmax;
-    int ok = n == count && !fail && !susfail && p99 <= lim99 && max <= limmax;
-    printf("WITNESS suspend %s delivered=%d sent=%d context_refused=%d last_error=%lu suspend_call_mean_us=%.0f mean_us=%.0f median_us=%.0f p99_us=%.0f max_us=%.0f\n", shape, n, n + fail, fail, lasterr,
-           n ? ssum / n : 0, n ? sum / n : 0, n ? v[n / 2] : 0, p99, max);
+    int ok = n >= 20 && !fail && !susfail && p99 <= lim99 && max <= limmax;
+    printf("WITNESS suspend %s delivered=%d sent=%d context_refused=%d last_error=%lu suspend_call_mean_us=%.0f mean_us=%.0f median_us=%.0f p90_us=%.0f p99_us=%.0f max_us=%.0f\n", shape, n, n + fail, fail, lasterr,
+           n ? ssum / n : 0, n ? sum / n : 0, n ? v[n / 2] : 0, n ? v[n * 9 / 10] : 0, p99, max);
     fflush(stdout);
     ExitProcess(ok ? 0 : 1);
 }

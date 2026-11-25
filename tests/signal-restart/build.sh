@@ -32,3 +32,4 @@ win shut shut.c
 "${MINGW32:-i686-w64-mingw32-gcc}" -O1 -mno-avx -Wall -o "$BIN/susp32.exe" susp.c susp32_k.S
 cc latency latency.c bench_k.S
 cc shapes shapes.c shapes_k.S
+cc sched sched.c

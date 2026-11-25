@@ -1,7 +1,8 @@
 /* How long a signal waits for a thread that runs one loop shape of shapes_k.S for ever.
  *   shapes NAME [COUNT [BUDGET_MS [P99_US [MAX_US]]]]
  * One worker in the loop; the main thread sends SIGUSR1 (tgkill) COUNT times, each after the one before was handled, and stops after
- * BUDGET_MS in all. A sender that the scheduler took off its core while it sent says nothing about the thread (sender_off). What a signal that is still waiting then has waited counts for the maximum.
+ * BUDGET_MS in all; what a signal that still waits 5 s later has waited counts for the maximum. A sender that the scheduler took off its
+ * core while it sent says nothing about the thread (sender_off).
  * Exit status 0: every signal sent was handled, the 99th percentile and the maximum are under their limits. */
 #include "nolibc.h"
 #define L(X) X(jmp) X(pause) X(spinflag) X(spinreg) X(tas) X(cas) X(spinyield) X(pairs) X(pairs8) X(pushret) X(callret) \
@@ -39,7 +40,7 @@ int main(int argc, char **argv) {
     u64 n = 0, done = 0, off = 0, sent = 0, begin = now_ns(), waits = 0;
     for (; n < count && now_ns() - begin < budget; ) {
         u64 s0 = seq, t0 = now_ns(); SC(SYS_tgkill, pid, tid, SIGUSR1); sent++; u64 t1 = now_ns();
-        while (seq == s0 && now_ns() - begin < budget) SC(SYS_sched_yield);
+        while (seq == s0 && now_ns() - begin < budget + 5000000000ul) SC(SYS_sched_yield);
         if (seq == s0) { waits = now_ns() - t0; break; }
         done++;
         if (t1 - t0 > 100000) off++; else lat[n++] = got - t0;      /* (the sender itself was off its core, before or after the kick: says nothing) */
@@ -49,7 +50,7 @@ int main(int argc, char **argv) {
     u64 sum = 0; for (u64 i = 0; i < n; i++) sum += lat[i];
     u64 p99 = n ? lat[n * 99 / 100] / 1000 : waits / 1000, max = n ? lat[n - 1] : 0; if (waits > max) max = waits; max /= 1000;
     int ok = done == sent && n >= 20 && off * 4 < sent && p99 <= lim99 && max <= limmax;
-    pf("WITNESS latency %s delivered=%lu sent=%lu sender_off=%lu mean_us=%lu median_us=%lu p99_us=%lu max_us=%lu%s\n", name, done, sent, off, n ? sum / n / 1000 : 0, n ? lat[n / 2] / 1000 : 0, p99, max,
+    pf("WITNESS latency %s delivered=%lu sent=%lu sender_off=%lu mean_us=%lu median_us=%lu p90_us=%lu p99_us=%lu max_us=%lu%s\n", name, done, sent, off, n ? sum / n / 1000 : 0, n ? lat[n / 2] / 1000 : 0, n ? lat[n * 9 / 10] / 1000 : 0, p99, max,
        waits ? " (the last one was still waiting)" : "");
     die(!ok); return 0;
 }
