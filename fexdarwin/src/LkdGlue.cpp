@@ -22,10 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mach/mach.h>
-#include <mach/mach_time.h>
 #include <mach/mach_vm.h>
 #include <os/lock.h>
-#include <os/os_sync_wait_on_address.h>
 #include <pthread.h>
 #include <dirent.h>
 #include <libproc.h>
@@ -144,24 +142,13 @@ int SetFp(lkd_task* t, int Kind, const void* Buf, size_t Len) {
 //   - in translated code, the dispatcher or a helper: it stops at the next safe point (DarwinSignalDelegator::RequestStop), where
 //     the guest registers are exact. The fault handler resumes it at the kick trampoline, which runs lkd_signal_next on the
 //     ordinary thread stack (it may block in a ptrace or job-control stop) and then re-enters the dispatcher loop.
-// Nothing has to be tried again: the request stays until the thread has seen it. KickBoostThread sees to it that the thread runs.
+// Nothing has to be tried again: the request stays until the thread has seen it, which it has at its next safe point once it runs.
+// When it runs is the scheduler's matter alone. The host threads that run the guest are scheduled as any thread is by default: no
+// priority, policy or QoS of theirs is ever set here, not for a moment (tests/signal-restart: `sched` checks it).
 
 // Guards what Kick needs of a thread that is ending: its host thread (PThread) and the task's engine data. A leaf: nothing else is
 // locked under it. The host signal's handler takes no lock.
 os_unfair_lock KickLock = OS_UNFAIR_LOCK_INIT;
-std::atomic<uint32_t> KickEpoch {0}; // what KickBoostThread waits on
-GuestThread* KickedThreads {};       // KickLock
-
-// Takes a thread out of that list; with KickLock held.
-void ForgetKicked(GuestThread* T) {
-  for (GuestThread** P = &KickedThreads; *P; P = &(*P)->NextKicked) {
-    if (*P == T) {
-      *P = T->NextKicked;
-      break;
-    }
-  }
-  T->Kicked = false;
-}
 
 // Guest threads that ended, waiting for their host thread to be joined and their FEX state freed. Each thread owns a
 // FEX lookup cache (about 260 MiB of reserved address space), JIT buffers, a call-ret stack and an 8 MiB host stack; a
@@ -186,27 +173,6 @@ void ReapDeadThreads() {
   }
 }
 
-// Whether the thread runs before every other that is no real-time one. Back, it is scheduled as a thread is by default, which every
-// guest thread is (LKD keeps the guest's priorities to itself); the second call has its priority computed again from what it has used,
-// which otherwise counts only from its next quantum on: a thread that is kicked all the time would run before the others for ever.
-void SetRealTime(pthread_t P, bool On) {
-  const thread_t Port = pthread_mach_thread_np(P);
-  if (On) {
-    static const mach_timebase_info_data_t Tb = [] { mach_timebase_info_data_t V; mach_timebase_info(&V); return V; }();
-    const auto Ticks = [](uint64_t Ns) { return static_cast<uint32_t>(Ns * Tb.denom / Tb.numer); };
-    thread_time_constraint_policy_data_t D {.period = 0, .computation = Ticks(200 * 1000), .constraint = Ticks(1000 * 1000), .preemptible = 1};
-    thread_policy_set(Port, THREAD_TIME_CONSTRAINT_POLICY, reinterpret_cast<thread_policy_t>(&D), THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-  } else {
-    thread_standard_policy_data_t D {};
-    thread_policy_set(Port, THREAD_STANDARD_POLICY, reinterpret_cast<thread_policy_t>(&D), THREAD_STANDARD_POLICY_COUNT);
-    thread_precedence_policy_data_t Pr {.importance = 0};
-    thread_policy_set(Port, THREAD_PRECEDENCE_POLICY, reinterpret_cast<thread_policy_t>(&Pr), THREAD_PRECEDENCE_POLICY_COUNT);
-  }
-}
-void EndKickBoost(GuestThread* T, pthread_t P) {
-  if (T->KickBoosted.exchange(0)) SetRealTime(P, false);
-}
-
 [[noreturn]] void EndGuestThread(GuestThread* T) {
   lkd_task* Task = T->Task;
   pthread_t Host;
@@ -218,7 +184,6 @@ void EndKickBoost(GuestThread* T, pthread_t P) {
   Host = T->PThread;
   T->PThread = nullptr; // no more host signals: the host thread is going away
   os_unfair_lock_unlock(&KickLock);
-  EndKickBoost(T, pthread_self());
   int Status = 0;
   G->Signals->UnregisterThread(T);
   fexdarwin_lkd_task_get(Task);
@@ -228,7 +193,6 @@ void EndKickBoost(GuestThread* T, pthread_t P) {
   // A kick of the task may still be on its way (LKD keeps it in wake sets): from here on it finds no thread.
   os_unfair_lock_lock(&KickLock);
   lkd_task_set_engine_data(Task, nullptr);
-  ForgetKicked(T);
   os_unfair_lock_unlock(&KickLock);
   fexdarwin_lkd_task_put(Task);
   // The main guest thread is joined by RunWithLkd itself; every other thread is reaped by a later thread creation.
@@ -260,73 +224,11 @@ void Kick(lkd_task* t) {
   os_unfair_lock_lock(&KickLock);
   auto* T = GT(t);
   if (T && T != CurrentGuestThread) {
-    const bool First = !T->KickRequested.exchange(true);
-    if (First) {
-      T->KickNs.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), std::memory_order_relaxed);
-      T->KickBoostOver.store(false);
-    }
+    if (!T->KickRequested.exchange(true)) T->KickNs.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), std::memory_order_relaxed);
     G->Signals->RequestStop(T);
-    if (!T->Kicked) {
-      T->Kicked = true;
-      T->NextKicked = KickedThreads;
-      KickedThreads = T;
-    }
     if (T->PThread) pthread_kill(T->PThread, KickSignal);
-    if (First) {
-      KickEpoch.fetch_add(1);
-      os_sync_wake_by_address_any(&KickEpoch, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
-    }
   }
   os_unfair_lock_unlock(&KickLock);
-}
-
-// A thread that computes reaches a safe point within microseconds, when it runs. On a machine with more to run than it has cores it
-// may be off its core for tens of milliseconds, and a collector that suspends every thread waits for the last of them. What has not
-// seen its kick after KickBoostNs runs before everything else, until the first system call after its handler has begun (Wine's writes
-// its context to the server), at the latest for KickBoostMaxNs. This thread runs before everything itself.
-constexpr uint64_t KickBoostNs = 250 * 1000, KickBoostMaxNs = 5 * 1000 * 1000;
-void* KickBoostThread(void*) {
-  pthread_setname_np("lkd-kick-boost");
-  SetRealTime(pthread_self(), true);
-  uint32_t Seen = KickEpoch.load();
-  for (;;) {
-    os_sync_wait_on_address(&KickEpoch, Seen, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_NONE);
-    Seen = KickEpoch.load();
-    for (bool Again = true; Again;) {
-      usleep(KickBoostNs / 1000);
-      // Under KickLock alone, which nobody holds for long: the thread to boost may hold any other lock of the engine.
-      os_unfair_lock_lock(&KickLock);
-      for (GuestThread** P = &KickedThreads; *P;) {
-        GuestThread* T = *P;
-        const uint64_t Now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        const uint64_t Since = T->KickBoosted.load();
-        const bool Boost = !Since && T->KickRequested.load() && !T->KickBoostOver.load();
-        if (!Since && !Boost) { // it has seen its kick, or was boosted for it
-          T->Kicked = false;
-          *P = T->NextKicked;
-          continue;
-        }
-        P = &T->NextKicked;
-        if (!T->PThread || Now - (Boost ? T->KickNs.load(std::memory_order_relaxed) : Since) < (Boost ? KickBoostNs : KickBoostMaxNs)) {
-          continue;
-        }
-        if (Boost) {
-          SetRealTime(T->PThread, true);
-          T->KickBoosted.store(Now);
-        } else {
-          T->KickBoostOver.store(true); // (one that waits in a system call the host signal does not end: once is enough)
-          EndKickBoost(T, T->PThread);
-        }
-      }
-      Again = KickedThreads != nullptr;
-      os_unfair_lock_unlock(&KickLock);
-    }
-  }
-  return nullptr;
-}
-void StartKickBoostThread() {
-  pthread_t P;
-  if (pthread_create(&P, nullptr, KickBoostThread, nullptr) == 0) pthread_detach(P);
 }
 
 // ---- supervisor watchdog (machine safety) ----
@@ -506,8 +408,8 @@ static void DumpThreads(const char* Dir, const char* Prefix, unsigned Seq) {
         fprintf(F, "\n   futex word %#x, next %#x, owner(+8) %u, +12 %#x", W[0], W[1], W[2], W[3]);
     }
     if (T->KickRequested.load()) {
-      fprintf(F, "\n   STOP REQUESTED %llu ms ago%s%s", (unsigned long long)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - T->KickNs.load()) / 1000000),
-              G->Signals->StopRequested(T) ? ", its next safe point is armed" : ", NO safe point armed", T->KickBoosted.load() ? ", boosted" : "");
+      fprintf(F, "\n   STOP REQUESTED %llu ms ago%s", (unsigned long long)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - T->KickNs.load()) / 1000000),
+              G->Signals->StopRequested(T) ? ", its next safe point is armed" : ", NO safe point armed");
     } else if (G->Signals->StopRequested(T)) {
       fprintf(F, "\n   its next safe point is armed");
     }
@@ -663,7 +565,6 @@ int SpawnThread(lkd_task* Child, const lkd_regs* Start) {
     // LKD drops the task on this error: forget it and free what was made for it.
     os_unfair_lock_lock(&KickLock);
     lkd_task_set_engine_data(Child, nullptr);
-    ForgetKicked(C);
     os_unfair_lock_unlock(&KickLock);
     DestroyGuestThread(C);
     return -LX_EAGAIN;
@@ -834,10 +735,7 @@ void ForkChild(lkd_task* t) {
   T->Tid = lkd_task_tid(t);
   T->PThread = pthread_self();
   KickLock = OS_UNFAIR_LOCK_INIT; // held across the fork by this thread, as another host thread
-  KickedThreads = nullptr;
-  T->Kicked = false;
   G->Signals->WithdrawStop(T);
-  EndKickBoost(T, pthread_self());
   G->Threads.assign(1, T);
   G->ThreadsLock.unlock();
   {
@@ -845,7 +743,6 @@ void ForkChild(lkd_task* t) {
     std::lock_guard<std::mutex> Lk(DeadLock);
     DeadThreads.clear();
   }
-  StartKickBoostThread();
   StartSupervisorWatch(); // threads do not survive a host fork
   HitchLog::AfterFork();
 }
@@ -945,7 +842,6 @@ int LkdSetup() {
     setenv("FEXDARWIN_SUPERVISOR_PID", B, 1);
   }
   StartSupervisorWatch(); // the first process watches itself only through the region guard (kill(self) succeeds)
-  StartKickBoostThread();
   // A host pipe or socket the engine keeps must never kill the runtime; LKD sets F_SETNOSIGPIPE on guest ones.
   signal(SIGPIPE, SIG_IGN);
   return lkd_init(&Ops);
@@ -982,7 +878,6 @@ void LkdHandleSyscall(GuestThread* T, FEXCore::Core::CpuStateFrame* Frame) {
   case LKD_EXIT_GROUP: EndGuestThread(T);
   }
   // Deliver pending signals at this safe point; the frame saves the post-syscall context.
-  if (T->KickBoosted.load() && !T->KickRequested.load() && !lkd_signal_pending(T->Task)) EndKickBoost(T, pthread_self());
   DeliverPendingSignals(T);
   T->InLkd.store(false);
   T->SyscallSetsRip = true; // RIP is final, the generic path must not add 2 again

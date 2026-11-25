@@ -292,7 +292,7 @@ void DarwinSignalDelegator::WithdrawStop(GuestThread* T) {
   // An exchange, not a store: if it overwrites a request, what was queued before that request is seen after it. If the request
   // comes after it, it stays.
   std::atomic_ref<uint64_t>(Frame->SafepointPtr).exchange(reinterpret_cast<uint64_t>(&Frame->State.InlineJITBlockHeader), std::memory_order_acq_rel);
-  // (A kick between the two leaves the request without the mark: KickBoostThread passes it over, nothing else.)
+  // (A kick between the two leaves the request without the mark: the log and the dump pass it over, nothing else.)
   if (T->KickRequested.exchange(false)) {
     // FEXDARWIN_KICK_LOG=<ms>: a line for every stop that came later.
     static const char* Log = getenv("FEXDARWIN_KICK_LOG");
@@ -300,8 +300,8 @@ void DarwinSignalDelegator::WithdrawStop(GuestThread* T) {
     if (Log) {
       const uint64_t Ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - T->KickNs.load(std::memory_order_relaxed);
       if (Ns >= LogNs) {
-        Say("[fexdarwin] pid %d tid %d: stopped %llu us after the kick%s\n", static_cast<int>(getpid()), T->Tid,
-            (unsigned long long)(Ns / 1000), T->KickBoosted.load() ? ", boosted" : "");
+        Say("[fexdarwin] pid %d tid %d: stopped %llu us after the kick\n", static_cast<int>(getpid()), T->Tid,
+            (unsigned long long)(Ns / 1000));
       }
     }
   }
